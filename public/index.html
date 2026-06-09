@@ -27,8 +27,14 @@ const { useState, useEffect, useRef, useCallback } = React;
 // On Cloudflare Pages: backend is the Render URL stored in localStorage
 function getStoredBackend() {
   const hostname = window.location.hostname;
-  if (hostname === 'localhost' || hostname === '127.0.0.1') return '';
-  return localStorage.getItem('wa_campaign_backend') || null;
+  const stored = localStorage.getItem('wa_campaign_backend');
+  if (stored) return stored;
+  // Only show the setup screen on known CDN/Pages deployments
+  // (where frontend and backend are on different servers)
+  const isCDN = hostname.endsWith('.pages.dev') ||
+                hostname.endsWith('.netlify.app') ||
+                hostname.endsWith('.vercel.app');
+  return isCDN ? null : '';  // '' = use relative URLs (same server)
 }
 
 // ─── API factory — all calls go through here ──────────────────────────────────
