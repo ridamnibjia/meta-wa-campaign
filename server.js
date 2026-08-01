@@ -131,13 +131,68 @@ try {
   }
 } catch (e) { console.warn('[WARN] Could not read opt-outs.json:', e.message); }
 
+function saveOptOuts() {
+  try { fs.writeFileSync(OPT_OUT_FILE, JSON.stringify([...optOuts], null, 2)); }
+  catch (e) { console.error('[ERROR] Could not write opt-outs.json:', e.message); }
+}
+
 function addOptOut(phone) {
   const d = normalizePhone(phone);
   if (!d || optOuts.has(d)) return false;
   optOuts.add(d);
-  try { fs.writeFileSync(OPT_OUT_FILE, JSON.stringify([...optOuts], null, 2)); }
-  catch (e) { console.error('[ERROR] Could not write opt-outs.json:', e.message); }
+  saveOptOuts();
   return true;
+}
+
+function removeOptOut(phone) {
+  const d = normalizePhone(phone);
+  if (!d || !optOuts.delete(d)) return false;
+  saveOptOuts();
+  return true;
+}
+
+// ── Warm-up ────────────────────────────────────────────────────────────────────
+// A number that has never sent bulk traffic gets throttled — or its quality
+// rating tanked — if it blasts its full tier on day one. The ladder below is the
+// volume Meta's own guidance tolerates: one rung per *sending* day, and only
+// while quality holds. Persisted because the whole point is spanning days, and
+// campaign state does not survive a restart.
+const WARMUP_PLAN = [20, 50, 100, 250, 500, 1000];
+const WARMUP_FILE = path.join(__dirname, 'warmup.json');
+const W = { enabled: true, days: [] };   // ISO dates on which at least one message was accepted
+
+try {
+  if (fs.existsSync(WARMUP_FILE)) Object.assign(W, JSON.parse(fs.readFileSync(WARMUP_FILE, 'utf8')));
+} catch (e) { console.warn('[WARN] Could not read warmup.json:', e.message); }
+
+function saveWarmup() {
+  try { fs.writeFileSync(WARMUP_FILE, JSON.stringify(W, null, 2)); }
+  catch (e) { console.error('[ERROR] Could not write warmup.json:', e.message); }
+}
+
+// Which rung today sits on. A day already sent on keeps its rung; a fresh day
+// climbs one — unless quality has slipped, in which case it holds where it was.
+function warmupStep() {
+  const i = W.days.indexOf(todayKey());
+  let step = i >= 0 ? i : W.days.length;
+  if (step > 0 && ['RED', 'YELLOW'].includes(S.quality)) step -= 1;
+  return Math.min(step, WARMUP_PLAN.length - 1);
+}
+
+function warmupCap() { return W.enabled ? WARMUP_PLAN[warmupStep()] : null; }
+
+// The cap actually enforced: the warm-up rung, or your own number, whichever is lower.
+function effectiveCap() {
+  const w = warmupCap();
+  return w === null ? S.config.dailyCap : Math.min(S.config.dailyCap, w);
+}
+
+function markWarmupDay() {
+  const today = todayKey();
+  if (W.days.includes(today)) return;
+  W.days.push(today);
+  saveWarmup();
+  log('info', `Warm-up — day ${W.days.length}, today's ceiling is ${warmupCap()}`);
 }
 
 // ── Campaign state ─────────────────────────────────────────────────────────────
@@ -155,6 +210,7 @@ const S = {
   dailyDate:  null,
   msgIndex:   {},       // { messageId → { phone, name, status } }
   failLog:    [],       // last 50 failures
+  quality:    null,     // last quality_rating seen from Meta — gates the warm-up climb
   config: {
     delaySec:         2,
     dailyCap:         1000,
@@ -194,7 +250,16 @@ function buildState() {
     failed:         S.failed,
     skipped:        S.skipped,
     dailyCount:     S.dailyCount,
-    dailyCap:       S.config.dailyCap,
+    dailyCap:       effectiveCap(),
+    quality:        S.quality,
+    warmup: {
+      enabled: W.enabled,
+      plan:    WARMUP_PLAN,
+      step:    warmupStep(),
+      cap:     warmupCap(),
+      daysSent: W.days.length,
+      sentToday: W.days.includes(todayKey()),
+    },
     pauseReason:    S.pauseReason,
     config:         S.config,
     configured:     !!(CFG.phoneNumberId && CFG.accessToken),
@@ -346,6 +411,13 @@ async function graphGet(endpoint, fields) {
   return res.json();
 }
 
+// "TIER_1K" → 1000, "TIER_250" → 250. Meta's cap on unique users per day; the
+// UI prefills Daily Cap with it so nobody has to look the number up.
+function tierToCap(tier) {
+  const m = /TIER_(\d+)(K?)/i.exec(tier || '');
+  return m ? Number(m[1]) * (m[2] ? 1000 : 1) : null;
+}
+
 // Fetch quality rating and messaging tier for the phone number
 async function fetchAccountInfo() {
   if (!CFG.phoneNumberId || !CFG.accessToken) return { error: 'Credentials not configured' };
@@ -354,13 +426,17 @@ async function fetchAccountInfo() {
     'id,display_phone_number,verified_name,quality_rating,messaging_limit_tier,status,name_status'
   );
   if (data.error) return { error: data.error.message };
+  const tier = data.messaging_limit_tier || 'UNKNOWN';
   return {
     displayPhone:  data.display_phone_number,
     verifiedName:  data.verified_name,
-    qualityRating: data.quality_rating       || 'UNKNOWN',
-    tier:          data.messaging_limit_tier || 'UNKNOWN',
-    status:        data.status               || 'UNKNOWN',
-    nameStatus:    data.name_status          || 'UNKNOWN',
+    qualityRating: data.quality_rating || 'UNKNOWN',
+    tier,
+    tierCap:       tierToCap(tier),
+    status:        data.status      || 'UNKNOWN',
+    nameStatus:    data.name_status || 'UNKNOWN',
+    phoneNumberId: CFG.phoneNumberId,
+    wabaId:        CFG.wabaId || null,
   };
 }
 
@@ -375,34 +451,44 @@ async function resolveWabaId() {
   return CFG.wabaId;
 }
 
-// Validate template — fetches status, category, language, body text from Meta
-async function validateTemplate(templateName) {
+// Graph's template shape → the flat one both the validator and the picker use.
+function shapeTemplate(t) {
+  const part = (type, extra = () => true) => (t.components || []).find(c => c.type === type && extra(c));
+  return {
+    name:           t.name,
+    status:         t.status,
+    category:       t.category,
+    language:       t.language,
+    qualityScore:   t.quality_score?.score || null,
+    rejectedReason: t.rejected_reason      || null,
+    bodyText:       part('BODY')?.text || null,
+    headerText:     part('HEADER', c => c.format === 'TEXT')?.text || null,
+    buttons:        part('BUTTONS')?.buttons || [],
+  };
+}
+
+// One Graph call for message_templates. `name` filters to a single template;
+// omitting it lists the whole WABA, which is what the UI's picker needs.
+async function fetchTemplates(name) {
   if (!CFG.accessToken) return { error: 'Access Token not set' };
   const wabaId = await resolveWabaId();
   if (!wabaId) {
-    return { error: 'WABA ID unavailable. Set WABA_ID in .env or verify BUSINESS_ID.' };
+    return { error: 'WABA_ID is not set. Copy it from Meta for Developers → your app → WhatsApp → API Setup ("WhatsApp Business Account ID"), put it in .env, and restart.' };
   }
-  const url  = `https://graph.facebook.com/${CFG.apiVersion}/${wabaId}/message_templates`
-    + `?name=${encodeURIComponent(templateName)}`
-    + `&fields=name,status,category,language,quality_score,rejected_reason,components`;
-  const res  = await fetch(url, { headers: graphHeaders() });
-  const data = await res.json();
+  const url = `https://graph.facebook.com/${CFG.apiVersion}/${wabaId}/message_templates`
+    + `?limit=200&fields=name,status,category,language,quality_score,rejected_reason,components`
+    + (name ? `&name=${encodeURIComponent(name)}` : '');
+  const data = await (await fetch(url, { headers: graphHeaders() })).json();
   if (data.error) return { error: data.error.message };
-  if (!data.data?.length) return { found: false, name: templateName };
-  return {
-    found:     true,
-    templates: data.data.map(t => ({
-      name:           t.name,
-      status:         t.status,
-      category:       t.category,
-      language:       t.language,
-      qualityScore:   t.quality_score?.score || null,
-      rejectedReason: t.rejected_reason      || null,
-      bodyText:       (t.components || []).find(c => c.type === 'BODY')?.text || null,
-      headerText:     (t.components || []).find(c => c.type === 'HEADER' && c.format === 'TEXT')?.text || null,
-      buttons:        (t.components || []).find(c => c.type === 'BUTTONS')?.buttons || [],
-    })),
-  };
+  return { found: !!data.data?.length, templates: (data.data || []).map(shapeTemplate) };
+}
+
+// Validate template — fetches status, category, language, body text from Meta
+async function validateTemplate(templateName) {
+  const r = await fetchTemplates(templateName);
+  if (r.error) return r;
+  if (!r.found) return { found: false, name: templateName };
+  return r;
 }
 
 // Maps {{1}}, {{2}}… onto contact fields, in order.
@@ -487,12 +573,15 @@ async function campaignLoop() {
       S.phase = 'done'; broadcast(); break;
     }
     checkDaily();
-    if (S.dailyCount >= S.config.dailyCap) {
+    const cap = effectiveCap();
+    if (S.dailyCount >= cap) {
       const next = new Date(); next.setDate(next.getDate() + 1); next.setHours(0, 2, 0, 0);
       const wait = next - Date.now();
       const h = Math.floor(wait / 3600000), m = Math.floor((wait % 3600000) / 60000);
-      log('info', `Daily cap ${S.dailyCount}/${S.config.dailyCap} — resuming in ${h}h ${m}m`);
-      S.phase = 'paused'; S.pauseReason = `Daily cap reached. Resumes in ${h}h ${m}m.`; broadcast();
+      const why = warmupCap() !== null && warmupCap() <= S.config.dailyCap
+        ? `Warm-up ceiling for day ${W.days.length}` : 'Daily cap';
+      log('info', `${why} ${S.dailyCount}/${cap} — resuming in ${h}h ${m}m`);
+      S.phase = 'paused'; S.pauseReason = `${why} reached (${cap}/day). Resumes in ${h}h ${m}m.`; broadcast();
       await sleep(wait);
       S.phase = 'running'; S.pauseReason = null; broadcast(); continue;
     }
@@ -508,8 +597,9 @@ async function campaignLoop() {
     const result = await sendTemplate(c);
     if (result.ok) {
       S.accepted++; S.dailyCount++;
+      markWarmupDay();
       S.msgIndex[result.messageId] = { phone: c.dialStr, name: c.name, status: 'accepted' };
-      log('success', `${n} accepted — today:${S.dailyCount}/${S.config.dailyCap}`);
+      log('success', `${n} accepted — today:${S.dailyCount}/${cap}`);
     } else if (result.skip) {
       S.skipped++;
       log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
@@ -581,6 +671,15 @@ app.post('/webhook', (req, res) => {
   const body = req.body;
   if (body.object !== 'whatsapp_business_account') return;
   for (const entry of (body.entry || [])) {
+    // Meta stamps every webhook with the WABA ID that produced it. A System User
+    // token without business_management cannot look that ID up from the Business
+    // Portfolio, so learning it here is often the only way the server gets it —
+    // and without it template validation and the picker cannot work at all.
+    if (!CFG.wabaId && entry.id) {
+      CFG.wabaId = entry.id;
+      log('info', `WABA ID learned from webhook: ${entry.id} — add WABA_ID=${entry.id} to .env so it survives a restart`);
+    }
+
     for (const change of (entry.changes || [])) {
 
       // Inbound messages — we only care about the opt-out quick reply.
@@ -643,8 +742,22 @@ app.post('/api/upload-csv', upload.single('csv'), (req, res) => {
 });
 
 app.get('/api/account-info', async (req, res) => {
-  try { res.json(await fetchAccountInfo()); }
-  catch (e) { res.json({ error: e.message }); }
+  try {
+    const info = await fetchAccountInfo();
+    if (info.qualityRating) S.quality = info.qualityRating;
+    res.json(info);
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+// Every template on the WABA, newest-usable first. Lets the UI show a picker
+// instead of asking the operator to remember exact template names.
+app.get('/api/templates', async (req, res) => {
+  try {
+    const r = await fetchTemplates();
+    if (r.error) return res.json({ error: r.error, templates: [] });
+    const rank = { APPROVED: 0, PENDING: 1, IN_APPEAL: 1 };
+    res.json({ templates: r.templates.sort((a, b) => (rank[a.status] ?? 2) - (rank[b.status] ?? 2)) });
+  } catch (e) { res.json({ error: e.message, templates: [] }); }
 });
 
 app.get('/api/validate-template', async (req, res) => {
@@ -750,6 +863,72 @@ app.get('/api/template/status', async (req, res) => {
 
 app.get('/api/optouts', (req, res) => res.json({ count: optOuts.size, numbers: [...optOuts] }));
 
+// Manual edits. People phone up and ask to be put back on the list, and numbers
+// arrive from outside WhatsApp (a reply, a shop visit) that must never be sent to.
+app.post('/api/optouts', (req, res) => {
+  const add    = [].concat(req.body.add    || []);
+  const remove = [].concat(req.body.remove || []);
+  const added   = add.filter(addOptOut);
+  const removed = remove.filter(removeOptOut);
+  const bad     = add.filter(p => !normalizePhone(p));
+  if (added.length)   log('info', `Opt-out list — added ${added.length} by hand`);
+  if (removed.length) log('warn', `Opt-out list — removed ${removed.join(', ')} by hand`);
+  broadcast();
+  res.json({ ok: true, count: optOuts.size, numbers: [...optOuts], added: added.length, removed: removed.length, invalid: bad });
+});
+
+app.get('/api/optouts/download', (req, res) => {
+  res.setHeader('Content-Disposition', `attachment; filename="opt-outs-${todayKey()}.json"`);
+  res.setHeader('Content-Type', 'application/json');
+  res.send(JSON.stringify([...optOuts], null, 2));
+});
+
+app.post('/api/warmup', (req, res) => {
+  if (typeof req.body.enabled === 'boolean') { W.enabled = req.body.enabled; saveWarmup(); }
+  broadcast();
+  res.json({ ok: true, enabled: W.enabled, cap: warmupCap(), step: warmupStep(), daysSent: W.days.length });
+});
+
+// Fire the active template at a few numbers right now, outside the campaign loop
+// and outside the warm-up ceiling. This is how you confirm delivered/read
+// webhooks actually arrive before committing a whole list to it.
+app.post('/api/test-send', async (req, res) => {
+  const raw = [].concat(req.body.numbers || []).slice(0, 5);
+  if (!raw.length) return res.json({ ok: false, error: 'Give at least one number' });
+  if (!CFG.accessToken || !CFG.phoneNumberId) return res.json({ ok: false, error: 'Credentials not configured' });
+
+  const check = await validateTemplate(S.config.templateName).catch(e => ({ error: e.message }));
+  adoptTemplate(S.config.templateName, check);
+  if (check.error) return res.json({ ok: false, error: `Could not verify template: ${check.error}` });
+  if (S.config.templateStatus !== 'APPROVED') {
+    return res.json({ ok: false, error: `Template "${S.config.templateName}" is ${S.config.templateStatus || 'not found'} — only APPROVED templates can be sent` });
+  }
+
+  const results = [];
+  for (const n of raw) {
+    const dialStr = normalizePhone(n);
+    if (!dialStr) { results.push({ input: n, ok: false, error: 'Not a valid phone number' }); continue; }
+    // An opt-out is an opt-out even when you are only testing.
+    if (optOuts.has(dialStr)) { results.push({ input: n, dialStr, ok: false, error: 'This number has opted out' }); continue; }
+    const contact = { name: req.body.name || 'there', phone: n, dialStr };
+    log('info', `test send → +${dialStr}`);
+    const r = await sendTemplate(contact);
+    if (r.ok) {
+      // Counted like any other send so the stat tiles walk accepted → delivered
+      // → read in front of you; /api/start zeroes them before the real campaign.
+      S.accepted++; S.dailyCount++;
+      S.msgIndex[r.messageId] = { phone: dialStr, name: contact.name, status: 'accepted' };
+      log('success', `test send accepted — +${dialStr}`);
+    } else {
+      log('error', `test send failed — +${dialStr} [${r.errorCode}] ${r.error}`);
+      if (r.hint) log('error', `   ↳ ${r.hint}`);
+    }
+    results.push({ input: n, dialStr, ok: !!r.ok, error: r.error || null, hint: r.hint || null });
+  }
+  broadcast();
+  res.json({ ok: results.some(r => r.ok), results });
+});
+
 app.post('/api/start', async (req, res) => {
   if (!CFG.phoneNumberId) return res.json({ ok: false, error: 'Phone Number ID not configured' });
   if (!CFG.accessToken)   return res.json({ ok: false, error: 'Access Token not configured' });
@@ -768,10 +947,16 @@ app.post('/api/start', async (req, res) => {
     return res.json({ ok: false, error: `Could not verify template: ${e.message}` });
   }
 
+  // Quality gates the warm-up climb, so read it fresh rather than trusting a
+  // value cached from whenever the dashboard last loaded.
+  const info = await fetchAccountInfo().catch(() => ({}));
+  if (info.qualityRating) S.quality = info.qualityRating;
+
   S.accepted = S.failed = S.skipped = S.delivered = S.read = 0;
   S.currentIdx = 0; S.msgIndex = {}; S.failLog = []; S.logs = [];
   stopFlag = false; pauseFlag = false; running = false;
   S.phase = 'running'; S.pauseReason = null; broadcast();
+  if (W.enabled) log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${effectiveCap()} today`);
   startLoop();
   res.json({ ok: true });
 });
@@ -817,5 +1002,6 @@ if (require.main === module) {
 module.exports = {
   slugify, templateVars, sanitizeParam, validateTemplateInput,
   buildTemplatePayload, normalizePhone, parseCSV, buildParams,
-  verifySignature, explainError, META_ERRORS, OPT_OUT_LABEL, LIMITS, S,
+  verifySignature, explainError, tierToCap, META_ERRORS, OPT_OUT_LABEL, LIMITS, S,
+  warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W,
 };

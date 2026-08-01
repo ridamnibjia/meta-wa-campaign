@@ -5,15 +5,273 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>WA Campaign</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f4f4f5; color: #18181b; font-size: 14px; line-height: 1.5; min-height: 100vh; }
-  ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 3px; }
+  :root {
+    --bg:#f6f4f1; --surface:#fff; --line:#e9e4dd; --line2:#d8d1c7;
+    --ink:#1c1917; --ink2:#78716c; --ink3:#a8a29e;
+    --brand:#128c7e; --brand-dark:#0d7167; --brand-soft:#e7f4f1;
+    --green:#12866f; --green-bg:#e9f7f2;
+    --red:#c0362c;   --red-bg:#fdf0ee;
+    --amber:#b45309; --amber-bg:#fdf6e7;
+    --violet:#6d28d9;
+    --blue:#1d4ed8;  --blue-bg:#eef2ff;
+    --r:12px;
+  }
+  *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;
+    background:var(--bg); color:var(--ink); font-size:14px; line-height:1.55;
+    min-height:100vh; -webkit-font-smoothing:antialiased;
+  }
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb { background:var(--line2); border-radius:4px; }
+
+  /* ── header ─────────────────────────────────────────────── */
+  .hdr {
+    background:var(--surface); border-bottom:1px solid var(--line);
+    padding:0 20px; height:60px; display:flex; align-items:center; gap:14px;
+    position:sticky; top:0; z-index:30;
+  }
+  .brand { font-size:16px; font-weight:750; letter-spacing:-.3px; }
+  .brand span { color:var(--brand); }
+  .acct { display:flex; flex-direction:column; gap:1px; min-width:0; }
+  .acct-1 { font-size:12.5px; font-weight:600; white-space:nowrap; }
+  .acct-2 { font-size:11px; color:var(--ink3); white-space:nowrap; }
+  .hdr-r { margin-left:auto; display:flex; align-items:center; gap:8px; }
+  .sep { width:1px; height:24px; background:var(--line); flex-shrink:0; }
+
+  .pill {
+    display:inline-flex; align-items:center; gap:6px; padding:4px 11px;
+    border-radius:99px; font-size:11.5px; font-weight:700; letter-spacing:.2px;
+    background:var(--bg); color:var(--ink3);
+  }
+  .pill::before { content:''; width:6px; height:6px; border-radius:50%; background:currentColor; }
+  .pill.running { background:var(--green-bg); color:var(--green); }
+  .pill.running::before { animation:blink 1.4s ease-in-out infinite; }
+  .pill.paused  { background:var(--amber-bg); color:var(--amber); }
+  .pill.done    { background:var(--blue-bg);  color:var(--blue); }
+  @keyframes blink { 50% { opacity:.25 } }
+
+  /* ── layout ─────────────────────────────────────────────── */
+  .wrap {
+    max-width:1160px; margin:0 auto; padding:22px 20px 60px;
+    display:grid; grid-template-columns:minmax(0,420px) minmax(0,1fr); gap:20px;
+    align-items:start;
+  }
+  .col { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  @media (max-width:900px) {
+    .wrap { grid-template-columns:1fr; padding:16px 14px 48px; }
+    .hdr { padding:0 14px; gap:10px; }
+    .acct-2 { display:none; }
+  }
+
+  /* ── steps & cards ──────────────────────────────────────── */
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:var(--r); }
+  .card-b { padding:16px 18px 18px; }
+  .card-h {
+    display:flex; align-items:center; gap:10px; padding:14px 18px 0;
+  }
+  .step-n {
+    width:24px; height:24px; border-radius:50%; flex-shrink:0;
+    background:var(--brand); color:#fff;
+    display:flex; align-items:center; justify-content:center;
+    font-size:12px; font-weight:750;
+  }
+  .step-n.off { background:var(--line); color:var(--ink3); }
+  .step-n.ok  { background:var(--green); }
+  .step-t { font-size:14px; font-weight:700; letter-spacing:-.15px; }
+  .card-h .right { margin-left:auto; font-size:12px; color:var(--ink2); }
+
+  /* ── form controls ──────────────────────────────────────── */
+  .field { display:flex; flex-direction:column; gap:5px; margin-bottom:14px; }
+  .label { font-size:11.5px; font-weight:650; color:var(--ink2); }
+  .hint  { font-size:11.5px; color:var(--ink3); line-height:1.5; }
+  .in, .ta, .sel {
+    width:100%; padding:9px 11px; font-family:inherit; font-size:13.5px; color:var(--ink);
+    background:#fff; border:1px solid var(--line2); border-radius:9px; outline:none;
+    transition:border-color .12s, box-shadow .12s;
+  }
+  .ta { line-height:1.6; resize:vertical; min-height:104px; }
+  .sel { appearance:none; cursor:pointer; padding-right:34px;
+    background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2378716c' d='M2 4.5 6 8.5 10 4.5'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 12px center; }
+  .in:focus, .ta:focus, .sel:focus { border-color:var(--brand); box-shadow:0 0 0 3px var(--brand-soft); }
+  .in.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; }
+  .row { display:flex; gap:12px; }
+  .row > .field { flex:1; min-width:0; }
+  .check { display:flex; align-items:flex-start; gap:9px; cursor:pointer; margin-bottom:14px; }
+  .check input { margin-top:3px; width:15px; height:15px; accent-color:var(--brand); cursor:pointer; flex-shrink:0; }
+  .check span { font-size:12.5px; color:var(--ink2); line-height:1.5; }
+
+  /* ── buttons ────────────────────────────────────────────── */
+  .btn {
+    display:inline-flex; align-items:center; justify-content:center; gap:6px;
+    padding:8px 14px; font-family:inherit; font-size:12.5px; font-weight:650;
+    border-radius:9px; border:1px solid var(--line2); background:#fff; color:var(--ink2);
+    cursor:pointer; white-space:nowrap; transition:background .12s, border-color .12s;
+  }
+  .btn:hover:not(:disabled) { background:var(--bg); border-color:var(--ink3); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .btn.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
+  .btn.primary:hover:not(:disabled) { background:var(--brand-dark); border-color:var(--brand-dark); }
+  .btn.ok     { background:var(--green-bg); border-color:#bfe5d9; color:var(--green); }
+  .btn.danger { background:var(--red-bg);   border-color:#f3cdc7; color:var(--red); }
+  .btn.full   { width:100%; }
+  .btn.sm     { padding:5px 10px; font-size:11.5px; }
+  .link {
+    background:none; border:none; padding:0; font-family:inherit; font-size:12.5px;
+    font-weight:600; color:var(--brand); cursor:pointer; text-align:left;
+  }
+  .link:hover { text-decoration:underline; }
+
+  .send {
+    width:100%; padding:15px; border:none; border-radius:var(--r);
+    background:var(--brand); color:#fff; font-family:inherit; font-size:15.5px; font-weight:750;
+    letter-spacing:-.2px; cursor:pointer; transition:background .15s, transform .08s;
+    box-shadow:0 1px 2px rgba(18,140,126,.3), 0 6px 18px -6px rgba(18,140,126,.5);
+  }
+  .send:hover:not(:disabled) { background:var(--brand-dark); }
+  .send:active:not(:disabled) { transform:translateY(1px); }
+  .send:disabled {
+    background:var(--surface); color:var(--ink3); cursor:not-allowed;
+    border:1px solid var(--line); box-shadow:none;
+  }
+  .send-note { font-size:12px; color:var(--ink2); text-align:center; margin-top:9px; }
+
+  /* ── badges ─────────────────────────────────────────────── */
+  .badge {
+    display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:99px;
+    font-size:11px; font-weight:700; letter-spacing:.2px;
+    background:var(--bg); border:1px solid var(--line); color:var(--ink2);
+  }
+  .badge::before { content:''; width:5px; height:5px; border-radius:50%; background:currentColor; }
+  .badge.green { background:var(--green-bg); border-color:#bfe5d9; color:var(--green); }
+  .badge.amber { background:var(--amber-bg); border-color:#f2e0b6; color:var(--amber); }
+  .badge.red   { background:var(--red-bg);   border-color:#f3cdc7; color:var(--red); }
+  .badge.blue  { background:var(--blue-bg);  border-color:#c9d4fb; color:var(--blue); }
+  .badges { display:flex; flex-wrap:wrap; gap:6px; }
+
+  /* ── dropzone ───────────────────────────────────────────── */
+  .drop {
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px;
+    min-height:104px; padding:18px; text-align:center; cursor:pointer;
+    border:1.5px dashed var(--line2); border-radius:10px; background:var(--bg);
+    transition:border-color .15s, background .15s;
+  }
+  .drop:hover, .drop.on { border-color:var(--brand); background:var(--brand-soft); }
+  .drop-big { font-size:28px; font-weight:800; letter-spacing:-1px; color:var(--green);
+    font-variant-numeric:tabular-nums; line-height:1.1; }
+  .drop-1 { font-size:14px; font-weight:600; color:var(--ink); }
+  .drop-2 { font-size:12px; color:var(--ink3); }
+  .peek { margin-top:12px; }
+  .peek-row { display:flex; justify-content:space-between; gap:10px;
+    padding:5px 0; font-size:12.5px; border-bottom:1px solid var(--line); }
+  .peek-row:last-child { border-bottom:none; }
+  .peek-row b { font-weight:600; }
+  .peek-row span { color:var(--ink3); font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+
+  /* ── whatsapp preview bubble ────────────────────────────── */
+  .chat { background:#e4ded6; border-radius:10px; padding:12px; }
+  .bubble {
+    background:#fff; border-radius:2px 9px 9px 9px; padding:8px 10px 5px;
+    max-width:94%; box-shadow:0 1px 1px rgba(0,0,0,.12);
+  }
+  .bubble-b { font-size:13.5px; color:#111b21; white-space:pre-wrap; word-break:break-word; line-height:1.45; }
+  .bubble-f { font-size:11.5px; color:#8696a0; margin-top:5px; }
+  .bubble-t { font-size:10.5px; color:#8696a0; text-align:right; margin-top:2px; }
+  .bubble-btn { border-top:1px solid #e9edef; margin-top:6px; padding-top:7px;
+    text-align:center; font-size:13.5px; color:#00a5f4; font-weight:500; }
+
+  /* ── stats ──────────────────────────────────────────────── */
+  .stats { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; }
+  @media (max-width:620px) { .stats { grid-template-columns:repeat(3,1fr); } }
+  .stat { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:13px 14px; min-width:0; }
+  .stat-v { font-size:26px; font-weight:800; letter-spacing:-1px; line-height:1.05; font-variant-numeric:tabular-nums; }
+  .stat-l { font-size:11px; font-weight:600; color:var(--ink3); margin-top:3px; }
+  .rates { display:flex; gap:10px; flex-wrap:wrap; }
+  .rate { flex:1; min-width:130px; background:var(--surface); border:1px solid var(--line);
+    border-radius:10px; padding:10px 14px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .rate-l { font-size:12px; color:var(--ink2); }
+  .rate-v { font-size:14px; font-weight:750; font-variant-numeric:tabular-nums; }
+
+  .bar { height:7px; background:var(--bg); border:1px solid var(--line); border-radius:99px; overflow:hidden; }
+  .bar-f { height:100%; background:var(--brand); border-radius:99px; transition:width .5s ease; }
+
+  .banner { border-radius:10px; padding:12px 15px; display:flex; align-items:center; gap:12px; font-size:13px; }
+  .banner.amber { background:var(--amber-bg); border:1px solid #f2e0b6; color:var(--amber); }
+  .banner.green { background:var(--green-bg); border:1px solid #bfe5d9; color:var(--green); }
+  .banner.red   { background:var(--red-bg);   border:1px solid #f3cdc7; color:var(--red); }
+  .banner span.grow { flex:1; min-width:0; }
+
+  /* ── table & log ────────────────────────────────────────── */
+  .scroll-x { overflow-x:auto; }
+  .tbl { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .tbl th { text-align:left; padding:7px 14px; font-size:11px; font-weight:650;
+    color:var(--ink3); border-bottom:1px solid var(--line); white-space:nowrap; }
+  .tbl td { padding:8px 14px; border-bottom:1px solid var(--line); vertical-align:top; }
+  .tbl tr:last-child td { border-bottom:none; }
+  .code { background:var(--red-bg); color:var(--red); padding:1px 6px; border-radius:5px;
+    font-family:ui-monospace,Menlo,monospace; font-size:11px; font-weight:700; }
+
+  .log { max-height:320px; overflow-y:auto; padding:4px 0 8px; }
+  .log-row { display:flex; gap:10px; padding:2px 18px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11.5px; line-height:1.75; }
+  .log-t { color:var(--ink3); flex-shrink:0; }
+  .log-l { width:46px; flex-shrink:0; font-weight:700; font-size:10.5px; }
+  .log-m { color:var(--ink2); word-break:break-word; }
+  .empty { padding:26px 16px; text-align:center; color:var(--ink3); font-size:13px; }
+
+  /* ── advanced ───────────────────────────────────────────── */
+  details.adv { background:var(--surface); border:1px solid var(--line); border-radius:var(--r); }
+  details.adv > summary {
+    list-style:none; cursor:pointer; padding:13px 18px;
+    font-size:12.5px; font-weight:650; color:var(--ink2);
+    display:flex; align-items:center; gap:8px;
+  }
+  details.adv > summary::-webkit-details-marker { display:none; }
+  details.adv > summary::before { content:'▸'; color:var(--ink3); font-size:11px; }
+  details.adv[open] > summary::before { content:'▾'; }
+  details.adv > summary:hover { color:var(--ink); }
+  .adv-b { padding:2px 18px 18px; border-top:1px solid var(--line); margin-top:2px; padding-top:16px; }
+  /* ── test send ──────────────────────────────────────────── */
+  .testbox { background:var(--bg); border:1px solid var(--line); border-radius:10px;
+    padding:13px 14px; margin-bottom:16px; }
+  .testbox .row { align-items:center; }
+  .testbox .btn { flex-shrink:0; }
+
+  /* ── warm-up ladder ─────────────────────────────────────── */
+  .ladder { display:flex; gap:6px; }
+  .rung { flex:1; min-width:0; text-align:center; padding:8px 4px; border-radius:8px;
+    background:var(--bg); border:1px solid var(--line); }
+  .rung-d { display:block; font-size:10px; color:var(--ink3); font-weight:600; }
+  .rung-n { display:block; font-size:13px; font-weight:750; color:var(--ink2);
+    font-variant-numeric:tabular-nums; margin-top:1px; }
+  .rung.past { background:var(--green-bg); border-color:#bfe5d9; }
+  .rung.past .rung-n, .rung.past .rung-d { color:var(--green); }
+  .rung.now { background:var(--brand); border-color:var(--brand); }
+  .rung.now .rung-n, .rung.now .rung-d { color:#fff; }
+
+  .switch { display:inline-flex; align-items:center; gap:7px; cursor:pointer;
+    font-size:12px; font-weight:650; color:var(--ink2); }
+  .switch input { width:15px; height:15px; accent-color:var(--brand); cursor:pointer; }
+
+  /* ── opt-out list ───────────────────────────────────────── */
+  .optlist { max-height:230px; overflow-y:auto; border:1px solid var(--line); border-radius:9px; }
+  .optrow { display:flex; justify-content:space-between; align-items:center; gap:10px;
+    padding:7px 12px; border-bottom:1px solid var(--line);
+    font-family:ui-monospace,Menlo,monospace; font-size:12.5px; }
+  .optrow:last-child { border-bottom:none; }
+  a.btn { text-decoration:none; }
+
+  .text-r { color:var(--red); }
+  .text-g { color:var(--green); }
+  .text-a { color:var(--amber); }
+  .text-2 { color:var(--ink2); }
+  .mt8 { margin-top:8px; } .mb0 { margin-bottom:0; }
 </style>
 </head>
 <body>
-<div id="root"><div style="height:100vh;display:flex;align-items:center;justify-content:center;color:#a1a1aa;font-size:13px;flex-direction:column;gap:8px"><div>Loading React app...</div><div style="font-size:11px;color:#d4d4d8">First load may take 3-5s (Babel compiling)</div></div></div>
+<div id="root"><div style="height:100vh;display:flex;align-items:center;justify-content:center;color:#a8a29e;font-size:13px">Loading…</div></div>
 
-<!-- CDN deps: loaded at bottom so inline scripts can't reference them before they're ready -->
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin="anonymous"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
@@ -22,682 +280,627 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback } = React;
 
-// ─── Backend URL resolution ────────────────────────────────────────────────────
-// In local dev:  backend is on the same origin, use relative URLs ('')
-// On Cloudflare Pages: backend is the Render URL stored in localStorage
-function getStoredBackend() {
-  const hostname = window.location.hostname;
-  const stored = localStorage.getItem('wa_campaign_backend');
-  if (stored) return stored;
-  // Only show the setup screen on known CDN/Pages deployments
-  // (where frontend and backend are on different servers)
-  const isCDN = hostname.endsWith('.pages.dev') ||
-                hostname.endsWith('.netlify.app') ||
-                hostname.endsWith('.vercel.app');
-  return isCDN ? null : '';  // '' = use relative URLs (same server)
-}
-
-// ─── API factory — all calls go through here ──────────────────────────────────
-function makeApi(backendUrl) {
-  const base = backendUrl || '';
-  const post = (path, data = {}) =>
-    fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json());
-  const get = path => fetch(base + path).then(r => r.json());
-  const upload = (path, formData) => fetch(base + path, { method: 'POST', body: formData }).then(r => r.json());
-  return { post, get, upload };
-}
-
-// ─── Tiny design tokens ───────────────────────────────────────────────────────
-const C = {
-  bg: '#f4f4f5', surface: '#ffffff', border: '#e4e4e7', border2: '#d4d4d8',
-  text: '#18181b', text2: '#71717a', text3: '#a1a1aa',
-  blue: '#2563eb', green: '#16a34a', red: '#dc2626', amber: '#d97706',
-  greenBg: '#f0fdf4', redBg: '#fef2f2', amberBg: '#fffbeb', blueBg: '#eff6ff',
+// Frontend and backend are the same origin (express serves this file), so every
+// call is relative. No server-picker screen, no localStorage.
+const api = {
+  get:    p       => fetch(p).then(r => r.json()),
+  post:   (p, d)  => fetch(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d || {}) }).then(r => r.json()),
+  upload: (p, fd) => fetch(p, { method: 'POST', body: fd }).then(r => r.json()),
 };
 
-// ─── Reusable components ──────────────────────────────────────────────────────
-const Field = ({ label, hint, children, inline }) => (
-  <div style={{ display: 'flex', flexDirection: inline ? 'row' : 'column', gap: inline ? 8 : 4, marginBottom: 12, alignItems: inline ? 'center' : undefined }}>
-    {label && <label style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.4px', color: C.text2, flexShrink: 0 }}>{label}</label>}
+const VAR = '{{1}}';
+const num = n => (n || 0).toLocaleString();
+const STATUS_COLOR = { APPROVED: 'green', PENDING: 'amber', IN_APPEAL: 'amber' };
+
+// ── Small presentational pieces ───────────────────────────────────────────────
+const Field = ({ label, hint, children }) => (
+  <div className="field">
+    {label && <label className="label">{label}</label>}
     {children}
-    {hint && <span style={{ fontSize: 10, color: C.text3, lineHeight: 1.5 }}>{hint}</span>}
+    {hint && <span className="hint">{hint}</span>}
   </div>
 );
 
-const TextInput = ({ value, onChange, onBlur, type = 'text', placeholder, mono, style }) => {
-  const [focused, setFocused] = useState(false);
-  return (
-    <input type={type} value={value} placeholder={placeholder} readOnly={!onChange}
-      onChange={e => onChange?.(e.target.value)} onBlur={() => { setFocused(false); onBlur?.(); }}
-      onFocus={() => setFocused(true)}
-      style={{ background: '#fff', border: `1px solid ${focused ? C.blue : C.border}`, borderRadius: 6, color: C.text, fontFamily: mono ? 'monospace' : 'inherit', fontSize: 12, padding: '8px 10px', outline: 'none', width: '100%', boxShadow: focused ? '0 0 0 2px rgba(37,99,235,.1)' : 'none', transition: 'border-color .12s, box-shadow .12s', ...style }} />
-  );
-};
-
-const NumberInput = ({ value, onChange, min = 1, max }) => (
-  <input type="number" value={value} min={min} max={max}
-    onChange={e => onChange(parseInt(e.target.value) || min)}
-    style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontFamily: 'monospace', fontSize: 12, padding: '8px 10px', outline: 'none', width: '100%' }} />
-);
-
-const Btn = ({ onClick, disabled, variant = 'ghost', size = 'md', full, children }) => {
-  const [hovered, setHovered] = useState(false);
-  const v = {
-    primary: { bg: hovered && !disabled ? '#1d4ed8' : C.blue, border: C.blue, color: '#fff' },
-    success: { bg: hovered ? '#dcfce7' : C.greenBg, border: '#bbf7d0', color: C.green },
-    danger:  { bg: hovered ? '#fee2e2' : C.redBg,   border: '#fecaca', color: C.red },
-    ghost:   { bg: hovered ? C.bg : '#fff',          border: C.border,  color: C.text2 },
-  }[variant];
-  const s = { sm: { padding: '5px 11px', fontSize: 11 }, md: { padding: '8px 14px', fontSize: 12 } }[size];
-  return <button onClick={disabled ? undefined : onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
-    style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 5, border: `1px solid ${v.border}`, borderRadius: 6, cursor: disabled ? 'not-allowed' : 'pointer', fontWeight: 600, fontFamily: 'inherit', background: v.bg, color: v.color, opacity: disabled ? .4 : 1, whiteSpace: 'nowrap', width: full ? '100%' : undefined, transition: 'background .12s', ...s }}>{children}</button>;
-};
-
-const Card = ({ children, style }) => (
-  <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden', ...style }}>{children}</div>
-);
-
-const CardSection = ({ label, right }) => (
-  <div style={{ padding: '10px 14px 6px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-    <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.5px', color: C.text3 }}>{label}</span>
-    {right}
-  </div>
-);
-
-const Badge = ({ color = 'gray', children }) => {
-  const colors = {
-    green: { bg: C.greenBg, border: '#bbf7d0', text: C.green },
-    red:   { bg: C.redBg,   border: '#fecaca', text: C.red },
-    amber: { bg: C.amberBg, border: '#fde68a', text: C.amber },
-    blue:  { bg: C.blueBg,  border: '#bfdbfe', text: C.blue },
-    gray:  { bg: C.bg,      border: C.border,  text: C.text2 },
-  }[color] || colors.gray;
-  return <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 7px', borderRadius: 20, fontSize: 10, fontWeight: 700, letterSpacing: '.3px', textTransform: 'uppercase', fontFamily: 'monospace', background: colors.bg, border: `1px solid ${colors.border}`, color: colors.text }}>
-    <span style={{ width: 5, height: 5, borderRadius: '50%', background: 'currentColor', flexShrink: 0 }} />{children}
-  </span>;
-};
-
-const StatCard = ({ label, value, color }) => (
-  <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '12px 14px', flex: 1, minWidth: 0 }}>
-    <div style={{ fontSize: 26, fontWeight: 800, fontFamily: 'monospace', letterSpacing: '-.5px', color: color || C.text, lineHeight: 1 }}>{(value || 0).toLocaleString()}</div>
-    <div style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.6px', color: C.text3, marginTop: 4 }}>{label}</div>
-  </div>
-);
-
-const PhasePill = ({ phase }) => {
-  const d = { idle: { bg: C.bg, color: C.text3 }, running: { bg: C.greenBg, color: C.green }, paused: { bg: C.amberBg, color: C.amber }, done: { bg: C.blueBg, color: C.blue } }[phase] || { bg: C.bg, color: C.text3 };
-  return <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 10px', borderRadius: 20, background: d.bg, fontSize: 11, fontWeight: 700, fontFamily: 'monospace', color: d.color }}>
-    <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor', flexShrink: 0 }} />{phase}
-  </span>;
-};
-
-// ─── Backend setup screen (shown once on Cloudflare Pages deployment) ─────────
-function BackendSetup({ onSave }) {
-  const [url, setUrl] = useState('');
-  const [testing, setTesting] = useState(false);
-  const [err, setErr] = useState('');
-  const save = async () => {
-    const clean = url.trim().replace(/\/$/, '');
-    if (!clean.startsWith('http')) { setErr('Enter a full URL starting with https://'); return; }
-    setTesting(true); setErr('');
-    try {
-      const r = await fetch(clean + '/health', { signal: AbortSignal.timeout(8000) }).then(r => r.json());
-      if (r.status === 'ok') { localStorage.setItem('wa_campaign_backend', clean); onSave(clean); }
-      else setErr('Server responded but /health check failed');
-    } catch (e) { setErr('Could not reach server. Check the URL and make sure it is running.'); }
-    setTesting(false);
-  };
-  return (
-    <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.bg, padding: 20 }}>
-      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 28, maxWidth: 420, width: '100%' }}>
-        <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Connect to Backend</div>
-        <div style={{ fontSize: 12, color: C.text2, marginBottom: 20, lineHeight: 1.6 }}>
-          You are running the frontend on Cloudflare Pages. Enter your Render backend URL to connect. This is saved in your browser and only needs to be done once.
-        </div>
-        <Field label="Render Backend URL" hint="e.g. https://meta-wa-campaign.onrender.com">
-          <TextInput value={url} onChange={setUrl} placeholder="https://your-app.onrender.com" mono />
-        </Field>
-        {err && <div style={{ fontSize: 12, color: C.red, marginBottom: 12 }}>{err}</div>}
-        <Btn variant="primary" size="md" full onClick={save} disabled={!url || testing}>{testing ? 'Testing connection...' : 'Save and Connect'}</Btn>
-        <div style={{ marginTop: 14, fontSize: 11, color: C.text3, lineHeight: 1.6 }}>
-          Don't have a backend yet? <a href="https://github.com/your-repo#deployment" style={{ color: C.blue }}>Deployment guide →</a>
-        </div>
+const Step = ({ n, title, state = 'todo', right, children }) => (
+  <div className="card">
+    <div className="card-h">
+      <div className={`step-n ${state === 'done' ? 'ok' : state === 'todo' ? 'off' : ''}`}>
+        {state === 'done' ? '✓' : n}
       </div>
+      <div className="step-t">{title}</div>
+      {right && <div className="right">{right}</div>}
     </div>
-  );
-}
+    <div className="card-b">{children}</div>
+  </div>
+);
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
+const Stat = ({ label, value, color }) => (
+  <div className="stat">
+    <div className="stat-v" style={{ color }}>{num(value)}</div>
+    <div className="stat-l">{label}</div>
+  </div>
+);
+
+// What a contact would actually receive: {{1}} filled with a real-looking name.
+const Preview = ({ body, footer, optOut, sample }) => body ? (
+  <div className="chat">
+    <div className="bubble">
+      <div className="bubble-b">{body.replace(/\{\{\s*1\s*\}\}/g, sample || 'Rahul')}</div>
+      {footer && <div className="bubble-f">{footer}</div>}
+      <div className="bubble-t">12:00</div>
+      {optOut && <div className="bubble-btn">Stop promotions</div>}
+    </div>
+  </div>
+) : null;
+
+// ── App ───────────────────────────────────────────────────────────────────────
 function App() {
-  const [backendUrl, setBackendUrl] = useState(() => getStoredBackend());
-
-  if (backendUrl === null) {
-    return <BackendSetup onSave={url => setBackendUrl(url)} />;
-  }
-  return <Campaign backendUrl={backendUrl} onChangeBackend={() => { localStorage.removeItem('wa_campaign_backend'); setBackendUrl(null); }} />;
-}
-
-function Campaign({ backendUrl, onChangeBackend }) {
-  const api = useRef(makeApi(backendUrl));
-
-  // Server state (from socket + REST)
-  const [ss, setSS] = useState({ phase: 'idle', accepted: 0, delivered: 0, read: 0, failed: 0, skipped: 0, dailyCount: 0, dailyCap: 1000, total: 0, currentIdx: 0, currentContact: null, pauseReason: null, configured: false });
-  // Local UI state
-  const [creds, setCreds]     = useState({ phoneId: 'YOUR_PHONE_NUMBER_ID', token: '', wabaId: '' });
+  const [ss, setSS] = useState({ phase: 'idle', accepted: 0, delivered: 0, read: 0, failed: 0, skipped: 0, dailyCount: 0, dailyCap: 1000, total: 0, currentContact: null, pauseReason: null, configured: false, config: {} });
+  const [account,  setAccount]  = useState(null);
   const [contacts, setContacts] = useState({ count: 0, sample: [], file: '' });
-  const [tmpl, setTmpl]       = useState({ name: 'your_template_name', status: null, category: null, language: 'en', bodyText: null, checking: false, error: null, rejectedReason: null });
-  const [compose, setCompose] = useState({
-    displayName: '', bodyText: '', footerText: '', sampleValue: 'Rahul',
-    addOptOut: true, category: 'MARKETING', language: 'en',
-    submitting: false, errors: [],
-  });
+  const [templates, setTemplates] = useState([]);
+  const [picked,   setPicked]   = useState('');       // name of the active template
+  const [tmplErr,  setTmplErr]  = useState(null);
+  const [writing,  setWriting]  = useState(false);    // composer open?
+  const [compose,  setCompose]  = useState({ displayName: '', bodyText: '', footerText: '', sampleValue: 'Rahul', addOptOut: true, category: 'MARKETING', language: 'en', submitting: false, errors: [] });
   const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 1000 });
-  const [logs, setLogs]       = useState([]);
-  const [failLog, setFailLog] = useState([]);
-  const [showToken, setShowToken] = useState(false);
-  const [savedOk, setSavedOk] = useState(false);
+  const [creds,    setCreds]    = useState({ phoneId: '', token: '', wabaId: '' });
+  const [credsMsg, setCredsMsg] = useState('');
+  const [logs,     setLogs]     = useState([]);
+  const [failLog,  setFailLog]  = useState([]);
+  const [optOuts,  setOptOuts]  = useState([]);
+  const [optAdd,   setOptAdd]   = useState('');
+  const [test,     setTest]     = useState({ to: '', sending: false, results: null });
   const [starting, setStarting] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [connected, setConnected] = useState(false);
+  const logEnd = useRef(null);
 
-  const logEndRef   = useRef(null);
-  const validateRef = useRef(null);
+  const active = templates.find(t => t.name === picked) || null;
 
   // ── Socket ──────────────────────────────────────────────────────
   useEffect(() => {
-    const opts = backendUrl ? { transports: ['websocket', 'polling'] } : {};
-    const sock = backendUrl ? io(backendUrl, opts) : io();
+    const sock = io();
     sock.on('connect',    () => setConnected(true));
     sock.on('disconnect', () => setConnected(false));
-    sock.on('state',  s  => setSS(s));
-    sock.on('log',    e  => setLogs(p => [...p.slice(-400), e]));
-    sock.on('logs',   ls => setLogs(ls.slice(-400)));
-    // Keep-alive ping every 10 minutes (prevents Render free tier from sleeping)
-    const ka = setInterval(() => fetch((backendUrl || '') + '/health').catch(() => {}), 10 * 60 * 1000);
-    return () => { sock.disconnect(); clearInterval(ka); };
-  }, [backendUrl]);
+    sock.on('state', s  => setSS(s));
+    sock.on('log',   e  => setLogs(p => [...p.slice(-400), e]));
+    sock.on('logs',  ls => setLogs(ls.slice(-400)));
+    return () => sock.disconnect();
+  }, []);
 
-  // ── Initial load ─────────────────────────────────────────────────
+  // ── Initial load: everything the server already knows, prefilled ─
+  const loadTemplates = useCallback(async (prefer) => {
+    const r = await api.get('/api/templates').catch(() => ({ error: 'Network error' }));
+    if (r.error) { setTmplErr(r.error); return; }
+    setTmplErr(null);
+    setTemplates(r.templates);
+    // Prefer the server's configured template, else the first APPROVED one.
+    setPicked(cur => {
+      const want = prefer || cur;
+      if (want && r.templates.some(t => t.name === want)) return want;
+      return (r.templates.find(t => t.status === 'APPROVED') || r.templates[0] || {}).name || '';
+    });
+  }, []);
+
   useEffect(() => {
-    api.current.get('/api/state').then(s => {
-      if (s.config) {
-        if (s.config.templateName) setTmpl(t => ({ ...t, name: s.config.templateName }));
-        if (s.config.delaySec)     setSettings(p => ({ ...p, delaySec: s.config.delaySec }));
-        if (s.config.dailyCap)     setSettings(p => ({ ...p, dailyCap: s.config.dailyCap }));
+    api.get('/api/state').then(s => {
+      const c = s.config || {};
+      setSettings(p => ({ delaySec: c.delaySec || p.delaySec, dailyCap: c.dailyCap || p.dailyCap }));
+      // Contacts survive a page reload because they live on the server.
+      if (s.total > 0) {
+        setContacts(x => ({ ...x, count: s.total }));
+        if (s.currentContact) setTest(t => t.to ? t : { ...t, to: '+' + s.currentContact.dialStr });
       }
-      if (s.total > 0) setContacts(c => ({ ...c, count: s.total }));
+      loadTemplates(c.templateName);
+    }).catch(() => loadTemplates());
+
+    api.get('/api/faillog').then(d => setFailLog(d || [])).catch(() => {});
+    api.get('/api/optouts').then(d => setOptOuts(d.numbers || [])).catch(() => {});
+    api.get('/api/account-info').then(a => {
+      if (a.error) return;
+      setAccount(a);
+      setCreds(c => ({ ...c, phoneId: a.phoneNumberId || '', wabaId: a.wabaId || '' }));
+      // Meta's own tier is the correct daily cap — no reason to make anyone type it.
+      if (a.tierCap) setSettings(p => ({ ...p, dailyCap: a.tierCap }));
     }).catch(() => {});
-    api.current.get('/api/faillog').then(d => setFailLog(d || [])).catch(() => {});
-  }, []);
+  }, [loadTemplates]);
 
-  // ── Auto-scroll logs ─────────────────────────────────────────────
-  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+  useEffect(() => { logEnd.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
 
-  // ── Credentials: auto-save on blur ───────────────────────────────
-  const saveCreds = useCallback(async () => {
-    if (!creds.token && !creds.phoneId) return;
-    await api.current.post('/api/config', { phoneNumberId: creds.phoneId, accessToken: creds.token, wabaId: creds.wabaId });
-    setSavedOk(true); setTimeout(() => setSavedOk(false), 2500);
-  }, [creds]);
+  // Tell the server which template to send, and let it count the variables.
+  useEffect(() => {
+    if (picked) api.get(`/api/validate-template?name=${encodeURIComponent(picked)}`).catch(() => {});
+  }, [picked]);
 
-  // ── Template: auto-validate with debounce ─────────────────────────
-  const doValidate = useCallback(async (name) => {
-    if (!name) return;
-    setTmpl(t => ({ ...t, checking: true, status: null, error: null }));
-    const r = await api.current.get(`/api/validate-template?name=${encodeURIComponent(name)}`).catch(() => ({ error: 'Network error' }));
-    if (r.error) {
-      setTmpl(t => ({ ...t, checking: false, status: 'error', error: r.error }));
-    } else if (!r.found) {
-      setTmpl(t => ({ ...t, checking: false, status: 'not_found' }));
-    } else {
-      const tmplData = r.templates[0];
-      setTmpl(t => ({ ...t, checking: false, status: tmplData.status, category: tmplData.category, language: tmplData.language, bodyText: tmplData.bodyText }));
-      await api.current.post('/api/config', { templateName: name, templateCategory: tmplData.category, templateLanguage: tmplData.language });
+  // Poll Meta while anything in the list is still under review.
+  useEffect(() => {
+    if (!templates.some(t => t.status === 'PENDING')) return;
+    const id = setInterval(() => loadTemplates(), 15000);
+    return () => clearInterval(id);
+  }, [templates, loadTemplates]);
+
+  // ── Actions ─────────────────────────────────────────────────────
+  const uploadCSV = useCallback(async file => {
+    const fd = new FormData(); fd.append('csv', file);
+    const r = await api.upload('/api/upload-csv', fd);
+    if (r.ok) {
+      setContacts({ count: r.count, sample: r.sample, file: file.name });
+      setFailLog([]);
+      // Prefill the test box with the first number in the file — the usual case
+      // is that row one is your own number, put there to test with.
+      setTest(t => t.to ? t : { ...t, to: '+' + (r.sample?.[0]?.dialStr || '') });
     }
+    else alert('Could not read that CSV: ' + (r.error || 'unknown error'));
   }, []);
 
-  const onTmplChange = useCallback((name) => {
-    setTmpl(t => ({ ...t, name, status: null }));
-    clearTimeout(validateRef.current);
-    if (name) validateRef.current = setTimeout(() => doValidate(name), 1200);
-  }, [doValidate]);
-
-  // ── Compose: submit a new template for approval ──────────────────
   const submitTemplate = useCallback(async () => {
     setCompose(c => ({ ...c, submitting: true, errors: [] }));
-    const r = await api.current.post('/api/template/create', {
-      displayName:  compose.displayName,
-      bodyText:     compose.bodyText,
-      footerText:   compose.footerText,
-      sampleValues: [compose.sampleValue],
-      addOptOut:    compose.addOptOut,
-      category:     compose.category,
-      language:     compose.language,
+    const r = await api.post('/api/template/create', {
+      displayName: compose.displayName, bodyText: compose.bodyText, footerText: compose.footerText,
+      sampleValues: [compose.sampleValue], addOptOut: compose.addOptOut,
+      category: compose.category, language: compose.language,
     }).catch(() => ({ ok: false, errors: ['Network error — is the server running?'] }));
-
     setCompose(c => ({ ...c, submitting: false, errors: r.ok ? [] : (r.errors || ['Unknown error']) }));
-    if (r.ok) {
-      setTmpl(t => ({ ...t, name: r.name, status: r.status, rejectedReason: null,
-                      bodyText: compose.bodyText, category: compose.category, language: compose.language }));
-    }
-  }, [compose]);
+    if (r.ok) { setWriting(false); await loadTemplates(r.name); }
+  }, [compose, loadTemplates]);
 
-  // ── Poll Meta while a template is under review ───────────────────
-  // Approval is usually minutes. Polling beats asking the user to refresh.
-  useEffect(() => {
-    if (tmpl.status !== 'PENDING' || !tmpl.name) return;
-    const tick = async () => {
-      const r = await api.current.get(`/api/template/status?name=${encodeURIComponent(tmpl.name)}`).catch(() => null);
-      if (r?.status && r.status !== 'PENDING') {
-        setTmpl(t => ({ ...t, status: r.status, rejectedReason: r.rejectedReason,
-                        bodyText: r.bodyText || t.bodyText, category: r.category || t.category }));
-      }
-    };
-    const id = setInterval(tick, 15000);
-    return () => clearInterval(id);
-  }, [tmpl.status, tmpl.name]);
+  const saveCreds = useCallback(async () => {
+    const r = await api.post('/api/config', { phoneNumberId: creds.phoneId, accessToken: creds.token, wabaId: creds.wabaId });
+    setCredsMsg(r.configured ? 'Saved' : 'Saved — still incomplete');
+    setTimeout(() => setCredsMsg(''), 2500);
+  }, [creds]);
 
-  // ── CSV upload ────────────────────────────────────────────────────
-  const uploadCSV = useCallback(async (file) => {
-    const fd = new FormData(); fd.append('csv', file);
-    const r = await api.current.upload('/api/upload-csv', fd);
-    if (r.ok) setContacts({ count: r.count, sample: r.sample, file: file.name });
+  const editOptOuts = useCallback(async patch => {
+    const r = await api.post('/api/optouts', patch).catch(() => null);
+    if (!r?.ok) return alert('Could not update the opt-out list.');
+    setOptOuts(r.numbers);
+    if (r.invalid?.length) alert('Not a valid phone number: ' + r.invalid.join(', '));
   }, []);
 
-  // ── Campaign actions ──────────────────────────────────────────────
+  const toggleWarmup = enabled => api.post('/api/warmup', { enabled });
+
+  const sendTest = useCallback(async () => {
+    const numbers = test.to.split(/[,\s]+/).filter(Boolean);
+    if (!numbers.length) return;
+    setTest(t => ({ ...t, sending: true, results: null }));
+    await api.post('/api/config', { templateName: picked });
+    const r = await api.post('/api/test-send', { numbers })
+      .catch(() => ({ ok: false, results: [{ input: numbers[0], ok: false, error: 'Network error' }] }));
+    setTest(t => ({ ...t, sending: false, results: r.results || [{ ok: false, error: r.error }] }));
+  }, [test.to, picked]);
+
   const doStart = async () => {
     setStarting(true);
-    await api.current.post('/api/config', { delaySec: settings.delaySec, dailyCap: settings.dailyCap });
-    const r = await api.current.post('/api/start');
-    if (!r.ok) alert('Error: ' + r.error);
+    await api.post('/api/config', { delaySec: settings.delaySec, dailyCap: settings.dailyCap, templateName: picked });
+    const r = await api.post('/api/start');
+    if (!r.ok) alert('Could not start: ' + r.error);
     setStarting(false);
   };
-  const doPause  = () => api.current.post('/api/pause',  {});
-  const doResume = () => api.current.post('/api/resume', {});
-  const doStop   = () => { if (confirm('Stop the campaign?')) api.current.post('/api/stop', {}); };
-  const doReset  = () => { if (confirm('Reset everything?')) { api.current.post('/api/reset', {}); setContacts({ count: 0, sample: [], file: '' }); setLogs([]); } };
-
-  // ── Derived stats ─────────────────────────────────────────────────
-  const { phase, accepted, delivered, read, failed, skipped, dailyCount, dailyCap, total, currentContact, pauseReason, configured } = ss;
-  const done  = accepted + failed + skipped;
-  const pct   = total > 0 ? Math.round(done / total * 100) : 0;
-  const dRate = accepted > 0 ? Math.round(delivered / accepted * 100) + '%' : '—';
-  const rRate = accepted > 0 ? Math.round(read / accepted * 100) + '%' : '—';
-  const approved   = tmpl.status === 'APPROVED';
-  const isReady    = (configured || savedOk) && contacts.count > 0 && approved && phase === 'idle';
-  const isRunning  = phase === 'running';
-  const isPaused   = phase === 'paused';
-
-  // Why the Launch button is disabled — shown under it so the state is never a mystery.
-  const blockedBy = !(configured || savedOk) ? 'Add your Access Token and Phone Number ID'
-    : !approved   ? (tmpl.status === 'PENDING' ? 'Waiting for Meta to approve the template'
-                    : 'Compose a message and get it approved first')
-    : !contacts.count ? 'Upload a CSV of contacts'
-    : phase !== 'idle' ? 'Campaign already running — stop or reset it first'
-    : null;
-
-  // Live preview: substitute {{1}} with the sample value the user typed.
-  const previewText = (compose.bodyText || '').replace(/\{\{\s*1\s*\}\}/g, compose.sampleValue || 'Rahul');
-  const bodyLen     = (compose.bodyText || '').length;
-  const hasVar      = /\{\{\s*1\s*\}\}/.test(compose.bodyText || '');
-
-  // ── Template status badge ─────────────────────────────────────────
-  const TmplStatus = () => {
-    if (tmpl.checking) return <span style={{ fontSize: 11, color: C.text3 }}>Checking...</span>;
-    if (!tmpl.status) return null;
-    if (tmpl.status === 'error') return <span style={{ fontSize: 11, color: C.red }}>{tmpl.error}</span>;
-    if (tmpl.status === 'not_found') return <Badge color="red">Not found</Badge>;
-    const color = tmpl.status === 'APPROVED' ? 'green' : tmpl.status === 'PENDING' ? 'amber' : 'red';
-    const catColor = { MARKETING: 'amber', UTILITY: 'blue', AUTHENTICATION: 'blue' }[tmpl.category] || 'gray';
-    return (
-      <div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 6 }}>
-          <Badge color={color}>{tmpl.status}</Badge>
-          {tmpl.category && <Badge color={catColor}>{tmpl.category}</Badge>}
-          {tmpl.language && <Badge>{tmpl.language}</Badge>}
-        </div>
-        {tmpl.status === 'PENDING' && (
-          <div style={{ fontSize: 11, color: C.amber, marginTop: 6 }}>
-            Meta is reviewing — usually a few minutes. Checking every 15s.
-          </div>
-        )}
-        {tmpl.rejectedReason && (
-          <div style={{ fontSize: 11, color: C.red, marginTop: 6 }}>Reason: {tmpl.rejectedReason}</div>
-        )}
-      </div>
-    );
+  const doPause  = () => api.post('/api/pause');
+  const doResume = () => api.post('/api/resume');
+  const doStop   = () => confirm('Stop the campaign? Progress is not resumable.') && api.post('/api/stop');
+  const doReset  = () => {
+    if (!confirm('Clear contacts, stats and logs?')) return;
+    api.post('/api/reset');
+    setContacts({ count: 0, sample: [], file: '' }); setLogs([]); setFailLog([]);
   };
 
-  const isMobile = typeof window !== 'undefined' && window.innerWidth < 768;
+  // ── Derived ─────────────────────────────────────────────────────
+  const { phase, accepted, delivered, read, failed, skipped, dailyCount, dailyCap, total, currentContact, pauseReason, configured, warmup: warm } = ss;
+  const done = accepted + failed + skipped;
+  const pct  = total > 0 ? Math.round(done / total * 100) : 0;
+  const rate = n => accepted > 0 ? Math.round(n / accepted * 100) + '%' : '—';
+  const isRunning = phase === 'running';
+  const isPaused  = phase === 'paused';
+  const approved  = active?.status === 'APPROVED';
+  const ready     = configured && contacts.count > 0 && approved && phase === 'idle';
+
+  const blockedBy =
+    !configured        ? 'Credentials missing on the server — check .env, or open Advanced below' :
+    !contacts.count    ? 'Upload a CSV to get started' :
+    !active            ? 'Pick or write a message template' :
+    active.status === 'PENDING' ? 'Meta is still reviewing this template — checking every 15s' :
+    !approved          ? `That template is ${active.status} — pick an approved one or write a new one` :
+    phase !== 'idle'   ? 'A campaign is already running — stop it first' : null;
+
+  // The picker groups by what you can actually do with each template, so an
+  // approved one is never buried among rejected ones.
+  const ready2   = templates.filter(t => t.status === 'APPROVED');
+  const waiting  = templates.filter(t => t.status === 'PENDING' || t.status === 'IN_APPEAL');
+  const unusable = templates.filter(t => !ready2.includes(t) && !waiting.includes(t));
+
+  const sampleName = contacts.sample?.[0]?.name || compose.sampleValue || 'Rahul';
+  const eta = Math.max(1, Math.round(contacts.count * settings.delaySec / 60));
+  const days = Math.ceil(contacts.count / Math.max(1, settings.dailyCap));
 
   return (
-    <div style={{ minHeight: '100vh', background: C.bg }}>
-
-      {/* ── Header ──────────────────────────────────────────────── */}
-      <header style={{ background: '#fff', borderBottom: `1px solid ${C.border}`, height: 52, display: 'flex', alignItems: 'center', padding: '0 18px', gap: 10, position: 'sticky', top: 0, zIndex: 30 }}>
-        <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: '-.2px' }}>WA Campaign</span>
-        <div style={{ width: 1, height: 18, background: C.border, flexShrink: 0 }} />
-        <PhasePill phase={phase} />
-        {!connected && <span style={{ fontSize: 10, color: C.red, fontFamily: 'monospace' }}>disconnected</span>}
-        {pauseReason && <span style={{ fontSize: 11, color: C.amber, fontStyle: 'italic', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 }}>{pauseReason}</span>}
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-          {isPaused  && <Btn variant="success" onClick={doResume}>Resume</Btn>}
-          {isRunning && <Btn variant="ghost" onClick={doPause}>Pause</Btn>}
-          {(isRunning || isPaused) && <Btn variant="danger" onClick={doStop}>Stop</Btn>}
-          <Btn variant="ghost" onClick={doReset}>Reset</Btn>
-          {backendUrl && <Btn variant="ghost" onClick={onChangeBackend} size="sm">Change server</Btn>}
+    <>
+      <header className="hdr">
+        <div className="brand">WA <span>Campaign</span></div>
+        {account && <>
+          <div className="sep" />
+          <div className="acct">
+            <div className="acct-1">{account.verifiedName || 'WhatsApp Business'}</div>
+            <div className="acct-2">
+              +{account.displayPhone?.replace(/\D/g, '')} · quality {String(account.qualityRating).toLowerCase()}
+              {account.tierCap ? ` · ${num(account.tierCap)}/day` : ''}
+            </div>
+          </div>
+        </>}
+        <div className="hdr-r">
+          {!connected && <span className="badge red">offline</span>}
+          <span className={`pill ${phase}`}>{phase}</span>
+          {isPaused  && <button className="btn ok"     onClick={doResume}>Resume</button>}
+          {isRunning && <button className="btn"        onClick={doPause}>Pause</button>}
+          {(isRunning || isPaused) && <button className="btn danger" onClick={doStop}>Stop</button>}
+          {!isRunning && <button className="btn sm" onClick={doReset}>Reset</button>}
         </div>
       </header>
 
-      {/* ── Body ────────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', gap: 14, padding: '14px', maxWidth: 1200, margin: '0 auto', flexDirection: isMobile ? 'column' : 'row', alignItems: 'flex-start' }}>
+      <div className="wrap">
+        {/* ── LEFT: three steps ─────────────────────────────── */}
+        <div className="col">
 
-        {/* ── LEFT: Setup ─────────────────────────────────────── */}
-        <div style={{ width: isMobile ? '100%' : 320, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
-
-          {/* Credentials */}
-          <Card>
-            <CardSection label="API Credentials" right={savedOk && <span style={{ fontSize: 10, color: C.green, fontWeight: 600 }}>Saved</span>} />
-            <div style={{ padding: '4px 14px 14px', display: 'flex', flexDirection: 'column', gap: 0 }}>
-              <Field label="Phone Number ID">
-                <TextInput value={creds.phoneId} onChange={v => setCreds(p => ({ ...p, phoneId: v }))} onBlur={saveCreds} mono />
-              </Field>
-              <Field label="Access Token" hint="Paste token — auto-saves when you click away">
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <TextInput type={showToken ? 'text' : 'password'} value={creds.token} onChange={v => setCreds(p => ({ ...p, token: v }))} onBlur={saveCreds} placeholder="EAABxx..." mono />
-                  <button onClick={() => setShowToken(!showToken)} style={{ padding: '0 10px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text2, cursor: 'pointer', fontSize: 11, fontWeight: 600, flexShrink: 0 }}>{showToken ? 'Hide' : 'Show'}</button>
-                </div>
-              </Field>
-              <Field label="WABA ID" hint="For template validation. Auto-resolved if blank.">
-                <TextInput value={creds.wabaId} onChange={v => setCreds(p => ({ ...p, wabaId: v }))} onBlur={saveCreds} placeholder="Auto-resolved" mono />
-              </Field>
-            </div>
-          </Card>
-
-          {/* Compose */}
-          <Card>
-            <CardSection label="Compose Message" right={<span style={{ fontSize: 10, color: C.text3 }}>{bodyLen}/1024</span>} />
-            <div style={{ padding: '4px 14px 14px' }}>
-
-              <div style={{ background: C.blueBg, border: `1px solid #bfdbfe`, borderRadius: 6, padding: '8px 10px', fontSize: 11, color: '#1e40af', lineHeight: 1.5, marginBottom: 12 }}>
-                Meta requires every message to cold contacts to be an approved template.
-                Write it here, submit, and send once it turns APPROVED.
+          <Step n={1} title="Upload contacts" state={contacts.count ? 'done' : 'now'}
+                right={contacts.count ? `${num(contacts.count)} numbers` : null}>
+            <label htmlFor="csv" className={`drop ${dragging ? 'on' : ''}`}
+              onDragOver={e => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={e => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f?.name.endsWith('.csv')) uploadCSV(f); }}>
+              {contacts.count ? <>
+                <div className="drop-big">{num(contacts.count)}</div>
+                <div className="drop-2">{contacts.file ? `${contacts.file} — click to replace` : 'already loaded on the server — click to replace'}</div>
+              </> : <>
+                <div className="drop-1">Drop your CSV here</div>
+                <div className="drop-2">or click to choose · Google Contacts export works as-is</div>
+              </>}
+            </label>
+            <input id="csv" type="file" accept=".csv" hidden onChange={e => e.target.files[0] && uploadCSV(e.target.files[0])} />
+            {contacts.sample?.length > 0 && (
+              <div className="peek">
+                {contacts.sample.slice(0, 3).map((c, i) => (
+                  <div className="peek-row" key={i}><b>{c.name}</b><span>+{c.dialStr}</span></div>
+                ))}
+                {contacts.count > 3 && <div className="hint mt8">and {num(contacts.count - 3)} more</div>}
               </div>
+            )}
+          </Step>
 
-              <Field label="Template Name" hint="Lowercased and underscored automatically">
-                <TextInput value={compose.displayName} onChange={v => setCompose(c => ({ ...c, displayName: v }))} placeholder="Diwali Offer 2026" />
-              </Field>
+          <Step n={2} title="Message" state={approved ? 'done' : contacts.count ? 'now' : 'todo'}
+                right={active && <span className={`badge ${STATUS_COLOR[active.status] || 'red'}`}>{active.status}</span>}>
 
-              <Field label="Message Body" hint="Use {{1}} where the contact's name should go">
-                <textarea
-                  value={compose.bodyText}
-                  onChange={e => setCompose(c => ({ ...c, bodyText: e.target.value }))}
-                  maxLength={1024} rows={5}
-                  placeholder="Hi {{1}}, our new range is live. Visit us this week for 20% off."
-                  style={{ width: '100%', padding: '8px 10px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, fontFamily: 'inherit', lineHeight: 1.6, resize: 'vertical', outline: 'none' }} />
-              </Field>
+            {!writing ? (
+              <>
+                <Field label="Template" hint={active?.status === 'PENDING'
+                  ? 'Meta usually approves within minutes. This list refreshes on its own — no need to reload.'
+                  : `${ready2.length} template${ready2.length === 1 ? '' : 's'} ready to send right now.`}>
+                  <select className="sel" value={picked} onChange={e => setPicked(e.target.value)}>
+                    {templates.length === 0 && <option value="">No templates found</option>}
+                    {ready2.length > 0 && (
+                      <optgroup label="Ready to send">
+                        {ready2.map(t => <option key={t.name} value={t.name}>{t.name} — {t.language} · {t.category}</option>)}
+                      </optgroup>
+                    )}
+                    {waiting.length > 0 && (
+                      <optgroup label="Awaiting Meta approval">
+                        {waiting.map(t => <option key={t.name} value={t.name}>{t.name} — {t.status}</option>)}
+                      </optgroup>
+                    )}
+                    {unusable.length > 0 && (
+                      <optgroup label="Cannot be sent">
+                        {unusable.map(t => <option key={t.name} value={t.name}>{t.name} — {t.status}</option>)}
+                      </optgroup>
+                    )}
+                  </select>
+                </Field>
 
-              <div style={{ display: 'flex', gap: 6, marginTop: -6, marginBottom: 12 }}>
-                <button
-                  onClick={() => setCompose(c => ({ ...c, bodyText: c.bodyText + '{{1}}' }))}
-                  style={{ padding: '4px 8px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, color: C.text2, cursor: 'pointer', fontSize: 11, fontWeight: 600, fontFamily: 'inherit' }}>
-                  + Insert {'{{1}}'} name
+                {tmplErr && <div className="banner red mb0" style={{ marginBottom: 14 }}>{tmplErr}</div>}
+                {active?.rejectedReason && <div className="banner red" style={{ marginBottom: 14 }}>Rejected: {active.rejectedReason}</div>}
+
+                <Preview body={active?.bodyText} footer={null}
+                         optOut={(active?.buttons || []).length > 0} sample={sampleName} />
+
+                <div className="mt8"><button className="link" onClick={() => setWriting(true)}>+ Write a new template instead</button></div>
+              </>
+            ) : (
+              <>
+                <Field label="Name it" hint="Lowercased and underscored for Meta automatically">
+                  <input className="in" value={compose.displayName} placeholder="Diwali Offer 2026"
+                    onChange={e => setCompose(c => ({ ...c, displayName: e.target.value }))} />
+                </Field>
+
+                <Field label={`Message · ${compose.bodyText.length}/1024`}
+                       hint={`Put ${VAR} where the contact's name should go.`}>
+                  <textarea className="ta" rows={5} maxLength={1024} value={compose.bodyText}
+                    placeholder={`Hi ${VAR}, our new range is live. Visit us this week for 20% off.`}
+                    onChange={e => setCompose(c => ({ ...c, bodyText: e.target.value }))} />
+                </Field>
+                <button className="btn sm" style={{ marginTop: -6, marginBottom: 14 }}
+                  onClick={() => setCompose(c => ({ ...c, bodyText: c.bodyText + VAR }))}>
+                  + Insert {VAR} name
+                </button>
+
+                <Field label="Footer" hint="Optional · max 60 characters">
+                  <input className="in" value={compose.footerText} placeholder="Mirror PVC"
+                    onChange={e => setCompose(c => ({ ...c, footerText: e.target.value.slice(0, 60) }))} />
+                </Field>
+
+                <div className="row">
+                  <Field label="Category">
+                    <select className="sel" value={compose.category} onChange={e => setCompose(c => ({ ...c, category: e.target.value }))}>
+                      <option value="MARKETING">Marketing</option>
+                      <option value="UTILITY">Utility</option>
+                    </select>
+                  </Field>
+                  <Field label="Language">
+                    <select className="sel" value={compose.language} onChange={e => setCompose(c => ({ ...c, language: e.target.value }))}>
+                      <option value="en">English</option>
+                      <option value="en_US">English (US)</option>
+                      <option value="hi">Hindi</option>
+                    </select>
+                  </Field>
+                </div>
+
+                <label className="check">
+                  <input type="checkbox" checked={compose.addOptOut}
+                    onChange={e => setCompose(c => ({ ...c, addOptOut: e.target.checked }))} />
+                  <span>Add a <b>Stop promotions</b> button. Taps are recorded and those numbers are never messaged again — this is what protects your quality rating.</span>
+                </label>
+
+                <Preview body={compose.bodyText} footer={compose.footerText}
+                         optOut={compose.addOptOut} sample={compose.sampleValue} />
+
+                {compose.errors.length > 0 && (
+                  <div className="banner red" style={{ marginTop: 14, display: 'block' }}>
+                    {compose.errors.map((e, i) => <div key={i}>• {e}</div>)}
+                  </div>
+                )}
+
+                <div className="row" style={{ marginTop: 14 }}>
+                  <button className="btn" onClick={() => setWriting(false)}>Cancel</button>
+                  <button className="btn primary" style={{ flex: 1 }} onClick={submitTemplate}
+                    disabled={compose.submitting || !compose.bodyText || !compose.displayName}>
+                    {compose.submitting ? 'Submitting to Meta…' : 'Submit for approval'}
+                  </button>
+                </div>
+              </>
+            )}
+          </Step>
+
+          <Step n={3} title="Send" state={ready ? 'now' : 'todo'}>
+            {/* Test first. A bad template or a dead webhook is much cheaper to
+                find on your own number than on the whole list. */}
+            <div className="testbox">
+              <div className="label" style={{ marginBottom: 6 }}>Test on your own number first</div>
+              <div className="row" style={{ gap: 8 }}>
+                <input className="in mono" value={test.to} placeholder="+91 98765 43210"
+                  onChange={e => setTest(t => ({ ...t, to: e.target.value }))} />
+                <button className="btn" onClick={sendTest} disabled={!approved || !test.to || test.sending}>
+                  {test.sending ? 'Sending…' : 'Send test'}
                 </button>
               </div>
+              <div className="hint mt8">
+                {approved ? 'Comma-separate up to 5 numbers. Test sends ignore the warm-up ceiling.'
+                          : 'Pick an approved template first.'}
+              </div>
+              {test.results && test.results.map((r, i) => (
+                <div key={i} className={`hint mt8 ${r.ok ? 'text-g' : 'text-r'}`}>
+                  {r.ok ? `✓ accepted — +${r.dialStr}, watch the log for delivered/read`
+                        : `✕ ${r.input || ''} — ${r.error}${r.hint ? ' · ' + r.hint : ''}`}
+                </div>
+              ))}
+            </div>
 
-              {hasVar && (
-                <Field label="Sample value for {{1}}" hint="Meta requires an example to review the template">
-                  <TextInput value={compose.sampleValue} onChange={v => setCompose(c => ({ ...c, sampleValue: v }))} placeholder="Rahul" />
+            <button className="send" onClick={doStart} disabled={!ready || starting}>
+              {starting ? 'Starting…'
+                : isRunning ? 'Campaign running'
+                : ready ? `Send to ${num(contacts.count)} contacts`
+                : 'Send'}
+            </button>
+            <div className="send-note">
+              {ready
+                ? `About ${eta} min at ${settings.delaySec}s apart${days > 1 ? ` · spread over ${days} days by the daily cap` : ''}`
+                : blockedBy}
+            </div>
+          </Step>
+
+          {/* ── Warm-up ─────────────────────────────────────── */}
+          {warm && (
+            <div className="card">
+              <div className="card-h">
+                <div className="step-t">Warm-up</div>
+                <div className="right">
+                  <label className="switch">
+                    <input type="checkbox" checked={warm.enabled} onChange={e => toggleWarmup(e.target.checked)} />
+                    <span>{warm.enabled ? 'On' : 'Off'}</span>
+                  </label>
+                </div>
+              </div>
+              <div className="card-b">
+                {warm.enabled ? <>
+                  <div className="ladder">
+                    {warm.plan.map((n, i) => (
+                      <div key={i} className={`rung ${i < warm.step ? 'past' : i === warm.step ? 'now' : ''}`}>
+                        <span className="rung-d">Day {i + 1}</span>
+                        <span className="rung-n">{num(n)}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="hint mt8">
+                    {warm.sentToday
+                      ? `Day ${warm.daysSent} — ${num(dailyCount)} of ${num(dailyCap)} sent today.`
+                      : `Nothing sent today. The first message moves you to day ${warm.daysSent + 1}, ceiling ${num(warm.cap)}.`}
+                    {['RED', 'YELLOW'].includes(ss.quality) &&
+                      <span className="text-a"> Quality is {ss.quality} — holding at this rung until it recovers.</span>}
+                  </div>
+                </> : (
+                  <div className="hint mb0">
+                    Off — the full daily cap of {num(settings.dailyCap)} applies from the first message.
+                    A number with no sending history can get throttled or quality-flagged for that.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── Opt-outs ────────────────────────────────────── */}
+          <details className="adv">
+            <summary>Opt-out list — {num(optOuts.length)} number{optOuts.length === 1 ? '' : 's'} never messaged again</summary>
+            <div className="adv-b">
+              <div className="row" style={{ gap: 8, marginBottom: 12 }}>
+                <input className="in mono" value={optAdd} placeholder="+91 98765 43210"
+                  onChange={e => setOptAdd(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && optAdd) { editOptOuts({ add: [optAdd] }); setOptAdd(''); } }} />
+                <button className="btn" disabled={!optAdd}
+                  onClick={() => { editOptOuts({ add: [optAdd] }); setOptAdd(''); }}>Add</button>
+              </div>
+              {optOuts.length === 0
+                ? <div className="hint">Nobody has opted out yet. Taps on <b>Stop promotions</b> land here automatically.</div>
+                : <>
+                    <div className="optlist">
+                      {optOuts.map(n => (
+                        <div className="optrow" key={n}>
+                          <span>+{n}</span>
+                          <button className="link text-r" onClick={() => {
+                            if (confirm(`Remove +${n}? They asked not to be messaged — only do this if they asked to come back.`))
+                              editOptOuts({ remove: [n] });
+                          }}>Remove</button>
+                        </div>
+                      ))}
+                    </div>
+                    <a className="btn sm mt8" style={{ display: 'inline-flex' }} href="/api/optouts/download">Download backup</a>
+                  </>}
+            </div>
+          </details>
+
+          <details className="adv">
+            <summary>Advanced — pacing and credentials</summary>
+            <div className="adv-b">
+              <div className="row">
+                <Field label="Delay between sends" hint="Seconds · 2 is safe">
+                  <input className="in mono" type="number" min="1" max="60" value={settings.delaySec}
+                    onChange={e => setSettings(p => ({ ...p, delaySec: parseInt(e.target.value) || 1 }))} />
                 </Field>
-              )}
-
-              <Field label="Footer" hint="Optional, max 60 chars, no variables">
-                <TextInput value={compose.footerText} onChange={v => setCompose(c => ({ ...c, footerText: v.slice(0, 60) }))} placeholder="Mirror PVC" />
-              </Field>
-
-              <div style={{ display: 'flex', gap: 10 }}>
-                <Field label="Category">
-                  <select value={compose.category} onChange={e => setCompose(c => ({ ...c, category: e.target.value }))}
-                    style={{ width: '100%', padding: '7px 8px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, fontFamily: 'inherit', outline: 'none' }}>
-                    <option value="MARKETING">Marketing</option>
-                    <option value="UTILITY">Utility</option>
-                  </select>
-                </Field>
-                <Field label="Language">
-                  <select value={compose.language} onChange={e => setCompose(c => ({ ...c, language: e.target.value }))}
-                    style={{ width: '100%', padding: '7px 8px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, fontFamily: 'inherit', outline: 'none' }}>
-                    <option value="en">English</option>
-                    <option value="en_US">English (US)</option>
-                    <option value="hi">Hindi</option>
-                  </select>
+                <Field label="Daily cap" hint={warm?.enabled
+                  ? `Warm-up holds today at ${num(warm.cap)} — whichever is lower wins`
+                  : account?.tierCap ? `Your tier allows ${num(account.tierCap)}` : 'Messages per day'}>
+                  <input className="in mono" type="number" min="1" value={settings.dailyCap}
+                    onChange={e => setSettings(p => ({ ...p, dailyCap: parseInt(e.target.value) || 1 }))} />
                 </Field>
               </div>
 
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 12, cursor: 'pointer' }}>
-                <input type="checkbox" checked={compose.addOptOut}
-                  onChange={e => setCompose(c => ({ ...c, addOptOut: e.target.checked }))}
-                  style={{ marginTop: 2, cursor: 'pointer' }} />
-                <span style={{ fontSize: 11, color: C.text2, lineHeight: 1.5 }}>
-                  Add a <strong style={{ color: C.text }}>Stop promotions</strong> button.
-                  Taps are recorded and those numbers are skipped forever. Strongly recommended —
-                  it protects your quality rating.
-                </span>
-              </label>
-
-              {/* Live preview */}
-              {compose.bodyText && (
-                <div style={{ marginBottom: 12 }}>
-                  <div style={{ fontSize: 10, color: C.text3, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.3px', marginBottom: 5 }}>Preview</div>
-                  <div style={{ background: '#e5ddd5', borderRadius: 8, padding: 10 }}>
-                    <div style={{ background: '#fff', borderRadius: '0 8px 8px 8px', padding: '7px 9px', maxWidth: '92%', boxShadow: '0 1px 1px rgba(0,0,0,.1)' }}>
-                      <div style={{ fontSize: 13, color: '#111', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.45 }}>{previewText}</div>
-                      {compose.footerText && <div style={{ fontSize: 11, color: '#8696a0', marginTop: 4 }}>{compose.footerText}</div>}
-                      <div style={{ fontSize: 10, color: '#8696a0', textAlign: 'right', marginTop: 3 }}>12:00</div>
-                      {compose.addOptOut && (
-                        <div style={{ borderTop: '1px solid #e9edef', marginTop: 6, paddingTop: 6, textAlign: 'center', fontSize: 13, color: '#00a5f4', fontWeight: 500 }}>Stop promotions</div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {compose.errors.length > 0 && (
-                <div style={{ background: C.redBg, border: `1px solid #fecaca`, borderRadius: 6, padding: '8px 10px', marginBottom: 12 }}>
-                  {compose.errors.map((e, i) => (
-                    <div key={i} style={{ fontSize: 11, color: C.red, lineHeight: 1.5 }}>• {e}</div>
-                  ))}
-                </div>
-              )}
-
-              <Btn variant="primary" size="md" full
-                onClick={submitTemplate}
-                disabled={compose.submitting || !compose.bodyText || !compose.displayName}>
-                {compose.submitting ? 'Submitting to Meta...' : 'Submit for Approval'}
-              </Btn>
-            </div>
-          </Card>
-
-          {/* Contacts */}
-          <Card>
-            <CardSection label="Contacts" right={contacts.count > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: C.green }}>{contacts.count.toLocaleString()} loaded</span>} />
-            <div style={{ padding: '4px 14px 14px' }}>
-              <label htmlFor="csv-input"
-                onDragOver={e => { e.preventDefault(); setDragging(true); }}
-                onDragLeave={() => setDragging(false)}
-                onDrop={e => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f?.name.endsWith('.csv')) uploadCSV(f); }}
-                style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 4, border: `1px dashed ${dragging ? C.blue : C.border2}`, borderRadius: 8, padding: contacts.count > 0 ? '14px' : '20px', textAlign: 'center', cursor: 'pointer', background: dragging ? '#eff6ff' : C.bg, transition: 'all .15s', minHeight: 70 }}>
-                {contacts.count > 0 ? (
-                  <>
-                    <div style={{ fontSize: 22, fontWeight: 800, fontFamily: 'monospace', color: C.green }}>{contacts.count.toLocaleString()}</div>
-                    <div style={{ fontSize: 11, color: C.text2 }}>{contacts.file} &mdash; click to replace</div>
-                  </>
-                ) : (
-                  <>
-                    <div style={{ fontSize: 13, fontWeight: 500, color: C.text2 }}>Drop CSV or tap to select</div>
-                    <div style={{ fontSize: 10, color: C.text3 }}>Google Contacts export · reads Name, Mobile Phone</div>
-                  </>
-                )}
-              </label>
-              <input id="csv-input" type="file" accept=".csv" style={{ display: 'none' }} onChange={e => { if (e.target.files[0]) uploadCSV(e.target.files[0]); }} />
-              {contacts.sample?.length > 0 && (
-                <div style={{ marginTop: 8 }}>
-                  {contacts.sample.slice(0, 3).map((c, i) => (
-                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', fontSize: 11, borderBottom: `1px solid ${C.bg}`, color: C.text2 }}>
-                      <span style={{ fontWeight: 500, color: C.text }}>{c.name}</span>
-                      <span style={{ fontFamily: 'monospace', color: C.text3 }}>+{c.dialStr}</span>
-                    </div>
-                  ))}
-                  {contacts.count > 3 && <div style={{ fontSize: 10, color: C.text3, marginTop: 3 }}>+ {(contacts.count - 3).toLocaleString()} more</div>}
-                </div>
-              )}
-            </div>
-          </Card>
-
-          {/* Template */}
-          <Card>
-            <CardSection label="Active Template" right={ss.optOutCount > 0 && <span style={{ fontSize: 10, color: C.text3 }}>{ss.optOutCount} opted out</span>} />
-            <div style={{ padding: '4px 14px 14px' }}>
-              <Field label="Template Name" hint="Set by Compose, or type an existing one to reuse it">
-                <TextInput value={tmpl.name} onChange={onTmplChange} mono placeholder="your_template_name" />
+              <div className="hint" style={{ margin: '4px 0 14px' }}>
+                Credentials come from <code>.env</code> on the server and are already loaded.
+                Only fill these in to override them for this session.
+              </div>
+              <Field label="Phone Number ID">
+                <input className="in mono" value={creds.phoneId} onBlur={saveCreds}
+                  onChange={e => setCreds(c => ({ ...c, phoneId: e.target.value }))} />
               </Field>
-              <TmplStatus />
-              {tmpl.bodyText && (
-                <div style={{ marginTop: 8, background: C.bg, borderRadius: 6, padding: '8px 10px', fontSize: 11, color: C.text2, lineHeight: 1.7, maxHeight: 90, overflow: 'auto', fontFamily: 'sans-serif', whiteSpace: 'pre-wrap', wordBreak: 'break-word', border: `1px solid ${C.border}` }}>
-                  {tmpl.bodyText}
-                </div>
-              )}
-            </div>
-          </Card>
-
-          {/* Settings */}
-          <Card>
-            <CardSection label="Send Settings" />
-            <div style={{ padding: '4px 14px 14px', display: 'flex', gap: 10 }}>
-              <Field label="Delay (s)" hint="Min 1s, rec 2s">
-                <NumberInput value={settings.delaySec} onChange={v => setSettings(p => ({ ...p, delaySec: v }))} min={1} max={60} />
+              <Field label="Access Token" hint="Leave blank to keep the server's token">
+                <input className="in mono" type="password" placeholder="EAAB…" value={creds.token} onBlur={saveCreds}
+                  onChange={e => setCreds(c => ({ ...c, token: e.target.value }))} />
               </Field>
-              <Field label="Daily Cap" hint="TIER_1 = 1000/day">
-                <NumberInput value={settings.dailyCap} onChange={v => setSettings(p => ({ ...p, dailyCap: v }))} min={1} />
+              <Field label="WABA ID">
+                <input className="in mono" value={creds.wabaId} placeholder="auto-resolved" onBlur={saveCreds}
+                  onChange={e => setCreds(c => ({ ...c, wabaId: e.target.value }))} />
               </Field>
+              {credsMsg && <div className="hint" style={{ color: 'var(--green)' }}>{credsMsg}</div>}
             </div>
-          </Card>
-
-          {/* Launch */}
-          <button onClick={doStart} disabled={!isReady || starting}
-            style={{ width: '100%', padding: '11px', background: isReady ? C.blue : C.border, border: 'none', borderRadius: 8, color: isReady ? '#fff' : C.text3, fontWeight: 700, fontSize: 14, fontFamily: 'inherit', cursor: isReady ? 'pointer' : 'not-allowed', transition: 'background .15s', letterSpacing: '-.1px' }}>
-            {starting ? 'Starting...' : 'Start Campaign'}
-          </button>
-          {isReady ? (
-            <div style={{ fontSize: 11, color: C.text3, textAlign: 'center', marginTop: -6 }}>
-              ~{Math.round(contacts.count * settings.delaySec / 60)}m &bull; {Math.ceil(contacts.count / settings.dailyCap)} day{contacts.count > settings.dailyCap ? 's' : ''}
-            </div>
-          ) : blockedBy && (
-            <div style={{ fontSize: 11, color: C.text3, textAlign: 'center', marginTop: -6 }}>{blockedBy}</div>
-          )}
+          </details>
         </div>
 
-        {/* ── RIGHT: Monitor ─────────────────────────────────── */}
-        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
-
-          {/* Pause banner */}
+        {/* ── RIGHT: live monitor ───────────────────────────── */}
+        <div className="col">
           {isPaused && pauseReason && (
-            <div style={{ background: C.amberBg, border: `1px solid #fde68a`, borderRadius: 8, padding: '11px 14px', display: 'flex', alignItems: 'center', gap: 12 }}>
-              <span style={{ flex: 1, fontSize: 12, color: C.amber, fontWeight: 500 }}>{pauseReason}</span>
-              <Btn variant="success" onClick={doResume}>Resume</Btn>
+            <div className="banner amber">
+              <span className="grow">{pauseReason}</span>
+              <button className="btn ok" onClick={doResume}>Resume</button>
             </div>
           )}
 
-          {/* Stats */}
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <StatCard label="Accepted"  value={accepted}  color={C.green} />
-            <StatCard label="Delivered" value={delivered} color={C.blue} />
-            <StatCard label="Read"      value={read}      color="#7c3aed" />
-            <StatCard label="Failed"    value={failed}    color={C.red} />
-            <StatCard label="Skipped"   value={skipped}   color={C.amber} />
+          <div className="stats">
+            <Stat label="Accepted"  value={accepted}  color="var(--green)" />
+            <Stat label="Delivered" value={delivered} color="var(--blue)" />
+            <Stat label="Read"      value={read}      color="var(--violet)" />
+            <Stat label="Failed"    value={failed}    color="var(--red)" />
+            <Stat label="Skipped"   value={skipped}   color="var(--amber)" />
           </div>
 
-          {/* Rates */}
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {[['Delivery Rate', dRate, C.green], ['Read Rate', rRate, '#7c3aed'], [`Daily ${dailyCount.toLocaleString()} / ${dailyCap.toLocaleString()}`, '', C.blue]].map(([l, v, c]) => (
-              <div key={l} style={{ flex: 1, minWidth: 100, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: '9px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: 11, color: C.text2 }}>{l}</span>
-                {v && <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'monospace', color: c }}>{v}</span>}
-              </div>
-            ))}
+          <div className="rates">
+            <div className="rate"><span className="rate-l">Delivery rate</span><span className="rate-v" style={{ color: 'var(--green)' }}>{rate(delivered)}</span></div>
+            <div className="rate"><span className="rate-l">Read rate</span><span className="rate-v" style={{ color: 'var(--violet)' }}>{rate(read)}</span></div>
+            <div className="rate"><span className="rate-l">Sent today</span><span className="rate-v">{num(dailyCount)} / {num(dailyCap)}</span></div>
           </div>
 
-          {/* Progress */}
-          <Card style={{ padding: '12px 14px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 7 }}>
-              <span style={{ fontSize: 12, fontWeight: 600 }}>Progress</span>
-              <span style={{ fontSize: 14, fontWeight: 800, fontFamily: 'monospace', color: C.blue }}>{pct}%</span>
+          <div className="card card-b">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 9 }}>
+              <span style={{ fontSize: 13, fontWeight: 650 }}>Progress</span>
+              <span style={{ fontSize: 14, fontWeight: 800, color: 'var(--brand)' }}>{pct}%</span>
             </div>
-            <div style={{ height: 5, background: C.bg, borderRadius: 3, overflow: 'hidden', border: `1px solid ${C.border}` }}>
-              <div style={{ height: '100%', width: `${pct}%`, background: C.blue, borderRadius: 3, transition: 'width .5s' }} />
+            <div className="bar"><div className="bar-f" style={{ width: `${pct}%` }} /></div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 7 }} className="hint">
+              <span>{num(done)} processed</span><span>{num(total)} total</span>
             </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5, fontSize: 10, fontFamily: 'monospace', color: C.text3 }}>
-              <span>{done.toLocaleString()} processed</span><span>{total.toLocaleString()} total</span>
-            </div>
-          </Card>
+          </div>
 
-          {/* Current contact */}
           {currentContact && isRunning && (
-            <div style={{ background: C.greenBg, border: '1px solid #bbf7d0', borderRadius: 8, padding: '9px 14px', display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 }}>
-              <span style={{ width: 7, height: 7, borderRadius: '50%', background: C.green }} />
-              <span style={{ fontWeight: 600 }}>{currentContact.name}</span>
-              <span style={{ color: C.text2, fontFamily: 'monospace', marginLeft: 'auto' }}>+{currentContact.dialStr}</span>
+            <div className="banner green">
+              <span className="grow"><b>{currentContact.name}</b></span>
+              <span style={{ fontFamily: 'ui-monospace,Menlo,monospace' }}>+{currentContact.dialStr}</span>
             </div>
           )}
 
-          {/* Failures */}
           {failLog.length > 0 && (
-            <Card>
-              <CardSection label={`Failures (${failLog.length})`} />
-              <div style={{ overflowX: 'auto', padding: '0 0 4px' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
-                  <thead>
-                    <tr>{['Name', 'Phone', 'Code', 'Error'].map(h => <th key={h} style={{ padding: '5px 10px', textAlign: 'left', fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.5px', color: C.text3, borderBottom: `1px solid ${C.border}` }}>{h}</th>)}</tr>
-                  </thead>
+            <div className="card">
+              <div className="card-h" style={{ paddingBottom: 12 }}>
+                <div className="step-t">Failures</div>
+                <div className="right">{failLog.length}</div>
+              </div>
+              <div className="scroll-x">
+                <table className="tbl">
+                  <thead><tr><th>Name</th><th>Phone</th><th>Code</th><th>What happened</th></tr></thead>
                   <tbody>
-                    {failLog.slice(-10).map((f, i) => (
-                      <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
-                        <td style={{ padding: '6px 10px', fontWeight: 500, verticalAlign: 'top' }}>{f.name}</td>
-                        <td style={{ padding: '6px 10px', fontFamily: 'monospace', color: C.text2, verticalAlign: 'top' }}>{f.phone}</td>
-                        <td style={{ padding: '6px 10px', verticalAlign: 'top' }}><span style={{ background: C.redBg, color: C.red, padding: '1px 5px', borderRadius: 3, fontFamily: 'monospace', fontSize: 10, fontWeight: 700 }}>{f.code}</span></td>
-                        <td style={{ padding: '6px 10px', minWidth: 240 }}>
-                          <div style={{ color: C.red, fontFamily: 'monospace', wordBreak: 'break-word' }}>{f.error}</div>
-                          {f.hint && <div style={{ color: C.text2, marginTop: 3, lineHeight: 1.45 }}>{f.hint}</div>}
+                    {failLog.slice(-10).reverse().map((f, i) => (
+                      <tr key={i}>
+                        <td><b>{f.name}</b></td>
+                        <td className="text-2" style={{ fontFamily: 'ui-monospace,Menlo,monospace' }}>{f.phone}</td>
+                        <td><span className="code">{f.code}</span></td>
+                        <td style={{ minWidth: 240 }}>
+                          <div className="text-r">{f.error}</div>
+                          {f.hint && <div className="text-2 mt8">{f.hint}</div>}
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-            </Card>
+            </div>
           )}
 
-          {/* Logs */}
-          <Card style={{ overflow: 'hidden', minHeight: 200 }}>
-            <CardSection label={`Live Log (${logs.length})`} right={<button onClick={() => setLogs([])} style={{ fontSize: 10, color: C.text3, background: 'none', border: 'none', cursor: 'pointer' }}>Clear</button>} />
-            <div style={{ maxHeight: 280, overflowY: 'auto', padding: '2px 0' }}>
-              {logs.length === 0 && <div style={{ padding: '16px', textAlign: 'center', color: C.text3, fontSize: 12 }}>No activity yet.</div>}
-              {logs.map((e, i) => {
-                const lc = { info: C.blue, success: C.green, warn: C.amber, error: C.red }[e.level] || C.text2;
-                return (
-                  <div key={i} style={{ display: 'flex', gap: 8, padding: '2px 14px', fontFamily: 'monospace', fontSize: 11, lineHeight: 1.8 }}>
-                    <span style={{ color: C.text3, flexShrink: 0, width: 58 }}>{e.time}</span>
-                    <span style={{ width: 48, flexShrink: 0, fontWeight: 700, fontSize: 10, textTransform: 'uppercase', color: lc }}>{e.level}</span>
-                    <span style={{ color: C.text2, wordBreak: 'break-all' }}>{e.msg}</span>
-                  </div>
-                );
-              })}
-              <div ref={logEndRef} />
+          <div className="card">
+            <div className="card-h" style={{ paddingBottom: 10 }}>
+              <div className="step-t">Live log</div>
+              <div className="right">
+                {logs.length > 0 && <button className="link" onClick={() => setLogs([])}>Clear</button>}
+              </div>
             </div>
-          </Card>
-
+            <div className="log">
+              {logs.length === 0 && <div className="empty">Nothing yet. Activity appears here the moment you hit send.</div>}
+              {logs.map((e, i) => (
+                <div className="log-row" key={i}>
+                  <span className="log-t">{e.time}</span>
+                  <span className="log-l" style={{ color: { info: 'var(--blue)', success: 'var(--green)', warn: 'var(--amber)', error: 'var(--red)' }[e.level] || 'var(--ink2)' }}>{e.level}</span>
+                  <span className="log-m">{e.msg}</span>
+                </div>
+              ))}
+              <div ref={logEnd} />
+            </div>
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }
 

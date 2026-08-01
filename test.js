@@ -6,7 +6,8 @@
 const assert = require('node:assert/strict');
 const {
   slugify, templateVars, sanitizeParam, validateTemplateInput,
-  buildTemplatePayload, normalizePhone, parseCSV, buildParams, verifySignature, explainError, META_ERRORS, S,
+  buildTemplatePayload, normalizePhone, parseCSV, buildParams, verifySignature, explainError, tierToCap, META_ERRORS, S,
+  warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W,
 } = require('./server');
 
 let passed = 0;
@@ -150,5 +151,51 @@ test('every entry has both a cause and an action', () => {
     assert.ok(v[0].length && v[1].length, `code ${code} has an empty field`);
   }
 });
+
+console.log('\ntierToCap');
+test('expands the K suffix', () => assert.equal(tierToCap('TIER_1K'), 1000));
+test('expands a larger K tier', () => assert.equal(tierToCap('TIER_100K'), 100000));
+test('reads a plain numeric tier', () => assert.equal(tierToCap('TIER_250'), 250));
+test('returns null for UNLIMITED so the UI keeps its default', () => assert.equal(tierToCap('TIER_UNLIMITED'), null));
+test('returns null for UNKNOWN', () => assert.equal(tierToCap('UNKNOWN'), null));
+test('returns null for undefined', () => assert.equal(tierToCap(undefined), null));
+
+console.log('\nwarm-up ladder');
+{
+  const restore = { days: [...W.days], enabled: W.enabled, quality: S.quality, cap: S.config.dailyCap };
+  const setup = (days, quality = 'GREEN') => { W.days = days; S.quality = quality; W.enabled = true; };
+
+  test('day one starts at the bottom rung', () => { setup([]); assert.equal(warmupCap(), WARMUP_PLAN[0]); });
+  test('a day already sent on keeps its own rung', () => {
+    setup([todayKey()]);
+    assert.equal(warmupStep(), 0, 'today is day 1, not day 2');
+  });
+  test('a fresh day climbs one rung', () => { setup(['2026-01-01']); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
+  test('climbs one rung per sending day', () => { setup(['a', 'b', 'c']); assert.equal(warmupCap(), WARMUP_PLAN[3]); });
+  test('never climbs past the top rung', () => {
+    setup(new Array(50).fill(0).map((_, i) => 'd' + i));
+    assert.equal(warmupCap(), WARMUP_PLAN[WARMUP_PLAN.length - 1]);
+  });
+  test('holds a rung back while quality is RED', () => { setup(['a', 'b'], 'RED'); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
+  test('holds a rung back while quality is YELLOW', () => { setup(['a', 'b'], 'YELLOW'); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
+  test('cannot be held below the bottom rung', () => { setup([], 'RED'); assert.equal(warmupCap(), WARMUP_PLAN[0]); });
+  test('disabling it lifts the ceiling entirely', () => { setup([]); W.enabled = false; assert.equal(warmupCap(), null); });
+
+  test('effective cap takes the lower of warm-up and your own cap', () => {
+    setup([]); S.config.dailyCap = 1000;
+    assert.equal(effectiveCap(), WARMUP_PLAN[0], 'warm-up is lower on day 1');
+  });
+  test('your own cap wins when it is the stricter one', () => {
+    setup(['a', 'b', 'c', 'd', 'e']); S.config.dailyCap = 300;
+    assert.equal(effectiveCap(), 300);
+  });
+  test('warm-up off falls back to your own cap', () => {
+    setup([]); W.enabled = false; S.config.dailyCap = 750;
+    assert.equal(effectiveCap(), 750);
+  });
+
+  Object.assign(W, { days: restore.days, enabled: restore.enabled });
+  S.quality = restore.quality; S.config.dailyCap = restore.cap;
+}
 
 console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);
