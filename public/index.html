@@ -185,7 +185,12 @@ function Campaign({ backendUrl, onChangeBackend }) {
   // Local UI state
   const [creds, setCreds]     = useState({ phoneId: 'YOUR_PHONE_NUMBER_ID', token: '', wabaId: '' });
   const [contacts, setContacts] = useState({ count: 0, sample: [], file: '' });
-  const [tmpl, setTmpl]       = useState({ name: 'your_template_name', status: null, category: null, language: 'en', bodyText: null, checking: false, error: null });
+  const [tmpl, setTmpl]       = useState({ name: 'your_template_name', status: null, category: null, language: 'en', bodyText: null, checking: false, error: null, rejectedReason: null });
+  const [compose, setCompose] = useState({
+    displayName: '', bodyText: '', footerText: '', sampleValue: 'Rahul',
+    addOptOut: true, category: 'MARKETING', language: 'en',
+    submitting: false, errors: [],
+  });
   const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 1000 });
   const [logs, setLogs]       = useState([]);
   const [failLog, setFailLog] = useState([]);
@@ -257,6 +262,41 @@ function Campaign({ backendUrl, onChangeBackend }) {
     if (name) validateRef.current = setTimeout(() => doValidate(name), 1200);
   }, [doValidate]);
 
+  // ── Compose: submit a new template for approval ──────────────────
+  const submitTemplate = useCallback(async () => {
+    setCompose(c => ({ ...c, submitting: true, errors: [] }));
+    const r = await api.current.post('/api/template/create', {
+      displayName:  compose.displayName,
+      bodyText:     compose.bodyText,
+      footerText:   compose.footerText,
+      sampleValues: [compose.sampleValue],
+      addOptOut:    compose.addOptOut,
+      category:     compose.category,
+      language:     compose.language,
+    }).catch(() => ({ ok: false, errors: ['Network error — is the server running?'] }));
+
+    setCompose(c => ({ ...c, submitting: false, errors: r.ok ? [] : (r.errors || ['Unknown error']) }));
+    if (r.ok) {
+      setTmpl(t => ({ ...t, name: r.name, status: r.status, rejectedReason: null,
+                      bodyText: compose.bodyText, category: compose.category, language: compose.language }));
+    }
+  }, [compose]);
+
+  // ── Poll Meta while a template is under review ───────────────────
+  // Approval is usually minutes. Polling beats asking the user to refresh.
+  useEffect(() => {
+    if (tmpl.status !== 'PENDING' || !tmpl.name) return;
+    const tick = async () => {
+      const r = await api.current.get(`/api/template/status?name=${encodeURIComponent(tmpl.name)}`).catch(() => null);
+      if (r?.status && r.status !== 'PENDING') {
+        setTmpl(t => ({ ...t, status: r.status, rejectedReason: r.rejectedReason,
+                        bodyText: r.bodyText || t.bodyText, category: r.category || t.category }));
+      }
+    };
+    const id = setInterval(tick, 15000);
+    return () => clearInterval(id);
+  }, [tmpl.status, tmpl.name]);
+
   // ── CSV upload ────────────────────────────────────────────────────
   const uploadCSV = useCallback(async (file) => {
     const fd = new FormData(); fd.append('csv', file);
@@ -283,9 +323,23 @@ function Campaign({ backendUrl, onChangeBackend }) {
   const pct   = total > 0 ? Math.round(done / total * 100) : 0;
   const dRate = accepted > 0 ? Math.round(delivered / accepted * 100) + '%' : '—';
   const rRate = accepted > 0 ? Math.round(read / accepted * 100) + '%' : '—';
-  const isReady    = (configured || savedOk) && contacts.count > 0 && phase === 'idle';
+  const approved   = tmpl.status === 'APPROVED';
+  const isReady    = (configured || savedOk) && contacts.count > 0 && approved && phase === 'idle';
   const isRunning  = phase === 'running';
   const isPaused   = phase === 'paused';
+
+  // Why the Launch button is disabled — shown under it so the state is never a mystery.
+  const blockedBy = !(configured || savedOk) ? 'Add your Access Token and Phone Number ID'
+    : !approved   ? (tmpl.status === 'PENDING' ? 'Waiting for Meta to approve the template'
+                    : 'Compose a message and get it approved first')
+    : !contacts.count ? 'Upload a CSV of contacts'
+    : phase !== 'idle' ? 'Campaign already running — stop or reset it first'
+    : null;
+
+  // Live preview: substitute {{1}} with the sample value the user typed.
+  const previewText = (compose.bodyText || '').replace(/\{\{\s*1\s*\}\}/g, compose.sampleValue || 'Rahul');
+  const bodyLen     = (compose.bodyText || '').length;
+  const hasVar      = /\{\{\s*1\s*\}\}/.test(compose.bodyText || '');
 
   // ── Template status badge ─────────────────────────────────────────
   const TmplStatus = () => {
@@ -296,10 +350,20 @@ function Campaign({ backendUrl, onChangeBackend }) {
     const color = tmpl.status === 'APPROVED' ? 'green' : tmpl.status === 'PENDING' ? 'amber' : 'red';
     const catColor = { MARKETING: 'amber', UTILITY: 'blue', AUTHENTICATION: 'blue' }[tmpl.category] || 'gray';
     return (
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 6 }}>
-        <Badge color={color}>{tmpl.status}</Badge>
-        {tmpl.category && <Badge color={catColor}>{tmpl.category}</Badge>}
-        {tmpl.language && <Badge>{tmpl.language}</Badge>}
+      <div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 6 }}>
+          <Badge color={color}>{tmpl.status}</Badge>
+          {tmpl.category && <Badge color={catColor}>{tmpl.category}</Badge>}
+          {tmpl.language && <Badge>{tmpl.language}</Badge>}
+        </div>
+        {tmpl.status === 'PENDING' && (
+          <div style={{ fontSize: 11, color: C.amber, marginTop: 6 }}>
+            Meta is reviewing — usually a few minutes. Checking every 15s.
+          </div>
+        )}
+        {tmpl.rejectedReason && (
+          <div style={{ fontSize: 11, color: C.red, marginTop: 6 }}>Reason: {tmpl.rejectedReason}</div>
+        )}
       </div>
     );
   };
@@ -350,6 +414,109 @@ function Campaign({ backendUrl, onChangeBackend }) {
             </div>
           </Card>
 
+          {/* Compose */}
+          <Card>
+            <CardSection label="Compose Message" right={<span style={{ fontSize: 10, color: C.text3 }}>{bodyLen}/1024</span>} />
+            <div style={{ padding: '4px 14px 14px' }}>
+
+              <div style={{ background: C.blueBg, border: `1px solid #bfdbfe`, borderRadius: 6, padding: '8px 10px', fontSize: 11, color: '#1e40af', lineHeight: 1.5, marginBottom: 12 }}>
+                Meta requires every message to cold contacts to be an approved template.
+                Write it here, submit, and send once it turns APPROVED.
+              </div>
+
+              <Field label="Template Name" hint="Lowercased and underscored automatically">
+                <TextInput value={compose.displayName} onChange={v => setCompose(c => ({ ...c, displayName: v }))} placeholder="Diwali Offer 2026" />
+              </Field>
+
+              <Field label="Message Body" hint="Use {{1}} where the contact's name should go">
+                <textarea
+                  value={compose.bodyText}
+                  onChange={e => setCompose(c => ({ ...c, bodyText: e.target.value }))}
+                  maxLength={1024} rows={5}
+                  placeholder="Hi {{1}}, our new range is live. Visit us this week for 20% off."
+                  style={{ width: '100%', padding: '8px 10px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, fontFamily: 'inherit', lineHeight: 1.6, resize: 'vertical', outline: 'none' }} />
+              </Field>
+
+              <div style={{ display: 'flex', gap: 6, marginTop: -6, marginBottom: 12 }}>
+                <button
+                  onClick={() => setCompose(c => ({ ...c, bodyText: c.bodyText + '{{1}}' }))}
+                  style={{ padding: '4px 8px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 5, color: C.text2, cursor: 'pointer', fontSize: 11, fontWeight: 600, fontFamily: 'inherit' }}>
+                  + Insert {'{{1}}'} name
+                </button>
+              </div>
+
+              {hasVar && (
+                <Field label="Sample value for {{1}}" hint="Meta requires an example to review the template">
+                  <TextInput value={compose.sampleValue} onChange={v => setCompose(c => ({ ...c, sampleValue: v }))} placeholder="Rahul" />
+                </Field>
+              )}
+
+              <Field label="Footer" hint="Optional, max 60 chars, no variables">
+                <TextInput value={compose.footerText} onChange={v => setCompose(c => ({ ...c, footerText: v.slice(0, 60) }))} placeholder="Mirror PVC" />
+              </Field>
+
+              <div style={{ display: 'flex', gap: 10 }}>
+                <Field label="Category">
+                  <select value={compose.category} onChange={e => setCompose(c => ({ ...c, category: e.target.value }))}
+                    style={{ width: '100%', padding: '7px 8px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, fontFamily: 'inherit', outline: 'none' }}>
+                    <option value="MARKETING">Marketing</option>
+                    <option value="UTILITY">Utility</option>
+                  </select>
+                </Field>
+                <Field label="Language">
+                  <select value={compose.language} onChange={e => setCompose(c => ({ ...c, language: e.target.value }))}
+                    style={{ width: '100%', padding: '7px 8px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: 13, fontFamily: 'inherit', outline: 'none' }}>
+                    <option value="en">English</option>
+                    <option value="en_US">English (US)</option>
+                    <option value="hi">Hindi</option>
+                  </select>
+                </Field>
+              </div>
+
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 12, cursor: 'pointer' }}>
+                <input type="checkbox" checked={compose.addOptOut}
+                  onChange={e => setCompose(c => ({ ...c, addOptOut: e.target.checked }))}
+                  style={{ marginTop: 2, cursor: 'pointer' }} />
+                <span style={{ fontSize: 11, color: C.text2, lineHeight: 1.5 }}>
+                  Add a <strong style={{ color: C.text }}>Stop promotions</strong> button.
+                  Taps are recorded and those numbers are skipped forever. Strongly recommended —
+                  it protects your quality rating.
+                </span>
+              </label>
+
+              {/* Live preview */}
+              {compose.bodyText && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: C.text3, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.3px', marginBottom: 5 }}>Preview</div>
+                  <div style={{ background: '#e5ddd5', borderRadius: 8, padding: 10 }}>
+                    <div style={{ background: '#fff', borderRadius: '0 8px 8px 8px', padding: '7px 9px', maxWidth: '92%', boxShadow: '0 1px 1px rgba(0,0,0,.1)' }}>
+                      <div style={{ fontSize: 13, color: '#111', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.45 }}>{previewText}</div>
+                      {compose.footerText && <div style={{ fontSize: 11, color: '#8696a0', marginTop: 4 }}>{compose.footerText}</div>}
+                      <div style={{ fontSize: 10, color: '#8696a0', textAlign: 'right', marginTop: 3 }}>12:00</div>
+                      {compose.addOptOut && (
+                        <div style={{ borderTop: '1px solid #e9edef', marginTop: 6, paddingTop: 6, textAlign: 'center', fontSize: 13, color: '#00a5f4', fontWeight: 500 }}>Stop promotions</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {compose.errors.length > 0 && (
+                <div style={{ background: C.redBg, border: `1px solid #fecaca`, borderRadius: 6, padding: '8px 10px', marginBottom: 12 }}>
+                  {compose.errors.map((e, i) => (
+                    <div key={i} style={{ fontSize: 11, color: C.red, lineHeight: 1.5 }}>• {e}</div>
+                  ))}
+                </div>
+              )}
+
+              <Btn variant="primary" size="md" full
+                onClick={submitTemplate}
+                disabled={compose.submitting || !compose.bodyText || !compose.displayName}>
+                {compose.submitting ? 'Submitting to Meta...' : 'Submit for Approval'}
+              </Btn>
+            </div>
+          </Card>
+
           {/* Contacts */}
           <Card>
             <CardSection label="Contacts" right={contacts.count > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: C.green }}>{contacts.count.toLocaleString()} loaded</span>} />
@@ -388,9 +555,9 @@ function Campaign({ backendUrl, onChangeBackend }) {
 
           {/* Template */}
           <Card>
-            <CardSection label="Template" />
+            <CardSection label="Active Template" right={ss.optOutCount > 0 && <span style={{ fontSize: 10, color: C.text3 }}>{ss.optOutCount} opted out</span>} />
             <div style={{ padding: '4px 14px 14px' }}>
-              <Field label="Template Name" hint="Auto-validates as you type">
+              <Field label="Template Name" hint="Set by Compose, or type an existing one to reuse it">
                 <TextInput value={tmpl.name} onChange={onTmplChange} mono placeholder="your_template_name" />
               </Field>
               <TmplStatus />
@@ -418,12 +585,14 @@ function Campaign({ backendUrl, onChangeBackend }) {
           {/* Launch */}
           <button onClick={doStart} disabled={!isReady || starting}
             style={{ width: '100%', padding: '11px', background: isReady ? C.blue : C.border, border: 'none', borderRadius: 8, color: isReady ? '#fff' : C.text3, fontWeight: 700, fontSize: 14, fontFamily: 'inherit', cursor: isReady ? 'pointer' : 'not-allowed', transition: 'background .15s', letterSpacing: '-.1px' }}>
-            {starting ? 'Starting...' : !contacts.count ? 'Upload contacts to start' : !(configured || savedOk) ? 'Save credentials to start' : 'Start Campaign'}
+            {starting ? 'Starting...' : 'Start Campaign'}
           </button>
-          {isReady && (
+          {isReady ? (
             <div style={{ fontSize: 11, color: C.text3, textAlign: 'center', marginTop: -6 }}>
               ~{Math.round(contacts.count * settings.delaySec / 60)}m &bull; {Math.ceil(contacts.count / settings.dailyCap)} day{contacts.count > settings.dailyCap ? 's' : ''}
             </div>
+          ) : blockedBy && (
+            <div style={{ fontSize: 11, color: C.text3, textAlign: 'center', marginTop: -6 }}>{blockedBy}</div>
           )}
         </div>
 
@@ -491,11 +660,14 @@ function Campaign({ backendUrl, onChangeBackend }) {
                   </thead>
                   <tbody>
                     {failLog.slice(-10).map((f, i) => (
-                      <tr key={i}>
-                        <td style={{ padding: '5px 10px', fontWeight: 500 }}>{f.name}</td>
-                        <td style={{ padding: '5px 10px', fontFamily: 'monospace', color: C.text2 }}>{f.phone}</td>
-                        <td style={{ padding: '5px 10px' }}><span style={{ background: C.redBg, color: C.red, padding: '1px 5px', borderRadius: 3, fontFamily: 'monospace', fontSize: 10, fontWeight: 700 }}>{f.code}</span></td>
-                        <td style={{ padding: '5px 10px', color: C.red, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace' }}>{f.error}</td>
+                      <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
+                        <td style={{ padding: '6px 10px', fontWeight: 500, verticalAlign: 'top' }}>{f.name}</td>
+                        <td style={{ padding: '6px 10px', fontFamily: 'monospace', color: C.text2, verticalAlign: 'top' }}>{f.phone}</td>
+                        <td style={{ padding: '6px 10px', verticalAlign: 'top' }}><span style={{ background: C.redBg, color: C.red, padding: '1px 5px', borderRadius: 3, fontFamily: 'monospace', fontSize: 10, fontWeight: 700 }}>{f.code}</span></td>
+                        <td style={{ padding: '6px 10px', minWidth: 240 }}>
+                          <div style={{ color: C.red, fontFamily: 'monospace', wordBreak: 'break-word' }}>{f.error}</div>
+                          {f.hint && <div style={{ color: C.text2, marginTop: 3, lineHeight: 1.45 }}>{f.hint}</div>}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

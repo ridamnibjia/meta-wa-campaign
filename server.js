@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const multer     = require('multer');
 const fs         = require('fs');
 const path       = require('path');
+const crypto     = require('crypto');
 
 const app    = express();
 const server = http.createServer(app);
@@ -47,7 +48,8 @@ const CFG = {
   wabaId:             process.env.WABA_ID              || '',
   businessId:         process.env.BUSINESS_ID          || 'YOUR_BUSINESS_ID',
   webhookVerifyToken: process.env.WEBHOOK_VERIFY_TOKEN || 'YOUR_WEBHOOK_VERIFY_TOKEN',
-  apiVersion:         process.env.API_VERSION          || 'v20.0',
+  appSecret:          process.env.APP_SECRET           || '',
+  apiVersion:         process.env.API_VERSION          || 'v23.0',
   templateName:       process.env.TEMPLATE_NAME        || 'your_template_name',
   templateLanguage:   process.env.TEMPLATE_LANGUAGE    || 'en',
   templateCategory:   process.env.TEMPLATE_CATEGORY    || 'MARKETING',
@@ -56,12 +58,14 @@ const CFG = {
 
 if (!CFG.accessToken)   console.warn('[WARN] ACCESS_TOKEN not set in .env');
 if (!CFG.phoneNumberId) console.warn('[WARN] PHONE_NUMBER_ID not set in .env');
+if (!CFG.appSecret)     console.warn('[WARN] APP_SECRET not set — /webhook will REJECT every POST from Meta');
 
-// ── Static files (local dev only — Cloudflare Pages serves frontend in production) ──
 const PUBLIC_DIR = path.join(__dirname, 'public');
 if (fs.existsSync(PUBLIC_DIR)) app.use(express.static(PUBLIC_DIR));
 
-app.use(express.json());
+// rawBody is kept so the webhook can verify Meta's X-Hub-Signature-256 over the
+// exact bytes sent. Re-serialising the parsed object would change the digest.
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -70,6 +74,71 @@ const LIMITS = {
   templateName: 512, templateBody: 1024, templateHeader: 60,
   templateFooter: 60, templateButton: 25, textMessage: 4096, paramValue: 1024,
 };
+
+const OPT_OUT_LABEL = 'Stop promotions';
+
+// ── Meta error codes → plain English + what to actually do ─────────────────────
+// Meta returns bare numbers and a terse message. Without this table a failure log
+// reads "(131042) Business eligibility payment issue", which tells you nothing
+// about where to click. Only codes reachable from this app's flows are listed;
+// anything unlisted falls through to Meta's own message.
+const META_ERRORS = {
+  4:      ['App hit its hourly API call limit',        'The loop backs off on its own. If it repeats, raise "Delay between sends".'],
+  10:     ['Permission denied for this action',        'The token is missing whatsapp_business_messaging or whatsapp_business_management. Regenerate it with both.'],
+  33:     ['Phone Number ID not found',                'PHONE_NUMBER_ID is wrong, or the token belongs to a different app. Recheck WhatsApp → API Setup.'],
+  100:    ['Invalid parameter in the request',         'Usually a template name/language mismatch. Re-run Check Template.'],
+  190:    ['Access token expired or invalid',          'Generate a fresh System User token (Business Settings → System Users → Generate Token) and update ACCESS_TOKEN.'],
+  200:    ['Permission error on the WABA',             'The System User needs admin access to this WhatsApp Business Account. Add it under Business Settings → Users.'],
+  80007:  ['WABA rate limit reached',                  'Slow down. Raise the delay, or lower the daily cap.'],
+  130429: ['Throughput rate limit reached',           'Sending faster than the number is allowed to. The loop retries this contact automatically.'],
+  131000: ['Meta-side error, cause unspecified',      'Transient. Retry the campaign; if every send fails, check status at metastatus.com.'],
+  131008: ['A required parameter was missing',        'Template variables do not match the approved template. Re-run Check Template.'],
+  131009: ['A parameter value was rejected',          'Usually a variable containing a newline, tab, or 4+ spaces. Check the CSV cell.'],
+  131016: ['WhatsApp service temporarily unavailable','Transient on Meta\'s side. Pause and resume in a few minutes.'],
+  131021: ['Sender and recipient are the same number','You are messaging your own business number. Remove it from the CSV.'],
+  131026: ['Message undeliverable',                   'Number is not on WhatsApp, or Meta blocked it on quality grounds. Nothing to fix — it is counted as skipped.'],
+  131031: ['Account locked for a policy violation',   'Check Business Support Home in Business Manager. Sending stays blocked until resolved.'],
+  131042: ['Billing not set up for this business',    'Add or fix the payment method: Business Settings → Billing & Payments. Sends stay blocked until it clears.'],
+  131047: ['Outside the 24-hour customer service window', 'Only approved templates can open a conversation. Confirm you are sending the template, not free text.'],
+  131049: ['Meta chose not to deliver this one',      'Per-user marketing cap on Meta\'s side. Not your error and not retryable.'],
+  131051: ['Unsupported message type',                'The template was changed after approval. Re-run Check Template.'],
+  132000: ['Wrong number of template variables',      'The approved template expects a different variable count than the CSV supplies. Re-run Check Template.'],
+  132001: ['Template not found in that language',     'Name or language code does not match an APPROVED template. Check spelling and the language code (en vs en_US).'],
+  132005: ['Filled-in template text is too long',     'A CSV value is pushing the body past 1024 characters. Shorten the longest values.'],
+  132007: ['Template content policy violation',       'Meta rejected the formatting. Rewrite the body and resubmit.'],
+  132012: ['Template variable format mismatch',       'A value does not match the sample you submitted for approval.'],
+  132015: ['Template is paused for low quality',      'Too many blocks or reports. Wait for the pause to lift, or submit a new template. Do not retry.'],
+  132016: ['Template is disabled',                    'Permanently disabled by Meta. Create and submit a new template.'],
+  133010: ['Phone number is not registered',          'Register the number under WhatsApp → API Setup before sending.'],
+  2388023:['Template is missing example values',      'Meta requires a sample for every variable. Fill in the sample fields and resubmit.'],
+};
+
+// Returns "what — action", or null when the code is unknown to us.
+function explainError(code) {
+  const e = META_ERRORS[code];
+  return e ? `${e[0]} — ${e[1]}` : null;
+}
+
+// ── Opt-out store ──────────────────────────────────────────────────────────────
+// ponytail: flat JSON file, loaded into a Set on boot. Hundreds of numbers, not
+// millions — swap for SQLite only if the list outgrows a single file read.
+const OPT_OUT_FILE = path.join(__dirname, 'opt-outs.json');
+const optOuts = new Set();
+
+try {
+  if (fs.existsSync(OPT_OUT_FILE)) {
+    for (const n of JSON.parse(fs.readFileSync(OPT_OUT_FILE, 'utf8'))) optOuts.add(n);
+  }
+} catch (e) { console.warn('[WARN] Could not read opt-outs.json:', e.message); }
+
+function addOptOut(phone) {
+  const d = normalizePhone(phone);
+  if (!d || optOuts.has(d)) return false;
+  optOuts.add(d);
+  try { fs.writeFileSync(OPT_OUT_FILE, JSON.stringify([...optOuts], null, 2)); }
+  catch (e) { console.error('[ERROR] Could not write opt-outs.json:', e.message); }
+  return true;
+}
 
 // ── Campaign state ─────────────────────────────────────────────────────────────
 // All state is in memory. Restarting the server resets it.
@@ -92,6 +161,8 @@ const S = {
     templateName:     CFG.templateName,
     templateLanguage: CFG.templateLanguage,
     templateCategory: CFG.templateCategory,
+    templateStatus:   null,   // APPROVED | PENDING | REJECTED — gates /api/start
+    paramCount:       0,      // number of {{n}} in the active template body
   },
   pauseReason: null,
   logs:        [],
@@ -129,6 +200,8 @@ function buildState() {
     configured:     !!(CFG.phoneNumberId && CFG.accessToken),
     currentContact: S.contacts[S.currentIdx] || null,
     limits:         LIMITS,
+    optOutCount:    optOuts.size,
+    optOutLabel:    OPT_OUT_LABEL,
   };
 }
 
@@ -176,6 +249,87 @@ function parseCSV(buffer) {
     }
   }
   return out;
+}
+
+// ── Template composition ───────────────────────────────────────────────────────
+// Meta template names: lowercase, [a-z0-9_] only. Anything else is rejected.
+function slugify(s) {
+  const out = String(s || '').toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, LIMITS.templateName);
+  return out || 'template';
+}
+
+// Returns the sorted, de-duplicated variable numbers found in a body: "Hi {{1}}" → [1]
+function templateVars(text) {
+  const nums = [...String(text || '').matchAll(/\{\{\s*(\d+)\s*\}\}/g)].map(m => Number(m[1]));
+  return [...new Set(nums)].sort((a, b) => a - b);
+}
+
+// Meta rejects parameter values containing newlines, tabs, or 4+ consecutive
+// spaces. Collapse all whitespace runs to a single space.
+function sanitizeParam(v) {
+  const out = String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, LIMITS.paramValue);
+  return out || 'there';
+}
+
+// Server-side pre-flight. Catches the documented rejection causes before we
+// spend a Graph call and a review cycle on them.
+function validateTemplateInput({ displayName, bodyText, footerText, sampleValues = [], category }) {
+  const errors = [];
+  const body   = String(bodyText || '').trim();
+
+  if (!String(displayName || '').trim()) errors.push('Template name is required');
+  if (!body) errors.push('Message body is required');
+  if (body.length > LIMITS.templateBody) errors.push(`Body is ${body.length} chars — max ${LIMITS.templateBody}`);
+
+  const vars = templateVars(body);
+  vars.forEach((n, i) => {
+    if (n !== i + 1) errors.push(`Variables must run {{1}}, {{2}}… with no gaps — found {{${n}}} at position ${i + 1}`);
+  });
+  if (vars.length && sampleValues.filter(v => String(v || '').trim()).length !== vars.length) {
+    errors.push(`Provide a sample value for each of the ${vars.length} variable(s) — Meta requires them`);
+  }
+  if (/^\s*\{\{\s*\d+\s*\}\}/.test(body)) errors.push('Body cannot start with a variable');
+  if (/\{\{\s*\d+\s*\}\}\s*$/.test(body)) errors.push('Body cannot end with a variable');
+
+  const footer = String(footerText || '').trim();
+  if (footer.length > LIMITS.templateFooter) errors.push(`Footer is ${footer.length} chars — max ${LIMITS.templateFooter}`);
+  if (templateVars(footer).length) errors.push('Footer cannot contain variables');
+
+  if (category && !['MARKETING', 'UTILITY', 'AUTHENTICATION'].includes(category)) {
+    errors.push(`Unknown category "${category}"`);
+  }
+  return errors;
+}
+
+function buildTemplatePayload({ displayName, bodyText, footerText, sampleValues = [], addOptOut, category, language }) {
+  const body   = String(bodyText || '').trim();
+  const footer = String(footerText || '').trim();
+  const vars   = templateVars(body);
+
+  const bodyComponent = { type: 'BODY', text: body };
+  // The example block is mandatory when the body has variables (error 2388023).
+  if (vars.length) {
+    bodyComponent.example = { body_text: [vars.map((_, i) => sanitizeParam(sampleValues[i]))] };
+  }
+
+  const components = [bodyComponent];
+  if (footer) components.push({ type: 'FOOTER', text: footer });
+  if (addOptOut) {
+    components.push({
+      type: 'BUTTONS',
+      buttons: [{ type: 'QUICK_REPLY', text: OPT_OUT_LABEL.slice(0, LIMITS.templateButton) }],
+    });
+  }
+
+  return {
+    name:     slugify(displayName),
+    language: language || 'en',
+    category: category || 'MARKETING',
+    components,
+  };
 }
 
 // ── Meta Graph API helpers ─────────────────────────────────────────────────────
@@ -251,6 +405,19 @@ async function validateTemplate(templateName) {
   };
 }
 
+// Maps {{1}}, {{2}}… onto contact fields, in order.
+// ponytail: only the CSV name is available today, so anything past {{1}} reuses
+// it. Add more fields here when the CSV parser learns to carry them.
+const PARAM_FIELDS = ['name'];
+
+function buildParams(contact) {
+  const n = S.config.paramCount || 0;
+  return Array.from({ length: n }, (_, i) => ({
+    type: 'text',
+    text: sanitizeParam(contact[PARAM_FIELDS[i]] ?? contact.name),
+  }));
+}
+
 // ── Meta Cloud API — send one template message ─────────────────────────────────
 async function sendTemplate(contact) {
   if (!CFG.accessToken || !CFG.phoneNumberId) {
@@ -266,6 +433,12 @@ async function sendTemplate(contact) {
       language: { code: S.config.templateLanguage },
     },
   };
+  // Only attach components when the template actually has variables — sending an
+  // empty parameters array is itself an error, as is omitting a required one (132000).
+  const params = buildParams(contact);
+  if (params.length) {
+    body.template.components = [{ type: 'body', parameters: params }];
+  }
   try {
     const res  = await fetch(
       `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/messages`,
@@ -278,19 +451,22 @@ async function sendTemplate(contact) {
     const subcode = err.error_subcode || 0;
     const msg     = err.message     || JSON.stringify(data);
     // Skippable: opted out, ecosystem health, re-engagement window
+    const hint = explainError(code) || explainError(subcode);
     if ([131026, 131047, 131049, 131051].includes(code) ||
         [131026, 131047, 131049, 131051].includes(subcode)) {
-      return { ok: false, skip: true, error: msg, errorCode: code };
+      return { ok: false, skip: true, error: msg, errorCode: code, hint };
     }
     // Rate limit: back off and retry same contact
     if ([130429, 80007, 4].includes(code)) {
       const retryMs = res.headers.get('retry-after')
         ? parseInt(res.headers.get('retry-after')) * 1000 : 60000;
-      return { ok: false, rateLimit: true, error: msg, errorCode: code, retryAfter: retryMs };
+      return { ok: false, rateLimit: true, error: msg, errorCode: code, retryAfter: retryMs, hint };
     }
-    return { ok: false, error: msg, errorCode: code };
+    return { ok: false, error: msg, errorCode: code, hint };
   } catch (e) {
-    return { ok: false, error: e.message, errorCode: -1 };
+    // fetch itself threw — DNS, TLS, or no outbound network from this host.
+    return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}`, errorCode: -1,
+             hint: 'Network problem on the machine running this server, not a Meta error. Check outbound HTTPS.' };
   }
 }
 
@@ -322,6 +498,12 @@ async function campaignLoop() {
     }
     const c = S.contacts[S.currentIdx];
     const n = `[${S.currentIdx + 1}/${S.contacts.length}]`;
+    if (optOuts.has(c.dialStr)) {
+      S.skipped++; S.currentIdx++;
+      log('warn', `${n} skipped — ${c.name} opted out`);
+      broadcast();
+      continue;   // no delay: nothing was sent
+    }
     log('info', `${n} ${c.name} +${c.dialStr}`);
     const result = await sendTemplate(c);
     if (result.ok) {
@@ -330,18 +512,19 @@ async function campaignLoop() {
       log('success', `${n} accepted — today:${S.dailyCount}/${S.config.dailyCap}`);
     } else if (result.skip) {
       S.skipped++;
-      log('warn', `${n} skipped (${result.errorCode})`);
+      log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
     } else if (result.rateLimit) {
-      log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s`);
+      log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s. ${result.hint || result.error} [${result.errorCode}]`);
       S.phase = 'paused'; S.pauseReason = 'Rate limit — auto-resuming'; broadcast();
       await sleep(result.retryAfter);
       S.phase = 'running'; S.pauseReason = null; broadcast();
       continue; // retry same contact
     } else {
       S.failed++;
-      S.failLog.push({ time: new Date().toISOString(), phone: c.dialStr, name: c.name, error: result.error, code: result.errorCode });
+      S.failLog.push({ time: new Date().toISOString(), phone: c.dialStr, name: c.name, error: result.error, code: result.errorCode, hint: result.hint });
       if (S.failLog.length > 50) S.failLog.shift();
-      log('error', `${n} failed (${result.errorCode}): ${result.error}`);
+      log('error', `${n} failed [${result.errorCode}] ${result.error}`);
+      if (result.hint) log('error', `   ↳ ${result.hint}`);
     }
     S.currentIdx++;
     broadcast();
@@ -364,15 +547,55 @@ app.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
+// Meta signs every POST with HMAC-SHA256 of the raw body, keyed on the app
+// secret. Without this check anyone who finds the public URL can forge opt-outs
+// and delivery stats. No secret configured = reject, rather than trust blindly.
+function verifySignature(rawBody, header, secret) {
+  if (!secret || !header || !rawBody) return false;
+  const mine = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  const a = Buffer.from(header), b = Buffer.from(mine);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// A status webhook can arrive for a message ID this process has never heard of:
+// S.msgIndex is in memory, so a restart wipes it, and Meta retries for 7 days.
+// Right now those events vanish — the counters under-report and a `failed` for
+// yesterday's campaign is lost.
+//
+// TODO(ridam): decide what should happen here. Options, roughly:
+//   a) leave it — accept that stats only cover the current process lifetime
+//   b) log('warn', ...) so at least you can see how many you're dropping
+//   c) push into a S.orphanStatuses array surfaced in the UI
+//   d) persist msgIndex to disk like opt-outs.json so restarts keep counting
+// (a) and (d) are the honest ends of the range; (b) is 1 line and tells you
+// whether (d) is even worth building.
+function onUnknownStatus(status) {
+}
+
 app.post('/webhook', (req, res) => {
+  if (!verifySignature(req.rawBody, req.get('x-hub-signature-256'), CFG.appSecret)) {
+    log('warn', 'webhook POST rejected — bad or missing X-Hub-Signature-256');
+    return res.sendStatus(401);
+  }
   res.sendStatus(200); // always ACK immediately
   const body = req.body;
   if (body.object !== 'whatsapp_business_account') return;
   for (const entry of (body.entry || [])) {
     for (const change of (entry.changes || [])) {
+
+      // Inbound messages — we only care about the opt-out quick reply.
+      // A quick-reply tap on a template arrives as type 'button'; the same label
+      // sent from an interactive message arrives as button_reply.
+      for (const m of (change.value?.messages || [])) {
+        const label = m.button?.text || m.interactive?.button_reply?.title;
+        if (!label || label.trim().toLowerCase() !== OPT_OUT_LABEL.toLowerCase()) continue;
+        if (addOptOut(m.from)) log('warn', `opt-out — +${m.from} will be skipped from now on`);
+        broadcast();
+      }
+
       for (const status of (change.value?.statuses || [])) {
         const id = status.id, st = status.status;
-        if (!S.msgIndex[id]) continue;
+        if (!S.msgIndex[id]) { onUnknownStatus(status); continue; }
         const prev = S.msgIndex[id].status;
         S.msgIndex[id].status = st;
         if (st === 'delivered' && prev !== 'delivered' && prev !== 'read') {
@@ -382,8 +605,10 @@ app.post('/webhook', (req, res) => {
           S.read++; log('info', `read — ${S.msgIndex[id].name}`);
         } else if (st === 'failed') {
           const code = status.errors?.[0]?.code;
-          S.failLog.push({ time: new Date().toISOString(), phone: S.msgIndex[id].phone, name: S.msgIndex[id].name, error: status.errors?.[0]?.title, code, source: 'webhook' });
-          log('warn', `delivery failed — ${S.msgIndex[id].name} code:${code}`);
+          const hint = explainError(code);
+          S.failLog.push({ time: new Date().toISOString(), phone: S.msgIndex[id].phone, name: S.msgIndex[id].name, error: status.errors?.[0]?.title, code, hint, source: 'webhook' });
+          log('warn', `delivery failed — ${S.msgIndex[id].name} [${code}] ${status.errors?.[0]?.title || ''}`);
+          if (hint) log('warn', `   ↳ ${hint}`);
         }
         broadcast();
       }
@@ -425,14 +650,124 @@ app.get('/api/account-info', async (req, res) => {
 app.get('/api/validate-template', async (req, res) => {
   const { name } = req.query;
   if (!name) return res.json({ error: 'Template name is required' });
-  try { res.json(await validateTemplate(name)); }
-  catch (e) { res.json({ error: e.message }); }
+  try {
+    const r = await validateTemplate(name);
+    adoptTemplate(name, r);
+    res.json(r);
+  } catch (e) { res.json({ error: e.message }); }
 });
 
-app.post('/api/start', (req, res) => {
+// When a template lookup succeeds, make it the active one: remember its status
+// (gates Start) and how many variables its body needs (drives buildParams).
+function adoptTemplate(name, result) {
+  const t = result?.templates?.[0];
+  if (!t) {
+    if (result && result.found === false) S.config.templateStatus = 'NOT_FOUND';
+    return;
+  }
+  S.config.templateName     = name;
+  S.config.templateStatus   = t.status;
+  S.config.templateCategory = t.category;
+  S.config.templateLanguage = t.language;
+  S.config.paramCount       = templateVars(t.bodyText).length;
+  CFG.templateName          = name;
+  broadcast();
+}
+
+// ── Compose: submit a new template to Meta for approval ────────────────────────
+app.post('/api/template/create', async (req, res) => {
+  const input = {
+    displayName:  req.body.displayName,
+    bodyText:     req.body.bodyText,
+    footerText:   req.body.footerText,
+    sampleValues: req.body.sampleValues || [],
+    addOptOut:    req.body.addOptOut !== false,   // default on
+    category:     req.body.category || 'MARKETING',
+    language:     req.body.language || 'en',
+  };
+
+  const errors = validateTemplateInput(input);
+  if (errors.length) return res.json({ ok: false, errors });
+
+  if (!CFG.accessToken) return res.json({ ok: false, errors: ['Access Token not configured'] });
+  const wabaId = await resolveWabaId();
+  if (!wabaId) return res.json({ ok: false, errors: ['WABA ID unavailable. Set WABA_ID or verify BUSINESS_ID.'] });
+
+  const payload = buildTemplatePayload(input);
+  try {
+    const r = await fetch(
+      `https://graph.facebook.com/${CFG.apiVersion}/${wabaId}/message_templates`,
+      { method: 'POST', headers: graphHeaders(), body: JSON.stringify(payload) }
+    );
+    const data = await r.json();
+    if (data.error) {
+      const code = data.error.code || 0;
+      const hint = explainError(code) || explainError(data.error.error_subcode);
+      log('error', `Template "${payload.name}" rejected on submit [${code}] ${data.error.message}`);
+      if (hint) log('error', `   ↳ ${hint}`);
+      const errs = [data.error.error_user_msg || data.error.message];
+      if (hint) errs.push(hint);
+      return res.json({ ok: false, errors: errs });
+    }
+
+    S.config.templateName     = payload.name;
+    S.config.templateLanguage = payload.language;
+    S.config.templateCategory = payload.category;
+    S.config.templateStatus   = data.status || 'PENDING';
+    S.config.paramCount       = templateVars(payload.components[0].text).length;
+    CFG.templateName          = payload.name;
+    broadcast();
+
+    log('info', `Template "${payload.name}" submitted — status ${S.config.templateStatus}`);
+    res.json({ ok: true, name: payload.name, id: data.id, status: S.config.templateStatus, payload });
+  } catch (e) {
+    res.json({ ok: false, errors: [e.message] });
+  }
+});
+
+// Polled by the UI every 15s while a template is PENDING.
+app.get('/api/template/status', async (req, res) => {
+  const name = req.query.name || S.config.templateName;
+  if (!name) return res.json({ error: 'Template name is required' });
+  try {
+    const r = await validateTemplate(name);
+    adoptTemplate(name, r);
+    const t = r?.templates?.[0];
+    res.json({
+      name,
+      found:          !!t,
+      status:         t?.status || (r.error ? null : 'NOT_FOUND'),
+      category:       t?.category || null,
+      language:       t?.language || null,
+      bodyText:       t?.bodyText || null,
+      rejectedReason: t?.rejectedReason || null,
+      qualityScore:   t?.qualityScore || null,
+      paramCount:     S.config.paramCount,
+      error:          r.error || null,
+    });
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+app.get('/api/optouts', (req, res) => res.json({ count: optOuts.size, numbers: [...optOuts] }));
+
+app.post('/api/start', async (req, res) => {
   if (!CFG.phoneNumberId) return res.json({ ok: false, error: 'Phone Number ID not configured' });
   if (!CFG.accessToken)   return res.json({ ok: false, error: 'Access Token not configured' });
   if (!S.contacts.length) return res.json({ ok: false, error: 'Upload a CSV first' });
+
+  // Re-check with Meta rather than trusting the client. A stale browser tab
+  // could otherwise launch a campaign against a template that was since rejected.
+  try {
+    const r = await validateTemplate(S.config.templateName);
+    adoptTemplate(S.config.templateName, r);
+    if (r.error) return res.json({ ok: false, error: `Could not verify template: ${r.error}` });
+    if (S.config.templateStatus !== 'APPROVED') {
+      return res.json({ ok: false, error: `Template "${S.config.templateName}" is ${S.config.templateStatus || 'not found'} — only APPROVED templates can be sent` });
+    }
+  } catch (e) {
+    return res.json({ ok: false, error: `Could not verify template: ${e.message}` });
+  }
+
   S.accepted = S.failed = S.skipped = S.delivered = S.read = 0;
   S.currentIdx = 0; S.msgIndex = {}; S.failLog = []; S.logs = [];
   stopFlag = false; pauseFlag = false; running = false;
@@ -467,10 +802,20 @@ io.on('connection', socket => {
   socket.emit('logs',  S.logs);
 });
 
-server.listen(CFG.port, () => {
-  console.log(`\n[WA-CAMPAIGN] Server running → http://localhost:${CFG.port}`);
-  console.log(`[WA-CAMPAIGN] Phone Number ID : ${CFG.phoneNumberId || 'NOT SET'}`);
-  console.log(`[WA-CAMPAIGN] Access Token    : ${CFG.accessToken ? 'SET' : 'NOT SET'}`);
-  console.log(`[WA-CAMPAIGN] CORS origin     : ${FRONTEND_URL || '* (all origins — dev mode)'}`);
-  console.log(`[WA-CAMPAIGN] Webhook path    : /webhook\n`);
-});
+// Only listen when run directly, so test.js can require the pure helpers below.
+if (require.main === module) {
+  server.listen(CFG.port, () => {
+    console.log(`\n[WA-CAMPAIGN] Server running → http://localhost:${CFG.port}`);
+    console.log(`[WA-CAMPAIGN] Phone Number ID : ${CFG.phoneNumberId || 'NOT SET'}`);
+    console.log(`[WA-CAMPAIGN] Access Token    : ${CFG.accessToken ? 'SET' : 'NOT SET'}`);
+    console.log(`[WA-CAMPAIGN] CORS origin     : ${FRONTEND_URL || '* (all origins — dev mode)'}`);
+    console.log(`[WA-CAMPAIGN] Opt-outs loaded : ${optOuts.size}`);
+    console.log(`[WA-CAMPAIGN] Webhook path    : /webhook (signature check ${CFG.appSecret ? 'ON' : 'OFF — POSTs will 401'})\n`);
+  });
+}
+
+module.exports = {
+  slugify, templateVars, sanitizeParam, validateTemplateInput,
+  buildTemplatePayload, normalizePhone, parseCSV, buildParams,
+  verifySignature, explainError, META_ERRORS, OPT_OUT_LABEL, LIMITS, S,
+};

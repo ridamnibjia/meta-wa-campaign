@@ -142,12 +142,23 @@ The Cloud API can only send **pre-approved templates** when you initiate contact
 | UTILITY | Order confirmations, account updates, alerts | Medium |
 | AUTHENTICATION | OTP, verification codes | Lowest |
 
-### Creating a template
+### Creating a template — in this app
 
-1. **WhatsApp Manager** → **Message Templates** → **Create Template**
-2. Choose category, name (lowercase, underscores only, e.g. `your_template_name`), and language
-3. Write your message. Use `{{1}}`, `{{2}}` for dynamic variables. The `your_template_name` template in this app uses no variables — same message to everyone.
-4. Submit. Approval usually takes minutes to a few hours.
+Use the **Compose Message** card in the left column. You do not need to leave the app.
+
+1. Give the template a name. It is lowercased and underscored for you (`Diwali Offer 2026` → `diwali_offer_2026`).
+2. Write the body. Insert `{{1}}` where the contact's name should go, and supply a sample value — Meta will not review a template with variables unless you give it an example.
+3. Optionally add a footer (max 60 chars, no variables).
+4. Leave **Stop promotions** checked. Taps on that button are captured by the webhook, written to `opt-outs.json`, and skipped on every future run.
+5. **Submit for Approval.** The app polls Meta every 15 seconds; the badge moves `PENDING` → `APPROVED` or `REJECTED` with the reason.
+
+The app validates the body before submitting — variable numbering gaps, a body starting or ending with a variable, an over-length footer, missing samples. These are the documented rejection causes, and catching them locally saves a review cycle.
+
+**Start Campaign stays disabled until the template is `APPROVED`.** The server re-checks with Meta at launch, so a stale browser tab cannot send against a rejected template.
+
+### Creating a template — in Meta's UI
+
+Still supported if you prefer it: **WhatsApp Manager** → **Message Templates** → **Create Template**. Type the resulting name into the **Active Template** field and the app will pick up its status and variable count automatically.
 
 ### After approval
 
@@ -191,6 +202,13 @@ meta-wa-campaign/
 │   └── index.html       React frontend (single file, CDN deps, no build step)
 │                        Deployed to Cloudflare Pages in production
 │                        Served by Express in local dev
+│
+├── test.js              Self-check for the pure functions — `node test.js`
+│                        No framework. Covers template validation, payload
+│                        building, parameter sanitising, phone normalising
+│
+├── opt-outs.json        Numbers that tapped "Stop promotions" (created at
+│                        runtime, gitignored, loaded into memory on boot)
 │
 ├── package.json         4 deps: express, socket.io, multer, dotenv
 ├── Dockerfile           For containerised deployment (Render, DigitalOcean)
