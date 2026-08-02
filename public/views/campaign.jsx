@@ -58,6 +58,26 @@ function ContactListDialog({ open, onClose }) {
   );
 }
 
+// Module scope, NOT inside Campaign(). A component declared inside another
+// component gets a fresh function identity on every render, so React sees a
+// different component type, throws the old subtree away and mounts a new one —
+// which destroys the focused <input> after every single keystroke.
+const Step = ({ n, title, state, right, children }) => (
+  <Card>
+    <CardHeader row className="gap-3">
+      <span className={cn('grid h-6 w-6 shrink-0 place-items-center rounded-full text-xs font-bold',
+        state === 'done' ? 'bg-success text-success-foreground'
+        : state === 'now' ? 'bg-primary text-primary-foreground'
+        : 'bg-secondary text-muted-foreground')}>
+        {state === 'done' ? '✓' : n}
+      </span>
+      <CardTitle className="flex-1">{title}</CardTitle>
+      {right}
+    </CardHeader>
+    <CardContent className="space-y-3">{children}</CardContent>
+  </Card>
+);
+
 function Campaign() {
   const {
     ss, contacts, setContacts, templates, picked, setPicked, params, setParams,
@@ -151,22 +171,6 @@ function Campaign() {
     api.post('/api/reset');
     setContacts({ count: 0, sample: [], file: '' }); setLogs([]); setFailLog([]);
   };
-
-  const Step = ({ n, title, state, right, children }) => (
-    <Card>
-      <CardHeader row className="gap-3">
-        <span className={cn('grid h-6 w-6 shrink-0 place-items-center rounded-full text-xs font-bold',
-          state === 'done' ? 'bg-success text-success-foreground'
-          : state === 'now' ? 'bg-primary text-primary-foreground'
-          : 'bg-secondary text-muted-foreground')}>
-          {state === 'done' ? '✓' : n}
-        </span>
-        <CardTitle className="flex-1">{title}</CardTitle>
-        {right}
-      </CardHeader>
-      <CardContent className="space-y-3">{children}</CardContent>
-    </Card>
-  );
 
   const ready2 = templates.filter(t => t.status === 'APPROVED');
 

@@ -100,23 +100,22 @@ function LoginScreen({ onIn, setupRequired }) {
 }
 
 // ── Shell ──────────────────────────────────────────────────────────────────────
+// Module scope for the same reason as Step in campaign.jsx: a component defined
+// inside a render is a new type every time, and React remounts new types.
+const NavLink = ({ r, on, unread }) => (
+  <button onClick={() => go(r.path)}
+    className={cn('flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+      on ? 'bg-secondary text-secondary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground')}>
+    <span className="w-4 text-center opacity-70">{r.icon}</span>
+    <span className="flex-1 text-left">{r.label}</span>
+    {r.path === 'inbox' && unread > 0 && <Badge variant="destructive">{unread}</Badge>}
+  </button>
+);
+
 function Shell({ children }) {
   const { ss, connected, dark, setDark, signOut } = useApp();
   const [tab] = useRoute();
   const unread = ss.inboxUnread || 0;
-
-  const NavLink = ({ r }) => {
-    const on = tab === r.path;
-    return (
-      <button onClick={() => go(r.path)}
-        className={cn('flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-          on ? 'bg-secondary text-secondary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground')}>
-        <span className="w-4 text-center opacity-70">{r.icon}</span>
-        <span className="flex-1 text-left">{r.label}</span>
-        {r.path === 'inbox' && unread > 0 && <Badge variant="destructive">{unread}</Badge>}
-      </button>
-    );
-  };
 
   return (
     <div className="flex min-h-full flex-col md:flex-row">
@@ -131,7 +130,9 @@ function Shell({ children }) {
             </p>
           </div>
         </div>
-        <nav className="flex gap-1 md:flex-col">{ROUTES.map(r => <NavLink key={r.path} r={r} />)}</nav>
+        <nav className="flex gap-1 md:flex-col">
+          {ROUTES.map(r => <NavLink key={r.path} r={r} on={tab === r.path} unread={unread} />)}
+        </nav>
         <div className="mt-auto hidden gap-1 pt-3 md:flex md:flex-col">
           <Button variant="ghost" size="sm" className="justify-start" onClick={() => setDark(!dark)}>
             {dark ? '☀ Light' : '☾ Dark'}
