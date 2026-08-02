@@ -13,12 +13,15 @@ const CFG = {
   phoneNumberId:      process.env.PHONE_NUMBER_ID      || '',
   accessToken:        process.env.ACCESS_TOKEN         || '',
   wabaId:             process.env.WABA_ID              || '',
-  businessId:         process.env.BUSINESS_ID          || 'YOUR_BUSINESS_ID',
-  webhookVerifyToken: process.env.WEBHOOK_VERIFY_TOKEN || 'YOUR_WEBHOOK_VERIFY_TOKEN',
+  businessId:         process.env.BUSINESS_ID          || '',
+  // No fallback on purpose. A default verify token would be a shared secret
+  // published in the repo, and an empty one is refused outright (see
+  // routes/webhook.js) rather than matching an empty query parameter.
+  webhookVerifyToken: process.env.WEBHOOK_VERIFY_TOKEN || '',
   appSecret:          process.env.APP_SECRET           || '',
   appPassword:        process.env.APP_PASSWORD         || '',
   apiVersion:         process.env.API_VERSION          || 'v23.0',
-  templateName:       process.env.TEMPLATE_NAME        || 'your_template_name',
+  templateName:       process.env.TEMPLATE_NAME        || '',
   templateLanguage:   process.env.TEMPLATE_LANGUAGE    || 'en',
   templateCategory:   process.env.TEMPLATE_CATEGORY    || 'MARKETING',
   frontendUrl:        process.env.FRONTEND_URL         || '',

@@ -142,14 +142,14 @@ resizeParamValues(0);
 console.log('\nnormalizePhone');
 test('prefixes a 10-digit Indian number', () => assert.equal(normalizePhone('9000000001'), '919000000001'));
 test('strips a leading zero', () => assert.equal(normalizePhone('09000000001'), '919000000001'));
-test('strips formatting characters', () => assert.equal(normalizePhone('+91 99801-73311'), '919000000001'));
+test('strips formatting characters', () => assert.equal(normalizePhone('+91 90000-00001'), '919000000001'));
 test('rejects toll-free numbers', () => assert.equal(normalizePhone('18001234567'), null));
 test('rejects numbers that are too short', () => assert.equal(normalizePhone('12345'), null));
 test('rejects empty input', () => assert.equal(normalizePhone(''), null));
 
 console.log('\nparseCSV');
 test('reads name and mobile, and dedupes', () => {
-  const csv = 'First Name,Mobile Phone\nRahul,9000000001\nPriya,9000000002\nDupe,+91 99801 73311\n';
+  const csv = 'First Name,Mobile Phone\nRahul,9000000001\nPriya,9000000002\nDupe,+91 90000 00001\n';
   const out = parseCSV(Buffer.from(csv));
   assert.equal(out.length, 2);
   assert.equal(out[0].name, 'Rahul');

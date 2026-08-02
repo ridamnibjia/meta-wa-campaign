@@ -1,6 +1,18 @@
 // The three-step send flow, ported from the previous single-file dashboard.
 // Behaviour is unchanged; only the styling and the file it lives in are new.
 
+// Offered as a download from the upload step. Every row carries a country code,
+// because that is the one thing that makes the parser unambiguous — see
+// CSV-FORMAT.md. Kept here rather than as a served file so the example the user
+// downloads is always the example the surrounding copy describes.
+const CSV_TEMPLATE = [
+  'Name,Mobile Phone',
+  'Asha,+91 90000 00001',
+  'Rahul,+919000000002',
+  'Marco,+39 333 000 0004',
+  'Sarah,+1 415 555 0123',
+].join('\n') + '\n';
+
 // What a contact would actually receive: {{1}} filled with a real-looking name.
 // `values` resolves {{1}}, {{2}}… positionally.
 const Preview = ({ body, footer, optOut, sample, values }) => body ? (
@@ -198,6 +210,31 @@ function Campaign() {
             </>}
           </label>
           <input id="csv" type="file" accept=".csv" hidden onChange={e => e.target.files[0] && uploadCSV(e.target.files[0])} />
+
+          {/* Format guidance, shown before the first upload — after one, the
+              parsed list below is the better answer to "did it work?".
+              The template is a data URI rather than a served file so it can
+              never drift from the example numbers documented here. */}
+          {!contacts.count && (
+            <div className="rounded-md border border-border bg-muted/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
+              <p>
+                Two columns are enough — one whose header contains <code className="font-mono">Name</code> and
+                one containing <code className="font-mono">Mobile</code>. Extra columns are ignored.
+              </p>
+              <p className="mt-1.5 font-medium text-foreground">
+                Write every number with its country code — <code className="font-mono">+91…</code>, <code className="font-mono">+1…</code>, <code className="font-mono">+44…</code>
+              </p>
+              <p className="mt-0.5">
+                Spaces, dashes and brackets are fine. A number with no country code is assumed
+                to be Indian, which is wrong for everyone else.
+              </p>
+              <a className="mt-2 inline-block font-medium text-primary underline underline-offset-2"
+                 download="contacts-template.csv"
+                 href={'data:text/csv;charset=utf-8,' + encodeURIComponent(CSV_TEMPLATE)}>
+                Download a template CSV
+              </a>
+            </div>
+          )}
 
           {/* The sample only exists right after an upload — a list still on the
               server from an earlier session has none, so this hangs off count. */}

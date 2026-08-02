@@ -17,10 +17,14 @@ router.get('/webhook', (req, res) => {
   const mode      = req.query['hub.mode'];
   const token     = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === CFG.webhookVerifyToken) {
+  // The token check must fail closed when none is configured. Without the first
+  // clause an unset WEBHOOK_VERIFY_TOKEN would match `?hub.verify_token=` and
+  // hand the challenge to anyone who asked.
+  if (mode === 'subscribe' && CFG.webhookVerifyToken && token === CFG.webhookVerifyToken) {
     log('info', 'Webhook verified by Meta');
     return res.status(200).send(challenge);
   }
+  if (!CFG.webhookVerifyToken) log('warn', 'webhook verification refused — WEBHOOK_VERIFY_TOKEN is not set');
   res.sendStatus(403);
 });
 

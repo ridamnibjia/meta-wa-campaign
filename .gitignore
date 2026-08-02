@@ -3,9 +3,25 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# Runtime state — created on first run, never committed
 opt-outs.json
 warmup.json
 msg-index.json
 inbox.json
 campaign.json
 *.tmp
+
+# Private working notes: the deployment runbook names real infrastructure, and
+# the design specs and video outline are not for publication. The public CSV
+# guide lives at ./CSV-FORMAT.md instead.
+docs/
+
+# Assistant session logs
+.remember/
+
+# Never commit a real contact list. Phone numbers are personal data, and a
+# public repo is a permanent, indexed copy. contacts-template.csv is the
+# exception — it is synthetic and deliberately tracked.
+*.csv
+!contacts-template.csv

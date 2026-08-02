@@ -1,7 +1,8 @@
 'use strict';
-// Entry point: wiring only. Behaviour lives in src/ — see
-// docs/superpowers/specs/2026-08-02-dashboard-inbox-pricing-design.md for the
-// layering rule (routes → services → lib → config).
+// Entry point: wiring only. Behaviour lives in src/, layered strictly one way:
+// routes → services → lib → config. Nothing in lib/ knows about Express and
+// nothing in services/ knows about HTTP, which is what lets test.js call the
+// real logic with no server and no mocks.
 const express    = require('express');
 const http       = require('http');
 const fs         = require('fs');

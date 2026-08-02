@@ -1,6 +1,9 @@
 'use strict';
 
 // Meta requires numbers without a + prefix, e.g. 919000000001 for Indian numbers.
+// Anything already carrying a country code passes through untouched — which is
+// why CSV-FORMAT.md tells people to always include one. The bare-10-digit branch
+// below has to guess a country, and it guesses India.
 function normalizePhone(raw) {
   if (!raw) return null;
   let d = String(raw).trim().replace(/\D/g, '');
