@@ -194,31 +194,49 @@ At 2s per message, 2,238 contacts takes ~75 minutes. If you are on Tier 1 (1,000
 ```
 meta-wa-campaign/
 │
-├── server.js            Node.js/Express backend
-│                        Handles: API routes, campaign loop, Meta API calls,
-│                        webhook receiver, Socket.io real-time updates
+├── server.js            Entry point — wiring and listen only
+│
+├── src/
+│   ├── config.js        CFG, LIMITS, PRICES, file paths (imports nothing)
+│   ├── state.js         Campaign state, log(), socket registry
+│   ├── lib/             Pure helpers: phone, errors, signature, pricing, store
+│   ├── services/        Graph client, templates, campaign loop, inbox,
+│   │                    opt-outs, warm-up, message index, state snapshot
+│   ├── middleware/
+│   │   └── auth.js      Password gate, sessions, login rate limit
+│   └── routes/          One router per resource; index.js mounts them and
+│                        decides what sits behind the password
 │
 ├── public/
-│   └── index.html       React frontend (single file, CDN deps, no build step)
-│                        Deployed to Cloudflare Pages in production
-│                        Served by Express in local dev
+│   ├── index.html       Shell — Tailwind CDN, design tokens, script tags
+│   ├── ui.jsx           shadcn-shaped primitives (Card, Button, Dialog, …)
+│   ├── app.jsx          API client, session gate, socket, hash router
+│   └── views/           dashboard, campaign, inbox, settings
 │
 ├── test.js              Self-check for the pure functions — `node test.js`
-│                        No framework. Covers template validation, payload
-│                        building, parameter sanitising, phone normalising
+│                        No framework. 117 cases covering template validation,
+│                        payload building, phone normalising, pricing maths,
+│                        the 24h reply window, webhook dedupe and auth
 │
-├── opt-outs.json        Numbers that tapped "Stop promotions" (created at
-│                        runtime, gitignored, loaded into memory on boot)
+├── opt-outs.json        Numbers that tapped "Stop promotions"
+├── msg-index.json       messageId → status, so late read receipts still count
+├── inbox.json           Conversation threads
+├── campaign.json        Send queue + cursor, so a restart resumes
+│                        (all four created at runtime and gitignored)
 │
 ├── package.json         4 deps: express, socket.io, multer, dotenv
 ├── Dockerfile           For containerised deployment (Render, DigitalOcean)
 ├── .env.example         Template for credentials — copy to .env
-├── .env                 Your secrets — never commit this
-├── .gitignore           Excludes .env and node_modules
+├── .gitignore           Excludes .env, node_modules and the runtime JSON
 └── README.md
 ```
 
-**Why no build step?** The frontend loads React, ReactDOM, and Babel from CDN. Babel compiles JSX in the browser. First load takes 3–5s; cached on repeat visits. For an internal tool this is acceptable and removes all build tooling.
+Dependencies run one way only: `routes → services → lib → config`. Nothing in
+`lib/` knows about Express, and nothing in `services/` knows about HTTP.
+
+**Why no build step?** The frontend loads React, ReactDOM, Babel and Tailwind from CDN. Babel compiles JSX in the browser. First load takes 3–5s; cached on repeat visits. For an internal tool this is acceptable and removes all build tooling.
+
+This is also why the UI is *shadcn-shaped* rather than actual shadcn/ui: shadcn ships TSX components you compile yourself, which needs a bundler. `ui.jsx` reproduces its token names, variants and component API by hand, so adopting the real thing later is a find-and-replace rather than a rewrite.
 
 ---
 

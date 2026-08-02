@@ -8,6 +8,11 @@ const {
   slugify, templateVars, sanitizeParam, validateTemplateInput,
   buildTemplatePayload, normalizePhone, parseCSV, buildParams, verifySignature, explainError, tierToCap, META_ERRORS, S,
   warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W,
+  applyStatus, missingParams, resizeParamValues,
+  rateFor, billableCount, estimateCost, spentCost, formatMoney,
+  isWindowOpen, recordInbound, describeInbound, inboxSummary,
+  checkPassword, createSession, validSession, destroySession,
+  PRICES,
 } = require('./server');
 
 let passed = 0;
@@ -89,22 +94,50 @@ test('defaults to MARKETING/en', () => {
 });
 
 console.log('\nbuildParams');
+const slots = (...v) => { resizeParamValues(v.length); S.config.paramValues = v; };
 test('returns nothing when the template has no variables', () => {
-  S.config.paramCount = 0;
+  slots();
   assert.deepEqual(buildParams({ name: 'Rahul' }), []);
 });
-test('maps {{1}} to the contact name', () => {
-  S.config.paramCount = 1;
+test('maps a name slot to the contact name', () => {
+  slots({ source: 'name', value: '' });
   assert.deepEqual(buildParams({ name: 'Rahul' }), [{ type: 'text', text: 'Rahul' }]);
 });
 test('sanitizes a multi-line name', () => {
-  S.config.paramCount = 1;
+  slots({ source: 'name', value: '' });
   assert.deepEqual(buildParams({ name: 'Ra\nhul' }), [{ type: 'text', text: 'Ra hul' }]);
 });
 test('falls back when the name is blank', () => {
-  S.config.paramCount = 1;
+  slots({ source: 'name', value: '' });
   assert.deepEqual(buildParams({ name: '' }), [{ type: 'text', text: 'there' }]);
 });
+test('a fixed slot sends the same value to everyone', () => {
+  slots({ source: 'fixed', value: '12' });
+  assert.deepEqual(buildParams({ name: 'Rahul' }), [{ type: 'text', text: '12' }]);
+  assert.deepEqual(buildParams({ name: 'Priya' }), [{ type: 'text', text: '12' }]);
+});
+test('mixes a per-contact slot with fixed ones', () => {
+  slots({ source: 'name', value: '' }, { source: 'fixed', value: '12' }, { source: 'fixed', value: '1 March' });
+  assert.deepEqual(buildParams({ name: 'Rahul' }).map(p => p.text), ['Rahul', '12', '1 March']);
+});
+test('an unfilled fixed slot is reported, not silently sent', () => {
+  slots({ source: 'name', value: '' }, { source: 'fixed', value: '  ' });
+  assert.deepEqual(missingParams(), [2]);
+});
+test('a fully filled template reports nothing missing', () => {
+  slots({ source: 'name', value: '' }, { source: 'fixed', value: '12' });
+  assert.deepEqual(missingParams(), []);
+});
+test('resizing keeps values for slots that still exist', () => {
+  slots({ source: 'fixed', value: '12' }, { source: 'fixed', value: '1 March' });
+  resizeParamValues(1);
+  assert.deepEqual(S.config.paramValues, [{ source: 'fixed', value: '12' }]);
+});
+test('growing adds fixed slots, defaulting only {{1}} to the contact name', () => {
+  resizeParamValues(0); resizeParamValues(2);
+  assert.deepEqual(S.config.paramValues.map(p => p.source), ['name', 'fixed']);
+});
+resizeParamValues(0);
 
 console.log('\nnormalizePhone');
 test('prefixes a 10-digit Indian number', () => assert.equal(normalizePhone('9000000001'), '919000000001'));
@@ -197,5 +230,161 @@ console.log('\nwarm-up ladder');
   Object.assign(W, { days: restore.days, enabled: restore.enabled });
   S.quality = restore.quality; S.config.dailyCap = restore.cap;
 }
+
+console.log('\nstatus webhook counting');
+{
+  const seed = () => {
+    S.msgIndex = { m1: { phone: '911', name: 'A', status: 'accepted' } };
+    S.delivered = 0; S.read = 0; S.failLog = [];
+  };
+  const feed = (...sts) => sts.forEach(s => applyStatus({ id: 'm1', status: s }));
+
+  test('delivered then read counts each once', () => {
+    seed(); feed('delivered', 'read');
+    assert.deepEqual([S.delivered, S.read], [1, 1]);
+  });
+  test('a read with no delivered still counts as delivered', () => {
+    seed(); feed('read');
+    assert.deepEqual([S.delivered, S.read], [1, 1]);
+  });
+  test('Meta redelivering the same status does not double count', () => {
+    seed(); feed('delivered', 'delivered', 'read', 'read');
+    assert.deepEqual([S.delivered, S.read], [1, 1]);
+  });
+  test('an out-of-order delivered after read does not rewind or recount', () => {
+    seed(); feed('read', 'delivered', 'read');
+    assert.deepEqual([S.delivered, S.read], [1, 1]);
+    assert.equal(S.msgIndex.m1.status, 'read');
+  });
+  test('failed is recorded without touching the delivered counter', () => {
+    seed(); applyStatus({ id: 'm1', status: 'failed', errors: [{ code: 131049, title: 'Blocked' }] });
+    assert.equal(S.failLog.length, 1);
+    assert.equal(S.delivered, 0);
+  });
+  test('a status for a message this server never sent is ignored', () => {
+    seed(); applyStatus({ id: 'nope', status: 'read' });
+    assert.deepEqual([S.delivered, S.read], [0, 0]);
+  });
+  S.msgIndex = {}; S.delivered = 0; S.read = 0; S.failLog = [];
+}
+
+
+console.log('\npricing');
+test('marketing rate comes from the configured price', () => {
+  PRICES.MARKETING = 0.78;
+  assert.equal(rateFor('MARKETING'), 0.78);
+});
+test('category is case-insensitive', () => assert.equal(rateFor('marketing'), 0.78));
+test('an unknown category falls back to the dearest rate, not zero', () => {
+  PRICES.MARKETING = 0.78; PRICES.UTILITY = 0.115;
+  assert.equal(rateFor('NONSENSE'), 0.78);
+  assert.equal(rateFor(null), 0.78);
+});
+test('billable excludes opted-out numbers', () => {
+  const contacts = [{ dialStr: '911' }, { dialStr: '922' }, { dialStr: '933' }];
+  assert.equal(billableCount(contacts, new Set(['922'])), 2);
+});
+test('billable counts everything when nothing has opted out', () => {
+  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }], new Set()), 2);
+});
+test('billable of an empty list is zero, not NaN', () => assert.equal(billableCount([], new Set()), 0));
+test('estimate multiplies and rounds to paise', () => assert.equal(estimateCost(988, 0.78), 770.64));
+test('estimate never goes negative', () => assert.equal(estimateCost(-5, 0.78), 0));
+test('spend counts delivered only — failures are free', () => assert.equal(spentCost(529, 0.78), 412.62));
+test('spend is zero before anything is delivered', () => assert.equal(spentCost(0, 0.78), 0));
+test('money is formatted with the currency symbol and two decimals', () => {
+  assert.equal(formatMoney(770.6, '₹'), '₹770.60');
+});
+
+console.log('\n24-hour reply window');
+const HOUR = 3600000;
+test('a thread with no inbound message has no open window', () => {
+  assert.equal(isWindowOpen({ lastInboundAt: 0 }), false);
+  assert.equal(isWindowOpen(null), false);
+});
+test('a reply one hour ago leaves the window open', () => {
+  const now = Date.now();
+  assert.equal(isWindowOpen({ lastInboundAt: now - HOUR }, now), true);
+});
+test('the window is still open at 23h59m', () => {
+  const now = Date.now();
+  assert.equal(isWindowOpen({ lastInboundAt: now - (24 * HOUR - 60000) }, now), true);
+});
+test('the window is shut at exactly 24h', () => {
+  const now = Date.now();
+  assert.equal(isWindowOpen({ lastInboundAt: now - 24 * HOUR }, now), false);
+});
+test('the window is shut past 24h', () => {
+  const now = Date.now();
+  assert.equal(isWindowOpen({ lastInboundAt: now - 25 * HOUR }, now), false);
+});
+
+console.log('\ninbound messages');
+{
+  const msg = (id, body) => ({ id, from: '919000000003', type: 'text',
+                               timestamp: String(Math.floor(Date.now() / 1000)), text: { body } });
+  S.inbox = {};
+  test('a text reply is recorded on its thread', () => {
+    const e = recordInbound(msg('w1', 'yes please'), 'Asha');
+    assert.equal(e.text, 'yes please');
+    assert.equal(e.dir, 'in');
+    assert.equal(S.inbox['919000000003'].unread, 1);
+  });
+  test('the profile name from Meta becomes the thread name', () => {
+    assert.equal(S.inbox['919000000003'].name, 'Asha');
+  });
+  test('a redelivered wamid is ignored instead of duplicating the message', () => {
+    assert.equal(recordInbound(msg('w1', 'yes please'), 'Asha'), null);
+    assert.equal(S.inbox['919000000003'].messages.length, 1);
+    assert.equal(S.inbox['919000000003'].unread, 1);
+  });
+  test('a second distinct message increments unread', () => {
+    recordInbound(msg('w2', 'what is the price'), 'Asha');
+    assert.equal(S.inbox['919000000003'].messages.length, 2);
+    assert.equal(S.inbox['919000000003'].unread, 2);
+  });
+  test('the unread summary totals every thread', () => {
+    assert.equal(inboxSummary().unread, 2);
+    assert.equal(inboxSummary().threads.length, 1);
+  });
+  test('a button tap is described by its label, not left blank', () => {
+    assert.equal(describeInbound({ type: 'button', button: { text: 'Stop promotions' } }), 'Stop promotions');
+  });
+  test('an unsupported type is labelled rather than dropped silently', () => {
+    assert.equal(describeInbound({ type: 'image' }), '[image]');
+  });
+  S.inbox = {};
+}
+
+console.log('\nauthentication');
+test('the right password is accepted', () => {
+  process.env.APP_PASSWORD = 'correct horse';
+  require('./src/config').CFG.appPassword = 'correct horse';
+  assert.equal(checkPassword('correct horse'), true);
+});
+test('a wrong password is rejected', () => assert.equal(checkPassword('wrong horse'), false));
+test('a password of a different length is rejected without throwing', () => {
+  assert.equal(checkPassword('x'), false);
+  assert.equal(checkPassword(''), false);
+  assert.equal(checkPassword(undefined), false);
+});
+test('no password configured means nothing authenticates', () => {
+  const cfg = require('./src/config').CFG;
+  const saved = cfg.appPassword;
+  cfg.appPassword = '';
+  assert.equal(checkPassword(''), false);
+  assert.equal(checkPassword('anything'), false);
+  cfg.appPassword = saved;
+});
+test('a fresh session token validates', () => {
+  const t = createSession();
+  assert.equal(validSession(t), true);
+});
+test('an unknown token does not validate', () => assert.equal(validSession('deadbeef'), false));
+test('a destroyed session stops validating', () => {
+  const t = createSession();
+  destroySession(t);
+  assert.equal(validSession(t), false);
+});
 
 console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);

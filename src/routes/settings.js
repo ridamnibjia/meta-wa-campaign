@@ -1,0 +1,77 @@
+'use strict';
+const express = require('express');
+const { CFG, LIMITS, PRICES } = require('../config');
+const { S, log } = require('../state');
+const { buildState, broadcast } = require('../services/status');
+const { fetchAccountInfo } = require('../services/graph');
+const { CONTACT_FIELDS } = require('../services/campaign');
+const { W, saveWarmup, warmupCap, warmupStep } = require('../services/warmup');
+const { missingParams } = require('../services/campaign');
+
+const router = express.Router();
+
+router.post('/config', (req, res) => {
+  const { phoneNumberId, accessToken, wabaId, templateName, templateLanguage,
+          templateCategory, delaySec, dailyCap, prices } = req.body;
+  if (phoneNumberId)    CFG.phoneNumberId    = phoneNumberId;
+  if (accessToken)      CFG.accessToken      = accessToken;
+  if (wabaId)           CFG.wabaId           = wabaId;
+  if (templateName)     { CFG.templateName     = templateName;     S.config.templateName     = templateName; }
+  if (templateLanguage) { CFG.templateLanguage = templateLanguage; S.config.templateLanguage = templateLanguage; }
+  if (templateCategory) { CFG.templateCategory = templateCategory; S.config.templateCategory = templateCategory; }
+  if (delaySec)         S.config.delaySec = Math.max(1, parseInt(delaySec));
+  if (dailyCap)         S.config.dailyCap = Math.max(1, parseInt(dailyCap));
+
+  // Session-only rate overrides. The .env values are the defaults every restart
+  // returns to — nothing here writes to disk, matching how credentials behave.
+  if (prices && typeof prices === 'object') {
+    for (const k of ['MARKETING', 'UTILITY', 'AUTHENTICATION']) {
+      const v = Number(prices[k]);
+      if (Number.isFinite(v) && v >= 0) PRICES[k] = v;
+    }
+    if (typeof prices.currency === 'string' && prices.currency.trim()) {
+      PRICES.currency = prices.currency.trim().slice(0, 4);
+    }
+    log('info', `Pricing updated — marketing ${PRICES.currency}${PRICES.MARKETING} per delivered message`);
+  }
+
+  broadcast();
+  res.json({ ok: true, configured: !!(CFG.phoneNumberId && CFG.accessToken) });
+});
+
+// Set what goes into each {{n}} for this campaign. Values are validated here and
+// sanitized again at send time, since this endpoint is the trust boundary for
+// text that ends up in a message to a real customer.
+router.post('/params', (req, res) => {
+  const incoming = req.body?.paramValues;
+  if (!Array.isArray(incoming)) return res.json({ ok: false, error: 'paramValues must be an array' });
+
+  S.config.paramValues = Array.from({ length: S.config.paramCount || 0 }, (_, i) => {
+    const p = incoming[i] || {};
+    const source = CONTACT_FIELDS.includes(p.source) ? p.source : 'fixed';
+    return { source, value: source === 'fixed' ? String(p.value ?? '').slice(0, LIMITS.paramValue) : '' };
+  });
+
+  broadcast();
+  res.json({ ok: true, paramValues: S.config.paramValues, missing: missingParams() });
+});
+
+router.get('/account-info', async (req, res) => {
+  try {
+    const info = await fetchAccountInfo();
+    if (info.qualityRating) S.quality = info.qualityRating;
+    res.json(info);
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+router.post('/warmup', (req, res) => {
+  if (typeof req.body.enabled === 'boolean') { W.enabled = req.body.enabled; saveWarmup(); }
+  broadcast();
+  res.json({ ok: true, enabled: W.enabled, cap: warmupCap(), step: warmupStep(), daysSent: W.days.length });
+});
+
+router.get('/state',   (req, res) => res.json(buildState()));
+router.get('/logs',    (req, res) => res.json(S.logs));
+router.get('/faillog', (req, res) => res.json(S.failLog));
+
+module.exports = router;

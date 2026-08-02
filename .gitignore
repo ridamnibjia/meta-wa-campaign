@@ -5,3 +5,7 @@ node_modules/
 Thumbs.db
 opt-outs.json
 warmup.json
+msg-index.json
+inbox.json
+campaign.json
+*.tmp
