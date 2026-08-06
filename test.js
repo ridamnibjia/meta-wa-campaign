@@ -29,6 +29,7 @@ const {
   buildState,
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
+  ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
 
@@ -1290,6 +1291,118 @@ testAsync('a signed envelope well over the old 100kb express default is accepted
   const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
   assert.equal(after, before + 1, 'the oversized envelope must actually be recorded, not merely accepted');
 });
+
+console.log('\nmedia — Meta identifiers');
+{
+  const seed = () => {
+    const r = saveUpload({ buffer: Buffer.from(`bytes-${Math.random()}`),
+                           originalname: 'sheet.pdf', mimetype: 'application/pdf' });
+    assert.equal(r.ok, true, r.error);
+    return r.asset.id;
+  };
+
+  // Every one of these stubs global.fetch. testAsync runs one at a time, so the
+  // restore in the finally block always lands before the next test's stub.
+  const withFetch = async (impl, fn) => {
+    const real = global.fetch;
+    const calls = [];
+    global.fetch = async (url, opts) => { calls.push({ url: String(url), opts }); return impl(String(url), opts, calls); };
+    try { return await fn(calls); } finally { global.fetch = real; }
+  };
+  const json = obj => ({ ok: true, status: 200, json: async () => obj, headers: new Headers() });
+
+  testAsync('ensureHandle runs the two-step resumable upload and caches the handle', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    try {
+      await withFetch((url, opts) => {
+        if (url.includes('/uploads?')) return json({ id: 'upload:SESSION' });
+        assert.equal(opts.headers.Authorization, 'OAuth test-token',
+          'step two of the resumable upload uses OAuth, not Bearer — Bearer 400s');
+        return json({ h: 'h:TESTHANDLE' });
+      }, async calls => {
+        const r = await ensureHandle(id);
+        assert.equal(r.ok, true, r.error);
+        assert.equal(r.handle, 'h:TESTHANDLE');
+        assert.equal(calls.length, 2, 'resumable upload is two calls');
+      });
+      // Cached: a second call must not touch the network.
+      await withFetch(() => { throw new Error('must not refetch a cached handle'); },
+        async () => assert.equal((await ensureHandle(id)).handle, 'h:TESTHANDLE'));
+    } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureHandle refuses clearly when APP_ID is not configured', async () => {
+    const savedApp = CFG.appId;
+    CFG.appId = '';
+    const id = seed();
+    try {
+      const r = await ensureHandle(id);
+      assert.equal(r.ok, false);
+      assert.match(r.error, /APP_ID/, 'the error must name the missing setting');
+    } finally { CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureMediaId uploads once and caches', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    try {
+      await withFetch(() => json({ id: '9990001' }), async calls => {
+        const r = await ensureMediaId(id);
+        assert.equal(r.ok, true, r.error);
+        assert.equal(r.mediaId, '9990001');
+        assert.equal(calls.length, 1);
+      });
+      await withFetch(() => { throw new Error('must not re-upload a fresh media id'); },
+        async () => assert.equal((await ensureMediaId(id)).mediaId, '9990001'));
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  // Meta deletes media at 30 days. Refreshing at 29 means a campaign that
+  // starts on day 29 does not fail halfway through when the id expires mid-run.
+  testAsync('a media id older than 29 days is re-uploaded', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    try {
+      await withFetch(() => json({ id: 'first' }), async () => { await ensureMediaId(id); });
+      db.prepare('UPDATE media_assets SET media_id_at = ? WHERE id = ?')
+        .run(Date.now() - (MEDIA_ID_TTL_MS + 1000), id);
+      await withFetch(() => json({ id: 'second' }), async calls => {
+        const r = await ensureMediaId(id);
+        assert.equal(r.mediaId, 'second', 'a stale media id must be re-uploaded, not reused');
+        assert.equal(calls.length, 1);
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  testAsync('force re-uploads even when the cached id is fresh', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    try {
+      await withFetch(() => json({ id: 'aaa' }), async () => { await ensureMediaId(id); });
+      await withFetch(() => json({ id: 'bbb' }), async () => {
+        assert.equal((await ensureMediaId(id, { force: true })).mediaId, 'bbb');
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  testAsync('a Graph error is returned as a message, not thrown', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    try {
+      await withFetch(() => json({ error: { message: 'Upload failed', code: 100 } }), async () => {
+        const r = await ensureMediaId(id);
+        assert.equal(r.ok, false);
+        assert.match(r.error, /Upload failed/);
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+}
 
 Promise.all(pending).then(() => {
   console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);

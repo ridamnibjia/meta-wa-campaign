@@ -19,6 +19,11 @@ const CFG = {
   // routes/webhook.js) rather than matching an empty query parameter.
   webhookVerifyToken: process.env.WEBHOOK_VERIFY_TOKEN || '',
   appSecret:          process.env.APP_SECRET           || '',
+  // The Resumable Upload API keys on the APP id — not the WABA id and not the
+  // business id, neither of which substitutes. It is the only way to get the
+  // h:… handle that template creation requires, so without it media headers
+  // are unavailable and the composer says so rather than failing at submit.
+  appId:              process.env.APP_ID               || '',
   appPassword:        process.env.APP_PASSWORD         || '',
   apiVersion:         process.env.API_VERSION          || 'v23.0',
   templateName:       process.env.TEMPLATE_NAME        || '',
