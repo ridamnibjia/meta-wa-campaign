@@ -62,7 +62,7 @@ function applyStatus(status) {
     const alreadyFailed = row.status === 'failed';
     markFailed.run(now, code, title, id);
     if (!alreadyFailed) {
-      S.failLog.push({ time: new Date().toISOString(), phone: row.wa_id, error: title, code, hint, source: 'webhook' });
+      S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: row.wa_id, error: title, code, hint, source: 'webhook' });
       if (S.failLog.length > 50) S.failLog.shift();
       log('warn', `delivery failed — +${row.wa_id} [${code}] ${title || ''}`);
       if (hint) log('warn', `   ↳ ${hint}`);

@@ -44,7 +44,7 @@ router.post('/test-send', async (req, res) => {
       // → read in front of you; /api/start opens a new run before the campaign.
       S.dailyCount++;
       recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
-                       body: contact.name, runId: S.currentRunId });
+                       body: `[template: ${S.config.templateName}]`, runId: S.currentRunId });
       log('success', `test send accepted — +${dialStr}`);
     } else {
       log('error', `test send failed — +${dialStr} [${r.errorCode}] ${r.error}`);

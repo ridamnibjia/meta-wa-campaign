@@ -147,8 +147,16 @@ async function campaignLoop() {
     checkDaily();
     const cap = effectiveCap();
     if (S.dailyCount >= cap) {
-      const next = new Date(); next.setDate(next.getDate() + 1); next.setHours(0, 2, 0, 0);
-      const wait = next - Date.now();
+      // Compute ms until 00:02 IST regardless of the server's TZ.
+      // IST is UTC+05:30, so offset the current UTC time by +5.5h to get
+      // "IST wall-clock" as a Date, ceil to the next midnight, then undo.
+      const IST_OFFSET_MS = 5.5 * 3600000;
+      const nowMs = Date.now();
+      const istNow = new Date(nowMs + IST_OFFSET_MS);
+      istNow.setUTCHours(0, 2, 0, 0);                  // midnight IST + 2m in UTC terms
+      istNow.setUTCDate(istNow.getUTCDate() + 1);       // next occurrence
+      const nextIstMidnight = istNow.getTime() - IST_OFFSET_MS;
+      const wait = nextIstMidnight - nowMs;
       const h = Math.floor(wait / 3600000), m = Math.floor((wait % 3600000) / 60000);
       const why = warmupCap() !== null && warmupCap() <= S.config.dailyCap
         ? `Warm-up ceiling for day ${W.days.length}` : 'Daily cap';
@@ -172,7 +180,7 @@ async function campaignLoop() {
       S.dailyCount++;
       markWarmupDay();
       recordOutbound({ wamid: result.messageId, waId: c.dialStr, name: c.name,
-                       body: c.name, runId: S.currentRunId });
+                       body: `[template: ${S.config.templateName}]`, runId: S.currentRunId });
       log('success', `${n} accepted — today:${S.dailyCount}/${cap}`);
     } else if (result.skip) {
       S.skipped++;
@@ -185,7 +193,7 @@ async function campaignLoop() {
       continue; // retry same contact
     } else {
       S.failed++;
-      S.failLog.push({ time: new Date().toISOString(), phone: c.dialStr, name: c.name, error: result.error, code: result.errorCode, hint: result.hint });
+      S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: c.dialStr, name: c.name, error: result.error, code: result.errorCode, hint: result.hint });
       if (S.failLog.length > 50) S.failLog.shift();
       log('error', `${n} failed [${result.errorCode}] ${result.error}`);
       if (result.hint) log('error', `   ↳ ${result.hint}`);

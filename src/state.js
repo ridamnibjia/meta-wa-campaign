@@ -42,7 +42,7 @@ const setIO = instance => { io = instance; };
 const emit = (event, payload) => { if (io) io.emit(event, payload); };
 
 function log(level, msg) {
-  const entry = { level, msg, time: new Date().toLocaleTimeString('en-IN', { hour12: false }) };
+  const entry = { level, msg, time: new Date().toLocaleTimeString('en-IN', { hour12: false, timeZone: 'Asia/Kolkata' }) };
   S.logs.push(entry);
   if (S.logs.length > 500) S.logs.shift();
   emit('log', entry);
@@ -51,7 +51,7 @@ function log(level, msg) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function todayKey() { return new Date().toISOString().split('T')[0]; }
+function todayKey() { return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); }
 
 function checkDaily() {
   const today = todayKey();

@@ -61,7 +61,7 @@ function migrateJsonToSql(handle = db, files = FILES) {
       // source actually created the row.
       const r = insertThread.run(m.phone, m.name ?? m.phone, 0, 0, indexAt);
       if (r.changes > 0) counts.threads++;
-      insertMsg.run(wamid, m.phone, 'out', 'template', m.name ?? null, indexAt, m.status ?? null);
+      insertMsg.run(wamid, m.phone, 'out', 'template', '[template]', indexAt, m.status ?? null);
       counts.outboundMessages++;
       indexWrites++;
     }
