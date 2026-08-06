@@ -14,6 +14,7 @@ function mount(app) {
   api.use(require('./settings'));
   api.use(require('./contacts'));
   api.use(require('./templates'));
+  api.use(require('./media'));
   api.use(require('./campaign'));
   api.use(require('./inbox'));
   app.use('/api', api);

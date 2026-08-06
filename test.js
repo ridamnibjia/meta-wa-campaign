@@ -26,7 +26,7 @@ const {
   nodeVersionOk, openDb, SCHEMA,
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
-  buildState,
+  buildState, app,
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS,
@@ -1291,6 +1291,74 @@ testAsync('a signed envelope well over the old 100kb express default is accepted
   const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
   assert.equal(after, before + 1, 'the oversized envelope must actually be recorded, not merely accepted');
 });
+
+console.log('\nmedia routes');
+{
+  // Mirrors startWebhookServer: mount the real router on a bare app so the
+  // handlers are exercised without session plumbing. The auth gate itself is
+  // asserted separately below, against the real app.
+  function startMediaServer() {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/media'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  }
+
+  testAsync('upload → list → download returns the same bytes', async () => {
+    const server = await startMediaServer();
+    try {
+      const port = server.address().port;
+      const bytes = Buffer.from(`%PDF route test ${Date.now()}`);
+      const form = new FormData();
+      form.append('file', new Blob([bytes], { type: 'application/pdf' }), 'catalogue.pdf');
+
+      const up = await (await fetch(`http://127.0.0.1:${port}/api/media/upload`,
+        { method: 'POST', body: form })).json();
+      assert.equal(up.ok, true, up.error);
+      assert.equal(up.asset.filename, 'catalogue.pdf');
+
+      const list = await (await fetch(`http://127.0.0.1:${port}/api/media`)).json();
+      assert.ok(list.assets.some(a => a.id === up.asset.id), 'the new asset must appear in the library');
+
+      const dl = await fetch(`http://127.0.0.1:${port}/api/media/asset/${up.asset.id}`);
+      assert.equal(dl.status, 200);
+      assert.equal(Buffer.from(await dl.arrayBuffer()).toString(), bytes.toString());
+    } finally { server.close(); }
+  });
+
+  testAsync('an unknown asset id is a 404, not a crash', async () => {
+    const server = await startMediaServer();
+    try {
+      const port = server.address().port;
+      const r = await fetch(`http://127.0.0.1:${port}/api/media/asset/99999999`);
+      assert.equal(r.status, 404);
+    } finally { server.close(); }
+  });
+
+  // uploads/ is never served statically. Anyone who could guess a hash would
+  // otherwise be able to read customer-facing business documents.
+  //
+  // Both halves matter. The 401 alone would pass even if the router were never
+  // mounted — requireAuth rejects every /api path before routing — so the
+  // signed-in 200 is what proves the route exists AND sits below the gate.
+  testAsync('the media library is mounted below the password gate', async () => {
+    const savedPw = CFG.appPassword;
+    CFG.appPassword = 'test-password';
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const anon = await fetch(`${base}/api/media`);
+      assert.equal(anon.status, 401, 'GET /api/media must require a session');
+
+      const signedIn = await fetch(`${base}/api/media`,
+        { headers: { cookie: `wa_session=${createSession()}` } });
+      assert.equal(signedIn.status, 200, 'a signed-in caller must reach the media router');
+      assert.ok(Array.isArray((await signedIn.json()).assets));
+    } finally { s.close(); CFG.appPassword = savedPw; }
+  });
+}
 
 console.log('\nmedia — Meta identifiers');
 {
