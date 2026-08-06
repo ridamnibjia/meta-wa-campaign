@@ -10,7 +10,7 @@ process.env.WA_DB_PATH = ':memory:';
 const assert = require('node:assert/strict');
 const {
   slugify, templateVars, sanitizeParam, validateTemplateInput,
-  buildTemplatePayload, normalizePhone, parseCSV, buildParams, verifySignature, explainError, tierToCap, META_ERRORS, S,
+  buildTemplatePayload, renderBody, normalizePhone, parseCSV, buildParams, verifySignature, explainError, tierToCap, META_ERRORS, S,
   warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W,
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
@@ -22,7 +22,7 @@ const {
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
   buildState,
-  migrateJsonToSql,
+  migrateJsonToSql, db,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
 
@@ -166,6 +166,57 @@ test('growing adds fixed slots, defaulting only {{1}} to the contact name', () =
   assert.deepEqual(S.config.paramValues.map(p => p.source), ['name', 'fixed']);
 });
 resizeParamValues(0);
+
+console.log('\nrenderBody');
+const p = t => ({ type: 'text', text: t });
+test('substitutes positionally', () =>
+  assert.equal(renderBody('Hi {{1}}, order {{2}}', [p('Sam'), p('A12')]), 'Hi Sam, order A12'));
+test('tolerates inner spaces', () =>
+  assert.equal(renderBody('Hi {{ 1 }}', [p('Sam')]), 'Hi Sam'));
+test('repeats a variable used twice', () =>
+  assert.equal(renderBody('{{1}} and {{1}}', [p('Sam')]), 'Sam and Sam'));
+test('returns the body unchanged when it has no variables', () =>
+  assert.equal(renderBody('Plain text', []), 'Plain text'));
+// A missing param must stay visibly unresolved. Writing "undefined" into a
+// customer thread would read as text we actually sent.
+test('leaves an unsupplied slot as its literal placeholder', () =>
+  assert.equal(renderBody('Hi {{1}}, order {{2}}', [p('Sam')]), 'Hi Sam, order {{2}}'));
+test('returns null for a missing body so the caller can fall back', () => {
+  assert.equal(renderBody(null, [p('Sam')]), null);
+  assert.equal(renderBody('', [p('Sam')]), null);
+  assert.equal(renderBody(undefined), null);
+});
+
+console.log('\ntemplate body capture');
+test('startRun snapshots the active body and language onto the run', () => {
+  const saved = { ...S.config };
+  Object.assign(S.config, { templateBody: 'Hi {{1}}', templateLanguage: 'en_GB', headerAssetId: null });
+  const id = startRun('promo_run');
+  const row = db.prepare('SELECT label, template_body, template_lang FROM campaign_runs WHERE id = ?').get(id);
+  Object.assign(S.config, saved);
+  assert.equal(row.label,         'promo_run');
+  assert.equal(row.template_body, 'Hi {{1}}');
+  assert.equal(row.template_lang, 'en_GB');
+});
+
+test('a recorded send stores the rendered text, not the template name', () => {
+  const wamid = `wamid.test.render.${Date.now()}`;
+  const body  = renderBody('Hi {{1}}, our sale is live', [p('Asha')]);
+  // A number no other test asserts on: recordOutbound stamps `at` with
+  // Date.now(), so this row would otherwise become the preview of a shared
+  // thread and break the inbox summary assertions further down.
+  recordOutbound({ wamid, waId: '910000000009', name: 'Asha', body, runId: null });
+  const row = db.prepare('SELECT body FROM messages WHERE wamid = ?').get(wamid);
+  assert.equal(row.body, 'Hi Asha, our sale is live');
+});
+
+test('a run with no captured body falls back to the placeholder', () => {
+  const saved = S.config.templateBody;
+  S.config.templateBody = null;
+  const text = renderBody(S.config.templateBody, [p('Asha')]) ?? `[template: ${S.config.templateName}]`;
+  S.config.templateBody = saved;
+  assert.match(text, /^\[template: /);
+});
 
 console.log('\nnormalizePhone');
 test('prefixes a 10-digit Indian number', () => assert.equal(normalizePhone('9000000001'), '919000000001'));

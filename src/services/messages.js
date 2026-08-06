@@ -136,10 +136,28 @@ function unprocessedWebhookCount() {
 // A reset starts a new run; it never deletes. The five counter integers this
 // replaces used to be zeroed on /start, which was harmless when the message
 // index was throwaway bookkeeping and would now mean deleting history.
-const insertRun = db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)');
+const insertRun = db.prepare(`
+  INSERT INTO campaign_runs (started_at, label, template_body, template_lang, header_asset)
+  VALUES (?, ?, ?, ?, ?)
+`);
 
+// One argument on purpose. Three of the four call sites (CSV upload, reset,
+// crash resume) have no template body in hand and would have to invent one for
+// an object signature — but all four already read the label out of S.config, so
+// reading the body from there too adds no coupling that was not already here.
+// If the body is stale at one of those sites, so is the name: they fail
+// together or not at all, which is the honest outcome.
+//
+// ?? null on every bind is required: node:sqlite throws on an undefined bind,
+// and a campaign.json saved before this change carries no headerAssetId.
 function startRun(label) {
-  const id = Number(insertRun.run(Date.now(), label ?? null).lastInsertRowid);
+  const id = Number(insertRun.run(
+    Date.now(),
+    label ?? null,
+    S.config.templateBody     ?? null,
+    S.config.templateLanguage ?? null,
+    S.config.headerAssetId    ?? null,
+  ).lastInsertRowid);
   S.currentRunId = id;
   return id;
 }

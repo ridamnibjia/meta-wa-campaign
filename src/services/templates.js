@@ -28,6 +28,19 @@ function sanitizeParam(v) {
   return out || 'there';
 }
 
+// Substitutes {{1}}, {{2}}… from the same parameter array the send uses, so the
+// text stored in the thread cannot drift from the text the recipient saw. An
+// unsupplied slot stays as its literal {{n}} rather than becoming "undefined" —
+// a placeholder is honest about not knowing; fabricated text is not.
+//
+// Returns null when there is no body at all, which is the signal the callers
+// use to fall back to the [template: name] placeholder.
+function renderBody(bodyText, params = []) {
+  if (!bodyText) return null;
+  return String(bodyText).replace(/\{\{\s*(\d+)\s*\}\}/g,
+    (whole, n) => params[Number(n) - 1]?.text ?? whole);
+}
+
 // Server-side pre-flight. Catches the documented rejection causes before we
 // spend a Graph call and a review cycle on them.
 function validateTemplateInput({ displayName, bodyText, footerText, sampleValues = [], category }) {
@@ -147,6 +160,10 @@ function adoptTemplate(name, result) {
     return;
   }
   S.config.templateName     = name;
+  // adoptTemplate is the single funnel through which Meta's shaped template
+  // reaches S.config, which is what lets startRun keep its one-argument
+  // signature: the body arrives here or not at all.
+  S.config.templateBody     = t.bodyText || null;
   S.config.templateStatus   = t.status;
   S.config.templateCategory = t.category;
   S.config.templateLanguage = t.language;
@@ -187,7 +204,7 @@ async function deleteTemplate(name) {
 }
 
 module.exports = {
-  slugify, templateVars, sanitizeParam, validateTemplateInput, buildTemplatePayload,
+  slugify, templateVars, sanitizeParam, renderBody, validateTemplateInput, buildTemplatePayload,
   shapeTemplate, fetchTemplates, validateTemplate, resizeParamValues, adoptTemplate,
   deleteTemplate, graphSend,
 };

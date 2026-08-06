@@ -24,6 +24,9 @@ const S = {
     templateStatus:   null,   // APPROVED | PENDING | REJECTED — gates /api/start
     paramCount:       0,      // number of {{n}} in the active template body
     paramValues:      [],     // one per {{n}}: { source: 'name' | 'fixed', value }
+    templateBody:     null,   // the approved, UNRENDERED body — snapshotted onto each run
+    headerFormat:     null,   // null | 'TEXT' | 'IMAGE' | 'VIDEO' | 'DOCUMENT'
+    headerAssetId:    null,   // media_assets.id sent as this campaign's header
   },
   pauseReason: null,
   logs:        [],

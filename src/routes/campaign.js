@@ -7,7 +7,7 @@ const { optOuts } = require('../services/optouts');
 const { W, effectiveCap } = require('../services/warmup');
 const { startRun, recordOutbound } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
-const { validateTemplate, adoptTemplate } = require('../services/templates');
+const { validateTemplate, adoptTemplate, renderBody } = require('../services/templates');
 const { fetchAccountInfo } = require('../services/graph');
 const {
   sendTemplate, missingParams, startLoop, saveCampaignNow, clearCampaignFile,
@@ -44,7 +44,9 @@ router.post('/test-send', async (req, res) => {
       // → read in front of you; /api/start opens a new run before the campaign.
       S.dailyCount++;
       recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
-                       body: `[template: ${S.config.templateName}]`, runId: S.currentRunId });
+                       body: renderBody(S.config.templateBody, r.params)
+                             ?? `[template: ${S.config.templateName}]`,
+                       runId: S.currentRunId });
       log('success', `test send accepted — +${dialStr}`);
     } else {
       log('error', `test send failed — +${dialStr} [${r.errorCode}] ${r.error}`);

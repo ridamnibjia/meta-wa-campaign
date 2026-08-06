@@ -6,7 +6,7 @@ const { broadcast } = require('./status');
 const { optOuts } = require('./optouts');
 const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
 const { recordOutbound, countsForRun, startRun } = require('./messages');
-const { sanitizeParam } = require('./templates');
+const { sanitizeParam, renderBody } = require('./templates');
 const { explainError } = require('../lib/errors');
 const { graphHeaders } = require('./graph');
 
@@ -102,7 +102,10 @@ async function sendTemplate(contact) {
       { method: 'POST', headers: graphHeaders(), body: JSON.stringify(body) }
     );
     const data = await res.json();
-    if (res.ok && data.messages?.[0]?.id) return { ok: true, messageId: data.messages[0].id };
+    // params travels back with the result so the caller renders the stored body
+    // from exactly what was sent, rather than rebuilding it and hoping the two
+    // agree. This is the whole "cannot drift" guarantee.
+    if (res.ok && data.messages?.[0]?.id) return { ok: true, messageId: data.messages[0].id, params };
     const err     = data.error || {};
     const code    = err.code        || 0;
     const subcode = err.error_subcode || 0;
@@ -180,7 +183,9 @@ async function campaignLoop() {
       S.dailyCount++;
       markWarmupDay();
       recordOutbound({ wamid: result.messageId, waId: c.dialStr, name: c.name,
-                       body: `[template: ${S.config.templateName}]`, runId: S.currentRunId });
+                       body: renderBody(S.config.templateBody, result.params)
+                             ?? `[template: ${S.config.templateName}]`,
+                       runId: S.currentRunId });
       log('success', `${n} accepted — today:${S.dailyCount}/${cap}`);
     } else if (result.skip) {
       S.skipped++;
