@@ -23,7 +23,7 @@ const META_ERRORS = {
   131031: ['Account locked for a policy violation',   'Check Business Support Home in Business Manager. Sending stays blocked until resolved.'],
   131042: ['Billing not set up for this business',    'Add or fix the payment method: Business Settings → Billing & Payments. Sends stay blocked until it clears.'],
   131047: ['Outside the 24-hour customer service window', 'Only approved templates can open a conversation. Confirm you are sending the template, not free text.'],
-  131049: ['Meta chose not to deliver this one',      'Per-user marketing cap on Meta\'s side. Not your error and not retryable.'],
+  131049: ['Meta chose not to deliver this one',      'This recipient hit their per-user marketing limit — a rolling, per-person cap Meta applies across every business messaging them. Not your error. Retry on a later day, or send it as a UTILITY-category template, which the cap does not apply to.'],
   131051: ['Unsupported message type',                'The template was changed after approval. Re-run Check Template.'],
   132000: ['Wrong number of template variables',      'The approved template expects a different variable count than the CSV supplies. Re-run Check Template.'],
   132001: ['Template not found in that language',     'Name or language code does not match an APPROVED template. Check spelling and the language code (en vs en_US).'],
