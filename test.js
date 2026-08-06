@@ -1840,6 +1840,69 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(Buffer.from(await att.arrayBuffer()).toString(), bytes.toString());
     } finally { s.close(); }
   });
+
+  // The mime type on a media row is whatever the customer's file carried —
+  // Meta relays it, it is not ours. Reflecting a script-capable type back with
+  // `inline` would run that script on the same origin as the dashboard, with
+  // the operator's session cookie attached.
+  for (const hostile of ['text/html', 'image/svg+xml', 'application/xhtml+xml']) {
+    testAsync(`a customer-supplied ${hostile} attachment is never served inline`, async () => {
+      const bytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>fetch("/api/config")</script></svg>');
+      const id = seedInbound({ bytes, mime: hostile, type: 'document', filename: 'invoice.svg' });
+      const s = await serve();
+      try {
+        const base = `http://127.0.0.1:${s.address().port}`;
+        await withToken(() => withMeta(metaOk(bytes, hostile), async () => {
+          await fetch(`${base}/api/media/inbound/${id}`, { method: 'POST', ...asOperator });
+        }));
+
+        const r = await fetch(`${base}/api/media/inbound/${id}`, asOperator);
+        assert.equal(r.status, 200);
+        assert.match(r.headers.get('content-disposition'), /^attachment/,
+          'a script-capable type must download, never render');
+        assert.match(r.headers.get('content-type'), /application\/octet-stream/,
+          'the browser must not be told this is renderable');
+        assert.equal(r.headers.get('x-content-type-options'), 'nosniff',
+          'without nosniff the browser sniffs the bytes and renders it anyway');
+        assert.match(r.headers.get('content-security-policy'), /sandbox/,
+          'sandbox is the backstop if the type ever slips through');
+      } finally { s.close(); }
+    });
+  }
+
+  testAsync('a real image is still served inline, and still hardened', async () => {
+    const bytes = Buffer.from(`safe-${Date.now()}`);
+    const id = seedInbound({ bytes, mime: 'image/jpeg' });
+    const s = await serve();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      await withToken(() => withMeta(metaOk(bytes), async () => {
+        await fetch(`${base}/api/media/inbound/${id}`, { method: 'POST', ...asOperator });
+      }));
+      const r = await fetch(`${base}/api/media/inbound/${id}`, asOperator);
+      assert.match(r.headers.get('content-type'), /image\/jpeg/, 'the inbox renders this in an <img>');
+      assert.match(r.headers.get('content-disposition'), /^inline/);
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+    } finally { s.close(); }
+  });
+
+  // WhatsApp voice notes arrive as "audio/ogg; codecs=opus". Matching the
+  // allowlist on the full string would push every voice note down the
+  // attachment path and silently break the audio player.
+  testAsync('a mime type with parameters still matches the allowlist', async () => {
+    const bytes = Buffer.from(`voice-${Date.now()}`);
+    const id = seedInbound({ bytes, mime: 'audio/ogg; codecs=opus', type: 'audio' });
+    const s = await serve();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      await withToken(() => withMeta(metaOk(bytes, 'audio/ogg; codecs=opus'), async () => {
+        await fetch(`${base}/api/media/inbound/${id}`, { method: 'POST', ...asOperator });
+      }));
+      const r = await fetch(`${base}/api/media/inbound/${id}`, asOperator);
+      assert.match(r.headers.get('content-disposition'), /^inline/,
+        'a voice note must still play in the thread');
+    } finally { s.close(); }
+  });
 }
 
 Promise.all(pending).then(() => {

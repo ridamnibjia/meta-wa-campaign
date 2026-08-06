@@ -48,6 +48,21 @@ router.get('/media/asset/:id', (req, res) => {
 });
 
 // ── Inbound: what a customer sent us ───────────────────────────────────────────
+// An allowlist, not a denylist: the set of types the inbox actually renders is
+// short and known, and a denylist of script-capable types is a guess about
+// every browser's future behaviour. PDF is deliberately absent — nothing
+// renders one inline, so it downloads like any other document.
+const INLINE_SAFE = new Set([
+  'image/jpeg', 'image/png', 'image/webp', 'image/gif',
+  'audio/aac', 'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/amr',
+  'video/mp4', 'video/3gpp',
+]);
+
+// WhatsApp voice notes arrive as "audio/ogg; codecs=opus". The allowlist holds
+// bare types, so the parameters come off before the lookup.
+const bareMime = m => String(m || '').split(';')[0].trim().toLowerCase();
+
+
 // Explicitly operator-triggered. Nothing downloads customer media automatically,
 // so the bytes only ever land on this server because someone asked for them.
 router.post('/media/inbound/:mediaId', async (req, res) => {
@@ -65,10 +80,24 @@ router.get('/media/inbound/:mediaId', (req, res) => {
   const file = inboundPath(row);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'The file for this media is missing from disk' });
 
+  // The mime type is whatever the customer's file carried — Meta relays it and
+  // we stored it. Reflecting it back with `inline` on this origin would let a
+  // customer who sends an SVG or an .html "document" run script against the
+  // dashboard with the operator's own session cookie attached. So the type is
+  // only honoured if it is on the list of things the inbox actually renders;
+  // everything else downloads as opaque bytes.
+  const mime = INLINE_SAFE.has(bareMime(row.mime_type)) ? bareMime(row.mime_type) : null;
   const name = row.filename || `${row.media_id}`;
-  res.type(row.mime_type || 'application/octet-stream');
+
+  res.type(mime || 'application/octet-stream');
+  // nosniff, because without it a browser will happily ignore
+  // application/octet-stream and render whatever the bytes look like.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // The backstop: even if a script-capable type ever reaches this line, a
+  // sandboxed response with no permitted sources cannot execute anything.
+  res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
   res.setHeader('Content-Disposition',
-    `${req.query.download ? 'attachment' : 'inline'}; filename="${encodeURIComponent(name)}"`);
+    `${mime && !req.query.download ? 'inline' : 'attachment'}; filename="${encodeURIComponent(name)}"`);
   fs.createReadStream(file).pipe(res);
 });
 
