@@ -13,17 +13,38 @@ const CSV_TEMPLATE = [
   'Sarah,+1 415 555 0123',
 ].join('\n') + '\n';
 
+// Mirrors templateVars() in src/services/templates.js. Duplicated rather than
+// shared because these .jsx files are transpiled in the browser with no bundler
+// and no way to require from src/. If the regex changes there, change it here.
+const templateVarsIn = text => [...new Set(
+  [...String(text || '').matchAll(/\{\{\s*(\d+)\s*\}\}/g)].map(m => Number(m[1]))
+)].sort((a, b) => a - b);
+
 // What a contact would actually receive: {{1}} filled with a real-looking name.
-// `values` resolves {{1}}, {{2}}… positionally.
-const Preview = ({ body, footer, optOut, sample, values }) => body ? (
+// `values` resolves {{1}}, {{2}}… positionally. `header` is a media_assets row
+// ({ id, kind, filename }) or null.
+const Preview = ({ body, footer, optOut, sample, values, header, buttons = [] }) => body ? (
   <div className="rounded-lg bg-[#e4ded6] p-3 dark:bg-[#0b141a]">
     <div className="max-w-[94%] rounded-r-lg rounded-bl-lg bg-white p-2.5 shadow-sm dark:bg-[#202c33]">
+      {header?.kind === 'image' && (
+        <img src={`/api/media/asset/${header.id}`} alt=""
+             className="mb-1.5 max-h-44 w-full rounded object-cover" />
+      )}
+      {header && header.kind !== 'image' && (
+        <div className="mb-1.5 flex items-center gap-2 rounded bg-[#f0f2f5] p-2 text-[12.5px] dark:bg-[#111b21]">
+          <span>{header.kind === 'video' ? '▶' : '📄'}</span>
+          <span className="truncate">{header.filename}</span>
+        </div>
+      )}
       <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed text-[#111b21] dark:text-[#e9edef]">
         {body.replace(/\{\{\s*(\d+)\s*\}\}/g, (m, n) => values?.[n - 1] ?? (sample || 'Rahul'))}
       </div>
       {footer && <div className="mt-1 text-[11.5px] text-[#8696a0]">{footer}</div>}
       <div className="mt-0.5 text-right text-[10.5px] text-[#8696a0]">12:00</div>
       {optOut && <div className="mt-1.5 border-t border-[#e9edef] pt-1.5 text-center text-[13.5px] font-medium text-[#00a5f4] dark:border-[#2a3942]">Stop promotions</div>}
+      {buttons.filter(b => b.text).map((b, i) => (
+        <div key={i} className="mt-1 border-t border-[#e9edef] pt-1 text-center text-[13.5px] font-medium text-[#00a5f4] dark:border-[#2a3942]">{b.text}</div>
+      ))}
     </div>
   </div>
 ) : null;
@@ -70,6 +91,112 @@ function ContactListDialog({ open, onClose }) {
   );
 }
 
+const KIND_FOR_FORMAT = { IMAGE: 'image', VIDEO: 'video', DOCUMENT: 'document' };
+
+// Module scope for the same reason Step is — see the note below.
+function MediaPicker({ format, assetId, onPick, disabled, disabledReason }) {
+  const [library, setLibrary] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState(null);
+  const [over, setOver] = useState(false);
+
+  const kind = KIND_FOR_FORMAT[format];
+  const load = () => api.get('/api/media').then(r => setLibrary(r.assets || [])).catch(() => setLibrary([]));
+  useEffect(() => { if (kind) load(); }, [kind]);
+
+  // Raw fetch, not api.post: this is multipart, and letting the browser set the
+  // Content-Type is the only way the boundary is correct.
+  const send = async file => {
+    if (!file) return;
+    setBusy(true); setErr(null);
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const r = await fetch('/api/media/upload', { method: 'POST', body: fd, credentials: 'same-origin' });
+      const j = await r.json();
+      if (!j.ok) { setErr(j.error); return; }
+      await load();
+      onPick(j.asset.id);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  if (!kind) return null;
+  if (disabled) return <Alert variant="warning" title="Media headers unavailable">{disabledReason}</Alert>;
+
+  const shown  = library.filter(a => a.kind === kind);
+  const picked = library.find(a => a.id === assetId);
+
+  return (
+    <div className="space-y-2">
+      <div
+        className={cn('rounded-lg border-2 border-dashed p-4 text-center text-sm',
+          over ? 'border-primary bg-primary/5' : 'border-border text-muted-foreground')}
+        onDragOver={e => { e.preventDefault(); setOver(true); }}
+        onDragLeave={() => setOver(false)}
+        onDrop={e => { e.preventDefault(); setOver(false); send(e.dataTransfer.files[0]); }}>
+        {busy ? 'Uploading…' : <>
+          Drop a {kind} here, or{' '}
+          <label className="cursor-pointer text-primary underline">
+            choose a file
+            <input type="file" className="hidden" onChange={e => send(e.target.files[0])} />
+          </label>
+        </>}
+      </div>
+      {err && <Alert variant="destructive" title="That file was not accepted">{err}</Alert>}
+      {shown.length > 0 && (
+        <Select value={assetId || ''} onChange={e => onPick(e.target.value ? Number(e.target.value) : null)}>
+          <option value="">No file chosen</option>
+          {shown.map(a => (
+            <option key={a.id} value={a.id}>
+              {a.filename} · {(a.file_size / 1048576).toFixed(1)} MB
+            </option>
+          ))}
+        </Select>
+      )}
+      {picked && kind === 'image' && (
+        <img src={`/api/media/asset/${picked.id}`} alt={picked.filename}
+             className="max-h-40 rounded-lg border border-border object-contain" />
+      )}
+    </div>
+  );
+}
+
+// One row per button. Kept flat rather than a nested editor component: three
+// fields and a delete is not enough surface to justify the indirection.
+function ButtonEditor({ buttons, onChange }) {
+  const set = (i, patch) => onChange(buttons.map((b, j) => j === i ? { ...b, ...patch } : b));
+  return (
+    <div className="space-y-2">
+      {buttons.map((b, i) => (
+        <div key={i} className="flex flex-wrap items-center gap-2">
+          <Select className="w-36 shrink-0" value={b.type}
+            onChange={e => set(i, { type: e.target.value, url: '', phone_number: '' })}>
+            <option value="QUICK_REPLY">Quick reply</option>
+            <option value="URL">Website link</option>
+            <option value="PHONE_NUMBER">Call us</option>
+          </Select>
+          <Input className="w-40" maxLength={25} placeholder="Button label"
+                 value={b.text || ''} onChange={e => set(i, { text: e.target.value })} />
+          {b.type === 'URL' && (
+            <Input className="min-w-[12rem] flex-1" placeholder="https://example.com/sale"
+                   value={b.url || ''} onChange={e => set(i, { url: e.target.value })} />
+          )}
+          {b.type === 'PHONE_NUMBER' && (
+            <Input className="min-w-[12rem] flex-1 font-mono" placeholder="+91 90000 00000"
+                   value={b.phone_number || ''} onChange={e => set(i, { phone_number: e.target.value })} />
+          )}
+          <Button variant="ghost" size="sm" onClick={() => onChange(buttons.filter((_, j) => j !== i))}>Remove</Button>
+        </div>
+      ))}
+      {/* 9, not 10: the opt-out quick reply occupies one of Meta's ten slots. */}
+      {buttons.length < 9 && (
+        <Button variant="outline" size="sm"
+          onClick={() => onChange([...buttons, { type: 'QUICK_REPLY', text: '' }])}>+ Add a button</Button>
+      )}
+    </div>
+  );
+}
+
 // Module scope, NOT inside Campaign(). A component declared inside another
 // component gets a fresh function identity on every render, so React sees a
 // different component type, throws the old subtree away and mounts a new one —
@@ -104,7 +231,8 @@ function Campaign() {
   const [deleting, setDeleting] = useState(null);   // template name pending confirmation
   const [test, setTest] = useState({ to: '', sending: false, results: null });
   const [compose, setCompose] = useState({
-    displayName: '', bodyText: '', footerText: '', sampleValue: 'Rahul',
+    displayName: '', bodyText: '', footerText: '', sampleValues: ['Rahul'],
+    headerFormat: '', headerText: '', headerSample: '', headerAssetId: null, buttons: [],
     addOptOut: true, category: 'MARKETING', language: 'en', submitting: false, errors: [],
   });
   const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 1000 });
@@ -114,9 +242,21 @@ function Campaign() {
     setSettings(p => ({ delaySec: c.delaySec || p.delaySec, dailyCap: c.dailyCap || p.dailyCap }));
   }, [ss.config?.delaySec, ss.config?.dailyCap]);
 
+  // The preview needs an asset's kind and filename, which only the library
+  // knows — S.config carries the id alone.
+  const [assetIndex, setAssetIndex] = useState({});
+  useEffect(() => {
+    api.get('/api/media')
+      .then(r => setAssetIndex(Object.fromEntries((r.assets || []).map(a => [a.id, a]))))
+      .catch(() => {});
+  }, [compose.headerAssetId, ss.config?.headerAssetId]);
+  const composeHeader = compose.headerAssetId ? assetIndex[compose.headerAssetId] || null : null;
+  const activeHeader  = ss.config?.headerAssetId ? assetIndex[ss.config.headerAssetId] || null : null;
+
   const { phase, configured, pricing = {} } = ss;
   const cur = pricing.currency || '₹';
-  const sampleName = contacts.sample?.[0]?.name || compose.sampleValue || 'Rahul';
+  const sampleName = contacts.sample?.[0]?.name || compose.sampleValues[0] || 'Rahul';
+  const composeVars = templateVarsIn(compose.bodyText);
   const approved  = active?.status === 'APPROVED';
   const isRunning = phase === 'running';
   const isPaused  = phase === 'paused';
@@ -125,7 +265,12 @@ function Campaign() {
   // borrowing the sample name — otherwise a blank price reads as a real one.
   const previewValues = vars.map((n, i) => params[i]?.source === 'fixed' ? (params[i].value || `{{${n}}}`) : sampleName);
   const unfilled = vars.filter((n, i) => params[i]?.source === 'fixed' && !params[i].value.trim());
-  const ready = configured && contacts.count > 0 && approved && phase === 'idle' && !unfilled.length;
+  // A media template with no file chosen would send a header component with no
+  // media id, which Meta rejects per contact. Block the start instead.
+  const needsAttachment = ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(ss.config?.headerFormat)
+                          && !ss.config?.headerAssetId;
+  const ready = configured && contacts.count > 0 && approved && phase === 'idle'
+                && !unfilled.length && !needsAttachment;
 
   const blockedBy =
     !configured        ? 'Credentials missing on the server — check .env, or open Settings' :
@@ -134,6 +279,7 @@ function Campaign() {
     active.status === 'PENDING' ? 'Meta is still reviewing this template — checking every 15s' :
     !approved          ? `That template is ${active.status} — pick an approved one or write a new one` :
     unfilled.length    ? `Fill in ${unfilled.map(n => `{{${n}}}`).join(', ')} above` :
+    needsAttachment    ? 'This template has a media header — choose the file to send' :
     phase !== 'idle'   ? 'A campaign is already running — stop it first' : null;
 
   // ── Actions ─────────────────────────────────────────────────────
@@ -141,8 +287,13 @@ function Campaign() {
     setCompose(c => ({ ...c, submitting: true, errors: [] }));
     const r = await api.post('/api/template/create', {
       displayName: compose.displayName, bodyText: compose.bodyText, footerText: compose.footerText,
-      sampleValues: [compose.sampleValue], addOptOut: compose.addOptOut,
+      sampleValues: compose.sampleValues, addOptOut: compose.addOptOut,
       category: compose.category, language: compose.language,
+      headerFormat:  compose.headerFormat || null,
+      headerText:    compose.headerText   || null,
+      headerSample:  compose.headerSample || null,
+      headerAssetId: compose.headerAssetId,
+      buttons:       compose.buttons,
     }).catch(() => ({ ok: false, errors: ['Network error — is the server running?'] }));
     setCompose(c => ({ ...c, submitting: false, errors: r.ok ? [] : (r.errors || ['Unknown error']) }));
     if (r.ok) { setWriting(false); await loadTemplates(r.name); }
@@ -318,13 +469,48 @@ function Campaign() {
                 </div>
               )}
 
+              {['IMAGE', 'VIDEO', 'DOCUMENT'].includes(ss.config?.headerFormat) && (
+                <Field label="Attachment"
+                       hint="This template was approved with a file of this type. Meta approved the SHAPE of the header, not the file — send a different one whenever you like, with no re-approval.">
+                  <MediaPicker format={ss.config.headerFormat} assetId={ss.config.headerAssetId}
+                               onPick={id => api.post('/api/config', { headerAssetId: id })} />
+                </Field>
+              )}
+
               <Preview body={active?.bodyText} optOut={(active?.buttons || []).length > 0}
-                       sample={sampleName} values={previewValues} />
+                       sample={sampleName} values={previewValues} header={activeHeader} />
 
               <Button variant="outline" size="sm" onClick={() => setWriting(true)}>+ Write a new template instead</Button>
             </>
           ) : (
             <>
+              <Field label="Header (optional)" hint="An image, video or document shown above your message. Meta reviews the file you attach here as the example; you can send a different one later without re-approval.">
+                <Select value={compose.headerFormat}
+                  onChange={e => setCompose(c => ({ ...c, headerFormat: e.target.value, headerAssetId: null }))}>
+                  <option value="">No header</option>
+                  <option value="TEXT">Text</option>
+                  <option value="IMAGE">Image</option>
+                  <option value="VIDEO">Video</option>
+                  <option value="DOCUMENT">Document</option>
+                </Select>
+              </Field>
+              {compose.headerFormat === 'TEXT' && (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="Header text" hint="Max 60 characters. One variable at most, and it must be {{1}}.">
+                    <Input value={compose.headerText} maxLength={60}
+                           onChange={e => setCompose(c => ({ ...c, headerText: e.target.value }))} />
+                  </Field>
+                  <Field label="Sample for the header variable">
+                    <Input value={compose.headerSample}
+                           onChange={e => setCompose(c => ({ ...c, headerSample: e.target.value }))} />
+                  </Field>
+                </div>
+              )}
+              <MediaPicker format={compose.headerFormat} assetId={compose.headerAssetId}
+                           onPick={id => setCompose(c => ({ ...c, headerAssetId: id }))}
+                           disabled={!!compose.headerFormat && compose.headerFormat !== 'TEXT' && !ss.mediaHeadersAvailable}
+                           disabledReason="APP_ID is not set on the server. Media headers need Meta's Resumable Upload API, which keys on the app id — set APP_ID in .env and restart." />
+
               <Field label="Template name" hint="Lowercase letters, digits and underscores. Meta rewrites anything else.">
                 <Input value={compose.displayName} placeholder="diwali_offer_2026"
                        onChange={e => setCompose(c => ({ ...c, displayName: e.target.value }))} />
@@ -338,9 +524,25 @@ function Campaign() {
                   <Input value={compose.footerText} maxLength={60}
                          onChange={e => setCompose(c => ({ ...c, footerText: e.target.value }))} />
                 </Field>
-                <Field label="Sample value for {{1}}" hint="Meta requires an example to review the template.">
-                  <Input value={compose.sampleValue}
-                         onChange={e => setCompose(c => ({ ...c, sampleValue: e.target.value }))} />
+                <Field label="Sample values" hint="Meta requires an example for every variable to review the template.">
+                  <div className="space-y-2">
+                    {composeVars.map((n, i) => (
+                      <div key={n} className="flex items-center gap-2">
+                        <span className="w-10 shrink-0 font-mono text-xs text-muted-foreground">{`{{${n}}}`}</span>
+                        <Input className="flex-1" value={compose.sampleValues[i] || ''}
+                               onChange={e => setCompose(c => {
+                                 const v = [...c.sampleValues];
+                                 v[i] = e.target.value;
+                                 return { ...c, sampleValues: v };
+                               })} />
+                      </div>
+                    ))}
+                    {!composeVars.length && (
+                      <p className="text-xs text-muted-foreground">
+                        This body has no variables yet — add {'{{1}}'} where a name or value goes.
+                      </p>
+                    )}
+                  </div>
                 </Field>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
@@ -356,8 +558,14 @@ function Campaign() {
               </div>
               <Switch checked={compose.addOptOut} onChange={v => setCompose(c => ({ ...c, addOptOut: v }))}
                       label="Add a “Stop promotions” button (strongly recommended)" />
+              <Field label="Buttons (optional)" hint="Meta allows 3 quick replies, 2 links and 1 call button. The Stop promotions button counts as a quick reply.">
+                <ButtonEditor buttons={compose.buttons}
+                              onChange={b => setCompose(c => ({ ...c, buttons: b }))} />
+              </Field>
               <Preview body={compose.bodyText} footer={compose.footerText}
-                       optOut={compose.addOptOut} sample={compose.sampleValue} />
+                       optOut={compose.addOptOut} sample={compose.sampleValues[0]}
+                       values={compose.sampleValues} buttons={compose.buttons}
+                       header={composeHeader} />
               {compose.errors.length > 0 && (
                 <Alert variant="destructive" title="Meta will not accept this yet">
                   <ul className="list-disc space-y-0.5 pl-4">{compose.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>

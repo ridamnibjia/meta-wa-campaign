@@ -54,6 +54,10 @@ function buildState() {
     pauseReason:    S.pauseReason,
     config:         S.config,
     configured:     !!(CFG.phoneNumberId && CFG.accessToken),
+    // Media headers need Meta's Resumable Upload API, which keys on the app id.
+    // Surfacing it here is what lets the composer grey the option out rather
+    // than accepting an upload and failing at submit time.
+    mediaHeadersAvailable: !!CFG.appId,
     currentContact: S.contacts[S.currentIdx] || null,
     limits:         LIMITS,
     optOutCount:    optOuts.size,
