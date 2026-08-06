@@ -30,6 +30,7 @@ const {
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS,
+  BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
 
@@ -126,6 +127,91 @@ test('defaults to MARKETING/en', () => {
   const p = buildTemplatePayload(ok);
   assert.equal(p.category, 'MARKETING');
   assert.equal(p.language, 'en');
+});
+
+console.log('\ntemplate headers');
+const okBase = { displayName: 'Test', bodyText: 'Hi {{1}}, our range is live.', sampleValues: ['Rahul'] };
+
+test('a TEXT header emits its example block', () => {
+  const c = buildTemplatePayload({ ...okBase, headerFormat: 'TEXT', headerText: 'Sale {{1}}', headerSample: 'Diwali' })
+    .components.find(x => x.type === 'HEADER');
+  assert.equal(c.format, 'TEXT');
+  assert.deepEqual(c.example, { header_text: ['Diwali'] });
+});
+
+test('a plain TEXT header carries no example block', () => {
+  const c = buildTemplatePayload({ ...okBase, headerFormat: 'TEXT', headerText: 'Big news' })
+    .components.find(x => x.type === 'HEADER');
+  assert.equal(c.text, 'Big news');
+  assert.equal(c.example, undefined);
+});
+
+test('a document header emits header_handle', () => {
+  const c = buildTemplatePayload({ ...okBase, headerFormat: 'DOCUMENT', headerHandle: 'h:TESTHANDLE' })
+    .components.find(x => x.type === 'HEADER');
+  assert.equal(c.format, 'DOCUMENT');
+  assert.deepEqual(c.example, { header_handle: ['h:TESTHANDLE'] });
+  assert.equal(c.text, undefined, 'a media header has no text');
+});
+
+test('the header is the first component — Meta requires that order', () => {
+  const p = buildTemplatePayload({ ...okBase, headerFormat: 'IMAGE', headerHandle: 'h:X' });
+  assert.equal(p.components[0].type, 'HEADER');
+});
+
+test('rejects a media header with no file chosen', () =>
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'IMAGE' }).join(), /choose a file/i));
+test('rejects a TEXT header with no text', () =>
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT' }).join(), /header text/i));
+test('rejects an over-length TEXT header', () =>
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT', headerText: 'x'.repeat(61) }).join(), /max 60/));
+test('rejects more than one variable in a TEXT header', () =>
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT', headerText: '{{1}} {{2}}', headerSample: 'a' }).join(), /one variable/i));
+test('rejects an unknown header format', () =>
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'LOCATION' }).join(), /header format/i));
+
+console.log('\ntemplate buttons');
+const qr  = n => Array.from({ length: n }, (_, i) => ({ type: 'QUICK_REPLY', text: `Reply ${i}` }));
+const url = n => Array.from({ length: n }, (_, i) => ({ type: 'URL', text: `Link ${i}`, url: `https://example.com/${i}` }));
+const tel = n => Array.from({ length: n }, (_, i) => ({ type: 'PHONE_NUMBER', text: `Call ${i}`, phone_number: '+910000000000' }));
+
+test('accepts a legal mix', () =>
+  assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: false, buttons: [...qr(2), ...url(2), ...tel(1)] }), []));
+test('rejects 3 URL buttons', () =>
+  assert.match(validateTemplateInput({ ...okBase, buttons: url(3) }).join(), /at most 2 URL/i));
+test('rejects 2 phone buttons', () =>
+  assert.match(validateTemplateInput({ ...okBase, buttons: tel(2) }).join(), /at most 1 (phone|call)/i));
+test('the opt-out button counts toward the 3 quick-reply ceiling', () =>
+  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(3) }).join(), /at most 3 quick/i));
+test('rejects a URL button with no url', () =>
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop' }] }).join(), /needs a URL/i));
+test('rejects a non-http URL', () =>
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop', url: 'javascript:alert(1)' }] }).join(), /https?:/i));
+test('rejects a button with no label', () =>
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', url: 'https://example.com' }] }).join(), /label/i));
+test('rejects an unknown button type', () =>
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'COPY_CODE', text: 'x' }] }).join(), /button type/i));
+
+test('the opt-out button is emitted first, before the operator\'s own', () => {
+  const b = buildTemplatePayload({ ...okBase, addOptOut: true, buttons: url(1) })
+    .components.find(c => c.type === 'BUTTONS').buttons;
+  assert.equal(b.length, 2);
+  assert.equal(b[0].type, 'QUICK_REPLY');
+  assert.equal(b[0].text, OPT_OUT_LABEL);
+  assert.equal(b[1].type, 'URL');
+  assert.equal(b[1].url,  'https://example.com/0');
+});
+
+console.log('\ntemplate row memory');
+test('a saved template row round-trips its header asset link', () => {
+  const name = `plan_test_${Date.now()}`;
+  saveTemplateRow({ name, displayName: 'Plan Test', language: 'en', category: 'MARKETING',
+                    headerFormat: 'DOCUMENT', headerText: null, headerAssetId: null,
+                    bodyText: 'Hi {{1}}', footerText: null, buttons: [], varCount: 1, status: 'PENDING' });
+  const row = getTemplateRow(name);
+  assert.equal(row.display_name,  'Plan Test');
+  assert.equal(row.header_format, 'DOCUMENT');
+  assert.equal(row.var_count,     1);
 });
 
 console.log('\nbuildParams');
