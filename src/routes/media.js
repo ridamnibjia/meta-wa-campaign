@@ -2,7 +2,8 @@
 const express = require('express');
 const fs      = require('fs');
 const multer  = require('multer');
-const { MEDIA_KINDS, saveUpload, listAssets, getAsset, assetPath } = require('../services/media');
+const { MEDIA_KINDS, saveUpload, listAssets, getAsset, assetPath,
+        getInbound, inboundPath, saveInbound } = require('../services/media');
 const { log } = require('../state');
 
 const router = express.Router();
@@ -43,6 +44,31 @@ router.get('/media/asset/:id', (req, res) => {
   res.type(asset.mime_type);
   // inline, not attachment: the composer previews images in an <img>.
   res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(asset.filename)}"`);
+  fs.createReadStream(file).pipe(res);
+});
+
+// ── Inbound: what a customer sent us ───────────────────────────────────────────
+// Explicitly operator-triggered. Nothing downloads customer media automatically,
+// so the bytes only ever land on this server because someone asked for them.
+router.post('/media/inbound/:mediaId', async (req, res) => {
+  const r = await saveInbound(req.params.mediaId);
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+router.get('/media/inbound/:mediaId', (req, res) => {
+  const row = getInbound(req.params.mediaId);
+  if (!row) return res.status(404).json({ error: 'No such media' });
+  // 409, not 404. The row exists and the fix is "save it first" — a 404 would
+  // send the operator looking for a message that is right in front of them.
+  if (!row.path) return res.status(409).json({ error: 'This media has not been saved to the server yet' });
+
+  const file = inboundPath(row);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'The file for this media is missing from disk' });
+
+  const name = row.filename || `${row.media_id}`;
+  res.type(row.mime_type || 'application/octet-stream');
+  res.setHeader('Content-Disposition',
+    `${req.query.download ? 'attachment' : 'inline'}; filename="${encodeURIComponent(name)}"`);
   fs.createReadStream(file).pipe(res);
 });
 

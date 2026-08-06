@@ -6,7 +6,7 @@
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('node:crypto');
-const { CFG, UPLOAD_DIR } = require('../config');
+const { CFG, UPLOAD_DIR, MEDIA_DIR } = require('../config');
 const { db }  = require('../lib/db');
 const { log } = require('../state');
 
@@ -222,7 +222,83 @@ async function headerComponent(assetId, { force = false } = {}) {
   return { ok: true, component: { type: 'header', parameters: [{ type: kind, [kind]: inner }] } };
 }
 
+// ── Inbound: media a customer sent us ──────────────────────────────────────────
+// The webhook records the descriptor and not the bytes, deliberately: the CDN
+// url in a download response expires in minutes, but the media id stays
+// resolvable for 30 days. The row is the receipt that makes a later,
+// operator-triggered fetch possible at all — without it the envelope is gone
+// the moment the webhook returns.
+const INBOUND_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const inboundRow = db.prepare(`
+  SELECT md.*, m.at AS message_at
+    FROM media md JOIN messages m ON m.wamid = md.wamid
+   WHERE md.media_id = ?
+`);
+const setInboundFile = db.prepare(
+  'UPDATE media SET path = ?, downloaded_at = ? WHERE media_id = ?');
+
+const getInbound = mediaId => inboundRow.get(String(mediaId));
+
+// Same rule as assetPath: the row stores a bare filename so WA_MEDIA_DIR can
+// move the whole store without rewriting a single row.
+const inboundPath = row => path.join(MEDIA_DIR, row.path);
+
+// Computed, never stored. Meta deletes the file 30 days after the message, so
+// the deadline is a property of the message we already have the timestamp for —
+// there is nothing to migrate and nothing to age out.
+const inboundExpired = (row, now = Date.now()) =>
+  !row.path && (now - row.message_at) > INBOUND_TTL_MS;
+
+// Two hops, both authenticated: GET /{media_id} returns a short-lived CDN url,
+// and that url still 401s without the same bearer token. This is why the
+// browser can never fetch customer media itself and the server has to proxy.
+async function saveInbound(mediaId) {
+  const row = getInbound(mediaId);
+  if (!row) return { ok: false, error: `No inbound media found for ${mediaId}` };
+  if (row.path) return { ok: true, media: row, already: true };
+  if (inboundExpired(row)) {
+    return { ok: false, error: 'Meta no longer has this file — it deletes inbound media 30 days after the message.' };
+  }
+  if (!CFG.accessToken) return { ok: false, error: 'Access Token not configured' };
+
+  try {
+    const res = await fetch(`https://graph.facebook.com/${CFG.apiVersion}/${encodeURIComponent(mediaId)}`,
+      { headers: { Authorization: `Bearer ${CFG.accessToken}` } });
+    const meta = await res.json();
+    if (meta.error || !meta.url) {
+      return { ok: false, error: meta.error?.message || 'Meta returned no download url for this media' };
+    }
+
+    const dl = await fetch(meta.url, { headers: { Authorization: `Bearer ${CFG.accessToken}` } });
+    if (!dl.ok) return { ok: false, error: `Download failed with HTTP ${dl.status}` };
+    const buf = Buffer.from(await dl.arrayBuffer());
+
+    // Verify before writing, not after. A truncated CDN response otherwise
+    // lands on disk as a perfectly valid-looking file that nothing downstream
+    // will ever question. Prefer the webhook's own checksum — it was recorded
+    // before this fetch and cannot be forged by whatever answered it.
+    const expected = row.sha256 || meta.sha256 || null;
+    const actual   = crypto.createHash('sha256').update(buf).digest('hex');
+    if (expected && expected !== actual) {
+      return { ok: false, error: 'Checksum mismatch — the download did not match the sha256 WhatsApp reported, so nothing was saved.' };
+    }
+
+    const ext  = (path.extname(row.filename || '') || '').slice(0, 10).toLowerCase();
+    const name = `${actual}${ext}`;
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(MEDIA_DIR, name), buf);
+    setInboundFile.run(name, Date.now(), row.media_id);
+
+    log('info', `Saved inbound ${row.mime_type || 'file'} from message ${row.wamid}`);
+    return { ok: true, media: getInbound(mediaId) };
+  } catch (e) {
+    return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
+  }
+}
+
 module.exports = {
   MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, headerComponent,
+  INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound,
 };

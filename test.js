@@ -8,6 +8,11 @@ process.env.WA_DB_PATH = ':memory:';
 process.env.WA_UPLOAD_DIR = require('path').join(
   require('os').tmpdir(), `wa-uploads-${process.pid}-${Date.now()}`);
 
+// Inbound customer media saved by these tests goes to a throwaway directory
+// too. Same reason, different store: MEDIA_DIR holds what customers sent us.
+process.env.WA_MEDIA_DIR = require('path').join(
+  require('os').tmpdir(), `wa-media-${process.pid}-${Date.now()}`);
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
@@ -30,6 +35,7 @@ const {
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
+  saveInbound, inboundPath, getInbound, INBOUND_TTL_MS,
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
@@ -1656,6 +1662,183 @@ console.log('\nsend path — header component');
         assert.equal(sent.template.components[0].type, 'body');
       });
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; Object.assign(S.config, savedCfg); }
+  });
+}
+
+console.log('\ninbound media — save, serve, expire');
+{
+  const fsm    = require('fs');
+  const crypto = require('node:crypto');
+
+  // Meta's media download is two hops and both need the token: GET /{media_id}
+  // hands back a short-lived CDN url, and that url still rejects an
+  // unauthenticated GET. The stub answers both, and passes local requests
+  // through so a route test can still reach its own server.
+  const withMeta = async (impl, fn) => {
+    const real = global.fetch;
+    const calls = [];
+    global.fetch = async (url, opts) => {
+      if (String(url).startsWith('http://127.0.0.1')) return real(url, opts);
+      calls.push({ url: String(url), opts });
+      return impl(String(url), opts, calls);
+    };
+    try { return await fn(calls); } finally { global.fetch = real; }
+  };
+
+  const sha = b => crypto.createHash('sha256').update(b).digest('hex');
+
+  // A real inbound image webhook, recorded through the real ingest path so the
+  // media row is created the way production creates it.
+  let n = 0;
+  const seedInbound = ({ bytes, sha256, ageMs = 0, mime = 'image/jpeg', type = 'image', filename } = {}) => {
+    const i  = ++n;
+    const id = `mid.test.${i}.${Date.now()}`;
+    const at = Date.now() - ageMs;
+    recordInbound({
+      id, from: '910000000001', timestamp: String(Math.floor(at / 1000)), type,
+      [type]: {
+        id, mime_type: mime, sha256: sha256 ?? (bytes ? sha(bytes) : undefined),
+        file_size: bytes ? bytes.length : 0, ...(filename ? { filename } : {}),
+      },
+    }, 'Media Tester');
+    return id;
+  };
+
+  const metaOk = (bytes, mime = 'image/jpeg') => (url) => url.includes('lookaside')
+    ? { ok: true, status: 200, arrayBuffer: async () => bytes, headers: new Headers() }
+    : { ok: true, status: 200, headers: new Headers(),
+        json: async () => ({ url: 'https://lookaside.fbsbx.com/whatsapp/1', mime_type: mime, file_size: bytes.length, sha256: sha(bytes) }) };
+
+  const withToken = async fn => {
+    const t = CFG.accessToken; CFG.accessToken = 'test-token';
+    try { return await fn(); } finally { CFG.accessToken = t; }
+  };
+
+  testAsync('saveInbound fetches the bytes and fills path and downloaded_at', async () => {
+    const bytes = Buffer.from(`jpeg-bytes-${Date.now()}`);
+    const id = seedInbound({ bytes });
+    await withToken(() => withMeta(metaOk(bytes), async calls => {
+      const r = await saveInbound(id);
+      assert.equal(r.ok, true, r.error);
+      assert.equal(calls.length, 2, 'resolve then download — two hops, both authenticated');
+      assert.match(calls[1].opts.headers.Authorization, /^Bearer /,
+        'the CDN url rejects an unauthenticated GET');
+      const row = getInbound(id);
+      assert.ok(row.path, 'path must be set once the bytes are on disk');
+      assert.ok(row.downloaded_at > 0);
+      assert.equal(fsm.readFileSync(inboundPath(row)).toString(), bytes.toString());
+    }));
+  });
+
+  testAsync('saving twice never refetches and never rewrites', async () => {
+    const bytes = Buffer.from(`once-${Date.now()}`);
+    const id = seedInbound({ bytes });
+    await withToken(() => withMeta(metaOk(bytes), () => saveInbound(id)));
+    const first = getInbound(id).downloaded_at;
+    await withToken(() => withMeta(() => { throw new Error('must not refetch saved media'); }, async () => {
+      const r = await saveInbound(id);
+      assert.equal(r.ok, true, r.error);
+      assert.equal(r.already, true, 'a saved row reports itself, it does not re-download');
+      assert.equal(getInbound(id).downloaded_at, first, 'downloaded_at must not move');
+    }));
+  });
+
+  // A truncated CDN response otherwise gets written as a valid file forever,
+  // and nothing downstream would ever notice.
+  testAsync('a sha256 mismatch refuses the write and leaves path NULL', async () => {
+    const bytes = Buffer.from(`truncated-${Date.now()}`);
+    const id = seedInbound({ bytes, sha256: 'f'.repeat(64) });
+    await withToken(() => withMeta(metaOk(bytes), async () => {
+      const r = await saveInbound(id);
+      assert.equal(r.ok, false);
+      assert.match(r.error, /checksum|sha256/i, 'the error must name what failed');
+      assert.equal(getInbound(id).path, null, 'a corrupt download must not be recorded as saved');
+    }));
+  });
+
+  testAsync('an unknown media id is an error, not a throw', async () => {
+    const r = await saveInbound('mid.does.not.exist');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /no inbound media found/i);
+  });
+
+  testAsync('media past 30 days reports expired and is refused before any fetch', async () => {
+    const bytes = Buffer.from('too-old');
+    const id = seedInbound({ bytes, ageMs: INBOUND_TTL_MS + 60_000 });
+    await withToken(() => withMeta(() => { throw new Error('expired media must not be fetched'); }, async () => {
+      const r = await saveInbound(id);
+      assert.equal(r.ok, false);
+      assert.match(r.error, /30|expired|no longer/i);
+    }));
+  });
+
+  testAsync('the thread carries the media descriptor, and text messages carry none', async () => {
+    const bytes = Buffer.from(`thread-${Date.now()}`);
+    const mediaId = seedInbound({ bytes, mime: 'application/pdf', type: 'document', filename: 'invoice.pdf' });
+    recordInbound({ id: `mid.text.${Date.now()}`, from: '910000000001',
+                    timestamp: String(Math.floor(Date.now() / 1000)),
+                    type: 'text', text: { body: 'plain words' } }, 'Media Tester');
+
+    const t = inboxThread('910000000001');
+    const withMedia = t.messages.find(m => m.id === mediaId);
+    assert.equal(withMedia.media.mediaId, mediaId);
+    assert.equal(withMedia.media.filename, 'invoice.pdf');
+    assert.equal(withMedia.media.mime, 'application/pdf');
+    assert.equal(withMedia.media.saved, false);
+    assert.equal(withMedia.media.expired, false);
+    assert.equal(t.messages.find(m => m.text === 'plain words').media, null,
+      'a text message must not carry a media object');
+  });
+
+  testAsync('an expired attachment is flagged expired in the thread', async () => {
+    const id = seedInbound({ bytes: Buffer.from('old'), ageMs: INBOUND_TTL_MS + 60_000 });
+    const m = inboxThread('910000000001').messages.find(x => x.id === id);
+    assert.equal(m.media.expired, true, 'the UI needs this to render expired instead of a Save button');
+  });
+
+  const serve = async () => {
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    return s;
+  };
+  // The whole /api surface sits behind the password gate, and a developer .env
+  // usually has APP_PASSWORD set — so these requests carry a real session
+  // rather than assuming the gate is open.
+  const asOperator = { headers: { cookie: `wa_session=${createSession()}` } };
+
+  // 409, not 404: "you have not downloaded this yet" and "no such media" are
+  // different problems with different fixes, and the UI acts on the difference.
+  testAsync('GET before save is a 409, after save streams the bytes', async () => {
+    const bytes = Buffer.from(`route-${Date.now()}`);
+    const id = seedInbound({ bytes });
+    const s = await serve();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const early = await fetch(`${base}/api/media/inbound/${id}`, asOperator);
+      assert.equal(early.status, 409, 'not downloaded yet is not the same as not found');
+
+      const missing = await fetch(`${base}/api/media/inbound/mid.nope`, asOperator);
+      assert.equal(missing.status, 404);
+
+      const anon = await fetch(`${base}/api/media/inbound/${id}`, { headers: { cookie: 'wa_session=nope' } });
+      assert.ok(anon.status === 401 || CFG.appPassword === '',
+        'customer media must never be readable without a session');
+
+      await withToken(() => withMeta(metaOk(bytes), async () => {
+        const saved = await fetch(`${base}/api/media/inbound/${id}`, { method: 'POST', ...asOperator });
+        assert.equal((await saved.json()).ok, true);
+      }));
+
+      const dl = await fetch(`${base}/api/media/inbound/${id}`, asOperator);
+      assert.equal(dl.status, 200);
+      assert.match(dl.headers.get('content-type'), /image\/jpeg/);
+      assert.match(dl.headers.get('content-disposition'), /^inline/);
+      assert.equal(Buffer.from(await dl.arrayBuffer()).toString(), bytes.toString());
+
+      const att = await fetch(`${base}/api/media/inbound/${id}?download=1`, asOperator);
+      assert.match(att.headers.get('content-disposition'), /^attachment/);
+      assert.equal(Buffer.from(await att.arrayBuffer()).toString(), bytes.toString());
+    } finally { s.close(); }
   });
 }
 

@@ -65,9 +65,10 @@ const FILES = {
 
 const PUBLIC_DIR = path.join(ROOT, 'public');
 
-// Inbound media bytes land here when an operator saves them (P3). Nothing in
-// P1 writes to it, so it is not created until something needs it.
-const MEDIA_DIR = path.join(ROOT, 'media');
+// Inbound media bytes land here when an operator saves them. Nothing writes to
+// it until an operator clicks Save, so it is not created until then.
+// WA_MEDIA_DIR is the test escape hatch, exactly like WA_UPLOAD_DIR.
+const MEDIA_DIR = process.env.WA_MEDIA_DIR || path.join(ROOT, 'media');
 
 // Files uploaded for use as a template header. Separate from MEDIA_DIR, which
 // holds INBOUND customer media — different provenance, different retention.

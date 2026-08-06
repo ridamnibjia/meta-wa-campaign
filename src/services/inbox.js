@@ -5,6 +5,7 @@ const { log, emit } = require('../state');
 const { normalizePhone } = require('../lib/phone');
 const { graphSend } = require('./graph');
 const { explainError } = require('../lib/errors');
+const { INBOUND_TTL_MS } = require('./media');
 
 // An inbound message opens a 24-hour "customer service window" during which the
 // business may send free-form text — no template, no approval. Outside it, Meta
@@ -171,13 +172,31 @@ const getThread = db.prepare('SELECT wa_id, name, last_inbound_at FROM threads W
 // ponytail: whole transcript, no LIMIT. Pagination is P4; until then the
 // honest answer to "show me the conversation" is all of it.
 const getMessages = db.prepare(`
-  SELECT wamid, dir, type, body, at, status
-    FROM messages WHERE wa_id = ? ORDER BY at ASC, rowid ASC
+  SELECT m.wamid, m.dir, m.type, m.body, m.at, m.status,
+         md.media_id, md.mime_type, md.filename, md.file_size, md.path
+    FROM messages m
+    LEFT JOIN media md ON md.wamid = m.wamid
+   WHERE m.wa_id = ? ORDER BY m.at ASC, m.rowid ASC
 `);
 
 // wamid → id and body → text: public/views/inbox.jsx renders those two keys and
 // this is the only place that knows the column names differ.
-const toEntry = r => ({ id: r.wamid, dir: r.dir, type: r.type, text: r.body ?? '', at: r.at, status: r.status });
+//
+// `expired` is computed here rather than stored. Meta deletes inbound media 30
+// days after the message, so the deadline is a property of a timestamp we
+// already have — the UI needs it to render "gone" instead of a Save button that
+// can only fail.
+const toEntry = (r, now = Date.now()) => ({
+  id: r.wamid, dir: r.dir, type: r.type, text: r.body ?? '', at: r.at, status: r.status,
+  media: r.media_id ? {
+    mediaId:  r.media_id,
+    mime:     r.mime_type,
+    filename: r.filename,
+    size:     r.file_size,
+    saved:    !!r.path,
+    expired:  !r.path && (now - r.at) > INBOUND_TTL_MS,
+  } : null,
+});
 
 // Thread list without message bodies — the nav badge and the inbox list poll
 // this, and neither needs the transcript. Campaign sends give every recipient a
@@ -204,7 +223,7 @@ function thread(waId, now = Date.now()) {
   return {
     waId: t.wa_id,
     name: t.name || t.wa_id,
-    messages: getMessages.all(waId).map(toEntry),
+    messages: getMessages.all(waId).map(r => toEntry(r, now)),
     windowOpen: isWindowOpen({ lastInboundAt: t.last_inbound_at }, now),
     windowClosesAt: t.last_inbound_at ? t.last_inbound_at + WINDOW_MS : null,
   };

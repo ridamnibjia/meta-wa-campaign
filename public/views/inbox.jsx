@@ -7,6 +7,73 @@ function countdown(ms) {
   return h > 0 ? `${h}h ${m}m left` : `${m}m left`;
 }
 
+const fileSize = n => !n ? ''
+  : n < 1024 ? `${n} B`
+  : n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB`
+  : `${(n / (1024 * 1024)).toFixed(1)} MB`;
+
+// What a customer sent us. Nothing is fetched until an operator asks: the bytes
+// live on Meta's servers, reachable only with our access token, and the browser
+// has no token — so Save round-trips through the server, which then serves the
+// file from disk behind the same session cookie as every other page.
+function Attachment({ media, onSaved }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const src = `/api/media/inbound/${encodeURIComponent(media.mediaId)}`;
+  const kind = (media.mime || '').split('/')[0];
+  const label = media.filename || `${kind || 'file'} attachment`;
+
+  if (media.expired) {
+    return (
+      <p className="mb-1 rounded border border-dashed border-border px-2 py-1.5 text-xs text-muted-foreground">
+        Meta no longer has this file — inbound media is deleted 30 days after the message.
+      </p>
+    );
+  }
+
+  if (!media.saved) {
+    const save = async () => {
+      setSaving(true); setError('');
+      const r = await api.post(src).catch(() => ({ ok: false, error: 'Network error' }));
+      setSaving(false);
+      if (!r.ok) return setError(r.error || 'Could not save this file');
+      onSaved();
+    };
+    return (
+      <div className="mb-1">
+        <div className="flex items-center gap-2 rounded border border-border bg-background/60 px-2 py-1.5">
+          <span className="text-base leading-none">{kind === 'image' ? '▣' : kind === 'video' ? '▶' : kind === 'audio' ? '♪' : '▤'}</span>
+          <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
+          {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
+          <Button size="sm" variant="outline" disabled={saving} onClick={save}>
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+        </div>
+        {error && <p className="mt-1 text-[11px] font-medium text-destructive">{error}</p>}
+      </div>
+    );
+  }
+
+  if (kind === 'image') {
+    return (
+      <a href={src} target="_blank" rel="noreferrer" className="mb-1 block">
+        <img src={src} alt={label} className="max-h-[260px] max-w-full rounded" />
+      </a>
+    );
+  }
+  if (kind === 'video') return <video src={src} controls className="mb-1 max-h-[260px] max-w-full rounded" />;
+  if (kind === 'audio') return <audio src={src} controls className="mb-1 w-full" />;
+
+  return (
+    <div className="mb-1 flex items-center gap-2 rounded border border-border bg-background/60 px-2 py-1.5">
+      <span className="text-base leading-none">▤</span>
+      <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
+      {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
+      <a href={`${src}?download=1`} className="text-xs text-primary underline-offset-4 hover:underline">Download</a>
+    </div>
+  );
+}
+
 function Thread({ waId, onBack }) {
   const { loadInbox } = useApp();
   const [data, setData] = useState(null);
@@ -60,7 +127,13 @@ function Thread({ waId, onBack }) {
           <div key={m.id} className={cn('flex', m.dir === 'out' ? 'justify-end' : 'justify-start')}>
             <div className={cn('max-w-[75%] rounded-lg px-3 py-2 text-sm shadow-sm',
               m.dir === 'out' ? 'bg-primary text-primary-foreground' : 'bg-card text-card-foreground border border-border')}>
-              <p className="whitespace-pre-wrap break-words">{m.text}</p>
+              {m.media && <Attachment media={m.media} onSaved={load} />}
+              {/* describe() writes "[image]" as the body so the thread-list
+                  preview says something. Once the bubble renders the real
+                  attachment, repeating the placeholder under it is noise. */}
+              {m.text && m.text !== `[${m.type}]` && (
+                <p className="whitespace-pre-wrap break-words">{m.text}</p>
+              )}
               <p className={cn('mt-0.5 text-right text-[10px]', m.dir === 'out' ? 'text-primary-foreground/70' : 'text-muted-foreground')}>
                 {clockTime(m.at)}
               </p>
