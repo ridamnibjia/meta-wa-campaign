@@ -14,8 +14,9 @@ const { S, setIO, log }   = require('./src/state');
 const auth   = require('./src/middleware/auth');
 const routes = require('./src/routes');
 const { buildState } = require('./src/services/status');
-const { loadMsgIndex } = require('./src/services/messages');
 const { resumeIfInterrupted } = require('./src/services/campaign');
+const { migrateJsonToSql } = require('./src/services/migrate');
+const { unprocessedWebhookCount } = require('./src/services/messages');
 
 const app    = express();
 const server = http.createServer(app);
@@ -47,7 +48,16 @@ app.use((req, res, next) => {
 
 // rawBody is kept so the webhook can verify Meta's X-Hub-Signature-256 over the
 // exact bytes sent. Re-serialising the parsed object would change the digest.
-app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
+//
+// limit is raised well past Express's 100kb default on purpose: this is a bulk
+// sender, so a batched status webhook covering hundreds of statuses is the
+// normal shape, not an edge case. A rejected body here means a 413 BEFORE
+// router.post('/webhook') ever runs — nothing reaches webhook_events, Meta
+// retries the identical bytes, and gets an identical 413 forever. Since Meta's
+// Cloud API is webhook-push only, that is not a failed request, it is a
+// permanently lost batch — the exact loss this durability boundary exists to
+// prevent, one layer above where it was defended.
+app.use(express.json({ limit: '5mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 
 // The frontend is public: it is a login screen until the API says otherwise.
@@ -55,7 +65,15 @@ if (fs.existsSync(PUBLIC_DIR)) app.use(express.static(PUBLIC_DIR));
 
 // Exempt from the password so the Docker healthcheck keeps working. It reveals
 // nothing an unauthenticated caller could use.
-app.get('/health', (req, res) => res.json({ status: 'ok', phase: S.phase, uptime: Math.round(process.uptime()) }));
+//
+// unprocessedWebhooks: nothing in this app replays webhook_events yet — this
+// count is the only signal that it needs to. Without it the only trace of a
+// parse failure is a log line in the 500-entry ring buffer that /api/start
+// wipes (F5).
+app.get('/health', (req, res) => res.json({
+  status: 'ok', phase: S.phase, uptime: Math.round(process.uptime()),
+  unprocessedWebhooks: unprocessedWebhookCount(),
+}));
 
 auth.mount(app);      // /api/login, /api/logout, /api/session — outside the gate
 routes.mount(app);    // /webhook (signed), then everything behind requireAuth
@@ -85,11 +103,18 @@ if (!CFG.accessToken)   console.warn('[WARN] ACCESS_TOKEN not set in .env');
 if (!CFG.phoneNumberId) console.warn('[WARN] PHONE_NUMBER_ID not set in .env');
 if (!CFG.appSecret)     console.warn('[WARN] APP_SECRET not set — /webhook will REJECT every POST from Meta');
 if (!CFG.appPassword)   console.warn('[WARN] APP_PASSWORD not set — the API is LOCKED until you set one in .env');
+{
+  const pending = unprocessedWebhookCount();
+  if (pending > 0) console.warn(`[WARN] ${pending} webhook event(s) recorded but never processed — check the logs around when they arrived`);
+}
 
-loadMsgIndex();
-
-// Only listen when run directly, so test.js can require the pure helpers.
+// Only listen when run directly, so test.js can require the pure helpers. This
+// also guards migrateJsonToSql(): it defaults to the real FILES paths, and
+// test.js requires this module without overriding them — calling it
+// unconditionally at require-time would rename the repo's own inbox.json and
+// msg-index.json the moment `npm test` loaded this file.
 if (require.main === module) {
+  migrateJsonToSql();
   resumeIfInterrupted();
   server.listen(CFG.port, () => {
     console.log(`\n[WA-CAMPAIGN] Server running → http://localhost:${CFG.port}`);
@@ -116,6 +141,9 @@ module.exports = {
   recordInbound:  require('./src/services/inbox').recordInbound,
   inboxSummary:   require('./src/services/inbox').summary,
   describeInbound: require('./src/services/inbox').describe,
+  markRead:    require('./src/services/inbox').markRead,
+  inboxThread: require('./src/services/inbox').thread,
+  sendReply:   require('./src/services/inbox').sendReply,
   checkPassword:  auth.checkPassword,
   createSession:  auth.createSession,
   validSession:   auth.validSession,
@@ -128,5 +156,10 @@ module.exports = {
   LIMITS: require('./src/config').LIMITS,
   PRICES: require('./src/config').PRICES,
   OPT_OUT_LABEL: require('./src/config').OPT_OUT_LABEL,
+  nodeVersionOk: require('./src/lib/db').nodeVersionOk,
+  openDb:        require('./src/lib/db').openDb,
+  SCHEMA:        require('./src/lib/db').SCHEMA,
+  db:            require('./src/lib/db').db,
+  migrateJsonToSql,
   app, server, io,
 };

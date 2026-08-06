@@ -12,6 +12,19 @@ inbox.json
 campaign.json
 *.tmp
 
+# Renamed by the one-shot SQL migration. Same customer data as the originals,
+# so it inherits the same rule: never committed.
+*.migrated
+
+# SQLite message store and its WAL sidecars — customer messages, never commit.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Inbound media saved by an operator. Customer content.
+media/
+
 # Private working notes: the deployment runbook names real infrastructure, and
 # the design specs and video outline are not for publication. The public CSV
 # guide lives at ./CSV-FORMAT.md instead.

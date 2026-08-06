@@ -1,7 +1,7 @@
 'use strict';
-const { CFG, FILES, LIMITS } = require('../config');
-const { readJSON, debouncedWriter } = require('../lib/store');
-const { S, log, emit } = require('../state');
+const { CFG, LIMITS } = require('../config');
+const { db } = require('../lib/db');
+const { log, emit } = require('../state');
 const { normalizePhone } = require('../lib/phone');
 const { graphSend } = require('./graph');
 const { explainError } = require('../lib/errors');
@@ -11,27 +11,13 @@ const { explainError } = require('../lib/errors');
 // rejects anything that is not an approved template (error 131047).
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 
-// ponytail: 200 messages per thread. This is an operations console, not an
-// archive — older messages stay in Meta's own records.
-const MAX_PER_THREAD = 200;
-
-S.inbox = readJSON(FILES.inbox, {});
-
-const writer = debouncedWriter(FILES.inbox, 1500);
-const saveInbox = () => writer.schedule(() => S.inbox);
+// The message types that carry a media asset. Meta nests the descriptor under a
+// key named after the type, so `m[m.type]` is the descriptor for all of them.
+const MEDIA_TYPES = ['image', 'video', 'audio', 'document', 'sticker'];
 
 function isWindowOpen(thread, now = Date.now()) {
   if (!thread || !thread.lastInboundAt) return false;
   return now - thread.lastInboundAt < WINDOW_MS;
-}
-
-function threadFor(waId, name) {
-  if (!S.inbox[waId]) {
-    S.inbox[waId] = { waId, name: name || waId, unread: 0, lastInboundAt: 0, lastAt: 0, messages: [] };
-  }
-  const t = S.inbox[waId];
-  if (name && t.name === waId) t.name = name;   // learn the profile name once Meta sends it
-  return t;
 }
 
 // Meta's own text for the message types this app does not render. Showing
@@ -46,35 +32,81 @@ function describe(m) {
   return `[${m.type || 'unsupported'}]`;
 }
 
+// Learn the profile name once Meta sends it, but never overwrite a real name
+// with the number — COALESCE(NULLIF(...)) keeps whichever is more informative.
+const upsertInboundThread = db.prepare(`
+  INSERT INTO threads (wa_id, name, unread, last_inbound_at, last_at)
+  VALUES (?, ?, 1, ?, ?)
+  ON CONFLICT(wa_id) DO UPDATE SET
+    name            = COALESCE(NULLIF(excluded.name, threads.wa_id), threads.name),
+    unread          = threads.unread + 1,
+    last_inbound_at = max(threads.last_inbound_at, excluded.last_inbound_at),
+    last_at         = max(threads.last_at, excluded.last_at)
+`);
+
+const insertInbound = db.prepare(`
+  INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, raw, at)
+  VALUES (?, ?, 'in', ?, ?, ?, ?)
+`);
+
+const insertMedia = db.prepare(`
+  INSERT OR IGNORE INTO media (media_id, wamid, mime_type, filename, file_size, sha256)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const seenWamid = db.prepare('SELECT 1 AS ok FROM messages WHERE wamid = ?');
+const zeroUnread = db.prepare('UPDATE threads SET unread = 0 WHERE wa_id = ?');
+const threadExists = db.prepare('SELECT wa_id FROM threads WHERE wa_id = ?');
+
+// run_id is left to its NULL default: an inbox reply is not part of any
+// campaign, and the campaign counters must not count it.
+const insertOutbound = db.prepare(`
+  INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+
+const touchThread = db.prepare('UPDATE threads SET last_at = max(last_at, ?) WHERE wa_id = ?');
+
 // Meta redelivers webhooks it did not get a 200 for, so the same wamid can
-// arrive more than once. Without this check a retried batch would double every
-// message in the thread and inflate the unread badge.
+// arrive more than once. The dedupe is now the messages primary key, checked
+// before the thread upsert so a retry cannot re-increment the unread badge.
 function recordInbound(m, profileName) {
   const waId = normalizePhone(m.from) || m.from;
-  const t    = threadFor(waId, profileName);
-  if (t.messages.some(x => x.id === m.id)) return null;
+  if (seenWamid.get(m.id)) return null;
 
-  const at = Number(m.timestamp) ? Number(m.timestamp) * 1000 : Date.now();
-  const entry = { id: m.id, dir: 'in', type: m.type || 'text', text: describe(m), at };
-  t.messages.push(entry);
-  if (t.messages.length > MAX_PER_THREAD) t.messages.shift();
-  t.unread       += 1;
-  t.lastInboundAt = Math.max(t.lastInboundAt, at);
-  t.lastAt        = Math.max(t.lastAt, at);
+  const at   = Number(m.timestamp) ? Number(m.timestamp) * 1000 : Date.now();
+  const text = describe(m);
+  const name = profileName || waId;
 
-  saveInbox();
+  db.exec('BEGIN');
+  try {
+    insertInbound.run(m.id, waId, m.type || 'text', text, JSON.stringify(m), at);
+    upsertInboundThread.run(waId, name, at, at);
+    // Recorded, not downloaded. Bytes are fetched on operator request in P3;
+    // this row is what makes that possible after the envelope is gone.
+    const desc = MEDIA_TYPES.includes(m.type) ? m[m.type] : null;
+    if (desc?.id) {
+      insertMedia.run(desc.id, m.id, desc.mime_type ?? null, desc.filename ?? null,
+                      desc.file_size ?? null, desc.sha256 ?? null);
+    } else if (desc) {
+      log('warn', `inbound ${m.type} ${m.id} carried no media id — nothing to fetch later`);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+
   emit('inbox', summary());
-  log('info', `reply from ${t.name} (+${waId}): ${entry.text.slice(0, 60)}`);
-  return entry;
+  log('info', `reply from ${name} (+${waId}): ${text.slice(0, 60)}`);
+  return { id: m.id, dir: 'in', type: m.type || 'text', text, at };
 }
 
 function markRead(waId) {
-  const t = S.inbox[waId];
-  if (!t) return null;
-  t.unread = 0;
-  saveInbox();
+  if (!threadExists.get(waId)) return null;
+  zeroUnread.run(waId);
   emit('inbox', summary());
-  return t;
+  return { waId };
 }
 
 // Free-form text, only inside the window. The check lives here rather than in
@@ -88,8 +120,8 @@ async function sendReply(waId, text) {
   }
   if (!CFG.accessToken || !CFG.phoneNumberId) return { ok: false, error: 'Credentials not configured' };
 
-  const t = S.inbox[waId];
-  if (!isWindowOpen(t)) {
+  const t = getThread.get(waId);
+  if (!isWindowOpen(t && { lastInboundAt: t.last_inbound_at })) {
     return { ok: false, error: 'The 24-hour reply window for this contact has closed. Only an approved template can reopen the conversation.' };
   }
 
@@ -108,43 +140,73 @@ async function sendReply(waId, text) {
       return { ok: false, error: data.error?.message || 'Send failed', hint };
     }
     const entry = { id: data.messages[0].id, dir: 'out', type: 'text', text: body, at: Date.now(), status: 'sent' };
-    t.messages.push(entry);
-    if (t.messages.length > MAX_PER_THREAD) t.messages.shift();
-    t.lastAt = entry.at;
-    saveInbox();
+    db.exec('BEGIN');
+    try {
+      insertOutbound.run(entry.id, waId, 'out', 'text', body, entry.at, 'sent');
+      touchThread.run(entry.at, waId);
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
     emit('inbox', summary());
-    log('success', `replied to ${t.name} (+${waId})`);
+    log('success', `replied to ${t.name || waId} (+${waId})`);
     return { ok: true, message: entry };
   } catch (e) {
     return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
   }
 }
 
+// ponytail: two correlated subqueries for the preview instead of a join with a
+// window function — 0ms at this scale on the (wa_id, at DESC) index, and it
+// reads like what it does. Revisit if a deployment ever measures otherwise.
+const listThreads = db.prepare(`
+  SELECT t.wa_id, t.name, t.unread, t.last_at, t.last_inbound_at,
+         (SELECT m.body FROM messages m WHERE m.wa_id = t.wa_id ORDER BY m.at DESC, m.rowid DESC LIMIT 1) AS preview,
+         (SELECT m.dir  FROM messages m WHERE m.wa_id = t.wa_id ORDER BY m.at DESC, m.rowid DESC LIMIT 1) AS last_dir
+    FROM threads t
+   WHERE (? = 1 OR t.last_inbound_at > 0)
+   ORDER BY t.last_at DESC
+`);
+
+const getThread = db.prepare('SELECT wa_id, name, last_inbound_at FROM threads WHERE wa_id = ?');
+
+// ponytail: whole transcript, no LIMIT. Pagination is P4; until then the
+// honest answer to "show me the conversation" is all of it.
+const getMessages = db.prepare(`
+  SELECT wamid, dir, type, body, at, status
+    FROM messages WHERE wa_id = ? ORDER BY at ASC, rowid ASC
+`);
+
+// wamid → id and body → text: public/views/inbox.jsx renders those two keys and
+// this is the only place that knows the column names differ.
+const toEntry = r => ({ id: r.wamid, dir: r.dir, type: r.type, text: r.body ?? '', at: r.at, status: r.status });
+
 // Thread list without message bodies — the nav badge and the inbox list poll
-// this, and neither needs the transcript.
-function summary(now = Date.now()) {
-  const threads = Object.values(S.inbox)
-    .map(t => ({
-      waId: t.waId,
-      name: t.name,
-      unread: t.unread,
-      lastAt: t.lastAt,
-      windowOpen: isWindowOpen(t, now),
-      windowClosesAt: t.lastInboundAt ? t.lastInboundAt + WINDOW_MS : null,
-      preview: t.messages.length ? t.messages[t.messages.length - 1].text.slice(0, 90) : '',
-      lastDir: t.messages.length ? t.messages[t.messages.length - 1].dir : null,
-    }))
-    .sort((a, b) => b.lastAt - a.lastAt);
+// this, and neither needs the transcript. Campaign sends give every recipient a
+// thread, so the default view is "people who actually replied"; last_inbound_at
+// already separates the two, and `all` shows everything.
+function summary({ all = false, now = Date.now() } = {}) {
+  const rows = listThreads.all(all ? 1 : 0);
+  const threads = rows.map(t => ({
+    waId:   t.wa_id,
+    name:   t.name || t.wa_id,
+    unread: t.unread,
+    lastAt: t.last_at,
+    windowOpen: isWindowOpen({ lastInboundAt: t.last_inbound_at }, now),
+    windowClosesAt: t.last_inbound_at ? t.last_inbound_at + WINDOW_MS : null,
+    preview: (t.preview || '').slice(0, 90),
+    lastDir: t.last_dir,
+  }));
   return { threads, unread: threads.reduce((n, t) => n + t.unread, 0) };
 }
 
 function thread(waId, now = Date.now()) {
-  const t = S.inbox[waId];
+  const t = getThread.get(waId);
   if (!t) return null;
   return {
-    waId: t.waId, name: t.name, messages: t.messages,
-    windowOpen: isWindowOpen(t, now),
-    windowClosesAt: t.lastInboundAt ? t.lastInboundAt + WINDOW_MS : null,
+    waId: t.wa_id,
+    name: t.name || t.wa_id,
+    messages: getMessages.all(waId).map(toEntry),
+    windowOpen: isWindowOpen({ lastInboundAt: t.last_inbound_at }, now),
+    windowClosesAt: t.last_inbound_at ? t.last_inbound_at + WINDOW_MS : null,
   };
 }
 

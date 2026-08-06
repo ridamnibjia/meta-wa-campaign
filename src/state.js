@@ -8,17 +8,13 @@ const S = {
   phase:      'idle',   // idle | running | paused | done
   contacts:   [],
   currentIdx: 0,
-  accepted:   0,        // Meta API accepted (queued for delivery)
-  delivered:  0,        // webhook confirmed delivered to device
-  read:       0,        // webhook confirmed read
-  failed:     0,
+  failed:     0,        // Graph API rejected the send — no wamid exists, so no row
   skipped:    0,        // opted out / ecosystem health skip
   dailyCount: 0,
   dailyDate:  null,
-  msgIndex:   {},       // { messageId → { phone, name, status } }
+  currentRunId: null,   // campaign_runs.id — scopes every derived counter
   failLog:    [],       // last 50 failures
   quality:    null,     // last quality_rating seen from Meta — gates the warm-up climb
-  inbox:      {},       // { waId → thread } — see services/inbox.js
   config: {
     delaySec:         2,
     dailyCap:         1000,

@@ -1,67 +1,181 @@
 'use strict';
-const { FILES } = require('../config');
-const { readJSON, debouncedWriter } = require('../lib/store');
+const { db } = require('../lib/db');
 const { S, log } = require('../state');
 const { explainError } = require('../lib/errors');
 
-// ── Message index persistence ──────────────────────────────────────────────────
-// `read` webhooks arrive minutes to hours after send — long after a redeploy has
-// restarted this process. Keeping msgIndex in memory only meant those events hit
-// an unknown ID and were dropped, so `delivered` counted and `read` never did.
-const writer = debouncedWriter(FILES.msgIndex, 2000);
-
-function saveMsgIndex() {
-  writer.schedule(() => ({
-    msgIndex: S.msgIndex, delivered: S.delivered, read: S.read,
-    accepted: S.accepted, failed: S.failed, failLog: S.failLog,
-  }));
-}
-
-function loadMsgIndex() {
-  const d = readJSON(FILES.msgIndex, {});
-  Object.assign(S, {
-    msgIndex: d.msgIndex || {}, delivered: d.delivered || 0, read: d.read || 0,
-    accepted: d.accepted || 0, failed: d.failed || 0, failLog: d.failLog || [],
-  });
-}
-
-// msgIndex now survives restarts (see MSG_FILE above), so an unknown ID means a
-// message this server never sent — a stale retry from before persistence, or
-// traffic from another tool on the same number. Log it rather than swallow it.
+// An unknown ID means a message this server never sent — traffic from another
+// tool on the same number, or a status for a message from before the SQL store.
+// Log it rather than swallow it.
 function onUnknownStatus(status) {
   log('warn', `status "${status.status}" for unknown message ${status.id} — ignored`);
 }
 
 // Meta redelivers statuses and does not promise order, so a `delivered` can land
-// after its own `read`. Ranking them means a message only ever moves forward and
-// each counter increments once. A `read` with no preceding `delivered` still
-// counts as delivered — you cannot read what was never delivered.
+// after its own `read`. Ranking them means a message only ever moves forward.
+// A `read` with no preceding `delivered` still counts as delivered — you cannot
+// read what was never delivered — which is why `delivered` below is a rank
+// comparison rather than a string equality.
 const STATUS_RANK = { accepted: 0, sent: 1, delivered: 2, read: 3 };
 
+// The guard lives in the WHERE clause, so an out-of-order redelivery is handled
+// by the database rather than by read-then-branch bookkeeping in JS.
+// 'failed' ranks 4 — above every value an incoming status can carry — because
+// it is terminal. Meta gives a retried send a new wamid, so a `delivered` that
+// arrives after a `failed` for the SAME wamid is always a stale redelivery of
+// an earlier event, never a real recovery.
+const advance = db.prepare(`
+  UPDATE messages
+     SET status = ?, status_at = ?
+   WHERE wamid = ?
+     AND (status IS NULL OR ? > CASE status
+            WHEN 'accepted' THEN 0 WHEN 'sent' THEN 1
+            WHEN 'delivered' THEN 2 WHEN 'read' THEN 3
+            WHEN 'failed' THEN 4 ELSE -1 END)
+`);
+
+const markFailed = db.prepare(`
+  UPDATE messages SET status = 'failed', status_at = ?, error_code = ?, error_title = ?
+   WHERE wamid = ?
+`);
+
+const exists = db.prepare('SELECT wa_id, status FROM messages WHERE wamid = ?');
+
 function applyStatus(status) {
-  const id = status.id, st = status.status;
-  const m = S.msgIndex[id];
-  if (!m) return onUnknownStatus(status);
+  const id = status.id;
+  const st = status.status;
+  const row = exists.get(id);
+  if (!row) return onUnknownStatus(status);
+
+  const now = Date.now();
 
   if (st === 'failed') {
-    const code = status.errors?.[0]?.code;
-    const hint = explainError(code);
-    S.failLog.push({ time: new Date().toISOString(), phone: m.phone, name: m.name, error: status.errors?.[0]?.title, code, hint, source: 'webhook' });
-    log('warn', `delivery failed — ${m.name} [${code}] ${status.errors?.[0]?.title || ''}`);
-    if (hint) log('warn', `   ↳ ${hint}`);
-    m.status = 'failed';
+    const code  = status.errors?.[0]?.code ?? null;
+    const title = status.errors?.[0]?.title ?? null;
+    const hint  = explainError(code);
+    // markFailed always runs — a later failure webhook can carry a better
+    // error code/title than an earlier one — but failLog and the operator log
+    // are gated on the transition INTO 'failed'. Meta redelivers, and unlike
+    // `advance` this path has no rank guard, so without this check every
+    // redelivery of the same failure pushed another failLog entry; failLog is
+    // capped at 50, so a handful of redelivered duplicates could evict every
+    // genuinely distinct failure from the operator's view (F6).
+    const alreadyFailed = row.status === 'failed';
+    markFailed.run(now, code, title, id);
+    if (!alreadyFailed) {
+      S.failLog.push({ time: new Date().toISOString(), phone: row.wa_id, error: title, code, hint, source: 'webhook' });
+      if (S.failLog.length > 50) S.failLog.shift();
+      log('warn', `delivery failed — +${row.wa_id} [${code}] ${title || ''}`);
+      if (hint) log('warn', `   ↳ ${hint}`);
+    }
     return;
   }
 
-  const now = STATUS_RANK[st], was = STATUS_RANK[m.status] ?? -1;
-  if (now === undefined || now <= was) return;   // unknown or backwards — ignore
-  if (now >= STATUS_RANK.delivered && was < STATUS_RANK.delivered) {
-    S.delivered++; log('info', `delivered — ${m.name}`);
-  }
-  if (now >= STATUS_RANK.read && was < STATUS_RANK.read) {
-    S.read++; log('info', `read — ${m.name}`);
-  }
-  m.status = st;
+  const rank = STATUS_RANK[st];
+  if (rank === undefined) return;          // a status value this app does not model
+  advance.run(st, now, id, rank);
 }
 
-module.exports = { saveMsgIndex, loadMsgIndex, applyStatus, STATUS_RANK };
+// Counters are derived, not incremented. This removes the drift class of bug
+// entirely: there is no number that can disagree with the messages it counts.
+const runCounts = db.prepare(`
+  SELECT count(*)                                                     AS accepted,
+         sum(CASE WHEN status IN ('delivered','read') THEN 1 ELSE 0 END) AS delivered,
+         sum(CASE WHEN status = 'read'   THEN 1 ELSE 0 END)           AS read,
+         sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)           AS failed
+    FROM messages
+   WHERE dir = 'out' AND run_id IS ?
+`);
+
+const ZERO_COUNTS = { accepted: 0, delivered: 0, read: 0, failed: 0 };
+
+function countsForRun(runId) {
+  // run_id IS NULL is not "no current campaign" in the messages table — it is
+  // the bucket inbox replies (services/inbox.js) and migrated legacy rows
+  // (services/migrate.js) deliberately land in, by design. Querying it for a
+  // null run would report every inbox reply and migrated row as if it were
+  // the current campaign's traffic — a self-hoster who just migrated sees a
+  // campaign that looks already run, and a resumed campaign with a forgotten
+  // run id would bill free-form replies at the template rate (F1). "No
+  // current run" means zero, full stop.
+  if (runId == null) return { ...ZERO_COUNTS };
+  const r = runCounts.get(runId);
+  return {
+    accepted:  r.accepted  || 0,
+    delivered: r.delivered || 0,
+    read:      r.read      || 0,
+    failed:    r.failed    || 0,
+  };
+}
+
+// ── The durability boundary ────────────────────────────────────────────────────
+// Meta's Cloud API is webhook-push only: there is no endpoint that returns past
+// messages. A batch lost between the 200 OK and the disk is lost permanently,
+// so the raw envelope is written first and the ACK depends on it. An un-ACKed
+// webhook is one Meta redelivers, which is a problem that fixes itself.
+const insertEvent = db.prepare('INSERT INTO webhook_events (received_at, body) VALUES (?, ?)');
+const stampEvent  = db.prepare('UPDATE webhook_events SET processed_at = ? WHERE id = ?');
+const countUnprocessed = db.prepare('SELECT count(*) AS n FROM webhook_events WHERE processed_at IS NULL');
+
+// Throws on failure by design. The route turns that throw into a 500.
+function recordEnvelope(rawText) {
+  return Number(insertEvent.run(Date.now(), rawText).lastInsertRowid);
+}
+
+function markEnvelopeProcessed(id) {
+  stampEvent.run(Date.now(), id);
+}
+
+// Nothing in this app replays webhook_events yet — this is the only signal
+// that it needs to. Surfaced on /health (F5) rather than left to a log line in
+// the 500-entry ring buffer that /api/start wipes.
+function unprocessedWebhookCount() {
+  return countUnprocessed.get().n;
+}
+
+// ── Campaign runs ──────────────────────────────────────────────────────────────
+// A reset starts a new run; it never deletes. The five counter integers this
+// replaces used to be zeroed on /start, which was harmless when the message
+// index was throwaway bookkeeping and would now mean deleting history.
+const insertRun = db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)');
+
+function startRun(label) {
+  const id = Number(insertRun.run(Date.now(), label ?? null).lastInsertRowid);
+  S.currentRunId = id;
+  return id;
+}
+
+// The single outbound write path. Both the campaign loop and the test-send
+// route call this, which is what ends the two-parallel-stores problem — and it
+// is why a thread now shows the template that opened the conversation.
+const insertOut = db.prepare(`
+  INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status, run_id)
+  VALUES (?, ?, 'out', ?, ?, ?, 'accepted', ?)
+`);
+
+// last_inbound_at is untouched: an outbound message does not open the customer
+// service window, and unread counts inbound only.
+const upsertOutThread = db.prepare(`
+  INSERT INTO threads (wa_id, name, unread, last_inbound_at, last_at)
+  VALUES (?, ?, 0, 0, ?)
+  ON CONFLICT(wa_id) DO UPDATE SET
+    name    = COALESCE(NULLIF(excluded.name, threads.wa_id), threads.name),
+    last_at = max(threads.last_at, excluded.last_at)
+`);
+
+function recordOutbound({ wamid, waId, name, type = 'template', body = null, at = Date.now(), runId = null }) {
+  db.exec('BEGIN');
+  try {
+    insertOut.run(wamid, waId, type, body, at, runId);
+    upsertOutThread.run(waId, name || waId, at);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+module.exports = {
+  applyStatus, STATUS_RANK, countsForRun,
+  recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
+  startRun, recordOutbound,
+};

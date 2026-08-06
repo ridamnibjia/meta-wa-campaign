@@ -55,8 +55,13 @@ const FILES = {
   msgIndex: path.join(ROOT, 'msg-index.json'),
   inbox:    path.join(ROOT, 'inbox.json'),
   campaign: path.join(ROOT, 'campaign.json'),
+  db:       path.join(ROOT, 'wa.db'),
 };
 
 const PUBLIC_DIR = path.join(ROOT, 'public');
 
-module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, FILES, PUBLIC_DIR, ROOT };
+// Inbound media bytes land here when an operator saves them (P3). Nothing in
+// P1 writes to it, so it is not created until something needs it.
+const MEDIA_DIR = path.join(ROOT, 'media');
+
+module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, FILES, PUBLIC_DIR, MEDIA_DIR, ROOT };

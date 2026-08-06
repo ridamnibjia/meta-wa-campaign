@@ -1,4 +1,8 @@
 'use strict';
+// Every DB-backed test runs against a private in-memory database. This must be
+// set before ./server is required, because src/lib/db.js opens on import.
+process.env.WA_DB_PATH = ':memory:';
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
@@ -8,17 +12,41 @@ const {
   slugify, templateVars, sanitizeParam, validateTemplateInput,
   buildTemplatePayload, normalizePhone, parseCSV, buildParams, verifySignature, explainError, tierToCap, META_ERRORS, S,
   warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W,
-  applyStatus, missingParams, resizeParamValues,
+  applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
+  markRead, inboxThread, sendReply,
   checkPassword, createSession, validSession, destroySession,
   PRICES,
+  nodeVersionOk, openDb, SCHEMA,
+  recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
+  startRun, recordOutbound,
+  buildState,
+  migrateJsonToSql,
+  saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
 
 let passed = 0;
 const test = (name, fn) => {
   try { fn(); passed++; console.log(`  ok   ${name}`); }
   catch (e) { console.error(`  FAIL ${name}\n       ${e.message}`); process.exitCode = 1; }
+};
+
+// The existing `test` helper is synchronous; an async assertion would resolve
+// after the summary line printed and its failure would never be counted.
+const pending = [];
+
+// Async tests run one at a time. They mutate shared state — CFG fields, the
+// single :memory: database, global.fetch — so a concurrent runner lets one
+// test's cleanup land in the middle of another's request. Each fn() waits for
+// the previous test's assertions AND cleanup to settle.
+let chain = Promise.resolve();
+const testAsync = (name, fn) => {
+  const p = chain.then(() => fn())
+    .then(() => { passed++; console.log(`  ok   ${name}`); })
+    .catch(e => { console.error(`  FAIL ${name}\n       ${e.message}`); process.exitCode = 1; });
+  chain = p;
+  pending.push(p);
 };
 
 console.log('\nslugify');
@@ -231,42 +259,83 @@ console.log('\nwarm-up ladder');
   S.quality = restore.quality; S.config.dailyCap = restore.cap;
 }
 
-console.log('\nstatus webhook counting');
-{
-  const seed = () => {
-    S.msgIndex = { m1: { phone: '911', name: 'A', status: 'accepted' } };
-    S.delivered = 0; S.read = 0; S.failLog = [];
-  };
-  const feed = (...sts) => sts.forEach(s => applyStatus({ id: 'm1', status: s }));
+console.log('\nstatus');
+const { db: testDb } = require('./server');
+const ensureRun = (runId) => {
+  try {
+    testDb.prepare('INSERT INTO campaign_runs (id, started_at) VALUES (?, ?)').run(runId, Date.now());
+  } catch (e) {
+    // already exists
+  }
+};
+const seedOut = (wamid, waId = '911', runId = null, status = 'accepted') => {
+  if (runId !== null) ensureRun(runId);
+  testDb.prepare("INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status, run_id) VALUES (?,?, 'out','template','hi',1000,?,?)")
+        .run(wamid, waId, status, runId);
+};
+const statusOf = wamid => testDb.prepare('SELECT status, error_code, error_title FROM messages WHERE wamid = ?').get(wamid);
 
-  test('delivered then read counts each once', () => {
-    seed(); feed('delivered', 'read');
-    assert.deepEqual([S.delivered, S.read], [1, 1]);
-  });
-  test('a read with no delivered still counts as delivered', () => {
-    seed(); feed('read');
-    assert.deepEqual([S.delivered, S.read], [1, 1]);
-  });
-  test('Meta redelivering the same status does not double count', () => {
-    seed(); feed('delivered', 'delivered', 'read', 'read');
-    assert.deepEqual([S.delivered, S.read], [1, 1]);
-  });
-  test('an out-of-order delivered after read does not rewind or recount', () => {
-    seed(); feed('read', 'delivered', 'read');
-    assert.deepEqual([S.delivered, S.read], [1, 1]);
-    assert.equal(S.msgIndex.m1.status, 'read');
-  });
-  test('failed is recorded without touching the delivered counter', () => {
-    seed(); applyStatus({ id: 'm1', status: 'failed', errors: [{ code: 131049, title: 'Blocked' }] });
-    assert.equal(S.failLog.length, 1);
-    assert.equal(S.delivered, 0);
-  });
-  test('a status for a message this server never sent is ignored', () => {
-    seed(); applyStatus({ id: 'nope', status: 'read' });
-    assert.deepEqual([S.delivered, S.read], [0, 0]);
-  });
-  S.msgIndex = {}; S.delivered = 0; S.read = 0; S.failLog = [];
-}
+test('status advances sent to delivered to read', () => {
+  seedOut('m1');
+  applyStatus({ id: 'm1', status: 'sent' });
+  assert.equal(statusOf('m1').status, 'sent');
+  applyStatus({ id: 'm1', status: 'delivered' });
+  assert.equal(statusOf('m1').status, 'delivered');
+  applyStatus({ id: 'm1', status: 'read' });
+  assert.equal(statusOf('m1').status, 'read');
+});
+test('a late delivered after read is ignored', () => {
+  seedOut('m2');
+  applyStatus({ id: 'm2', status: 'read' });
+  applyStatus({ id: 'm2', status: 'delivered' });
+  assert.equal(statusOf('m2').status, 'read');
+});
+test('a read with no preceding delivered counts as delivered', () => {
+  seedOut('m3', '911', 7);
+  applyStatus({ id: 'm3', status: 'read' });
+  assert.equal(countsForRun(7).delivered, 1);
+});
+test('an unknown status value is ignored', () => {
+  seedOut('m4', '911', null, 'sent');
+  applyStatus({ id: 'm4', status: 'teleported' });
+  assert.equal(statusOf('m4').status, 'sent');
+});
+test('failed records the error code and title', () => {
+  seedOut('m5');
+  applyStatus({ id: 'm5', status: 'failed', errors: [{ code: 131026, title: 'Message undeliverable' }] });
+  const r = statusOf('m5');
+  assert.equal(r.status, 'failed');
+  assert.equal(r.error_code, 131026);
+  assert.equal(r.error_title, 'Message undeliverable');
+});
+test('failed overwrites a prior delivered', () => {
+  seedOut('m6');
+  applyStatus({ id: 'm6', status: 'delivered' });
+  applyStatus({ id: 'm6', status: 'failed', errors: [{ code: 470, title: 'Expired' }] });
+  assert.equal(statusOf('m6').status, 'failed');
+});
+test('failed is terminal — a late delivered or read cannot resurrect it', () => {
+  seedOut('m5b');
+  applyStatus({ id: 'm5b', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+  applyStatus({ id: 'm5b', status: 'delivered' });
+  assert.equal(statusOf('m5b').status, 'failed');
+  applyStatus({ id: 'm5b', status: 'read' });
+  assert.equal(statusOf('m5b').status, 'failed');
+});
+test('a status for an unknown wamid changes nothing and does not throw', () => {
+  assert.doesNotThrow(() => applyStatus({ id: 'never-sent', status: 'read' }));
+  assert.equal(statusOf('never-sent'), undefined);
+});
+test('countsForRun sums per-message statuses', () => {
+  seedOut('r1', '911', 9); seedOut('r2', '911', 9); seedOut('r3', '911', 9); seedOut('r4', '911', 9);
+  applyStatus({ id: 'r1', status: 'read' });
+  applyStatus({ id: 'r2', status: 'delivered' });
+  applyStatus({ id: 'r3', status: 'failed', errors: [{ code: 1, title: 'x' }] });
+  assert.deepEqual(countsForRun(9), { accepted: 4, delivered: 2, read: 1, failed: 1 });
+});
+test('countsForRun on an empty run returns zeros, not nulls', () => {
+  assert.deepEqual(countsForRun(999), { accepted: 0, delivered: 0, read: 0, failed: 0 });
+});
 
 
 console.log('\npricing');
@@ -319,42 +388,175 @@ test('the window is shut past 24h', () => {
   assert.equal(isWindowOpen({ lastInboundAt: now - 25 * HOUR }, now), false);
 });
 
+// The old S.inbox-backed assertions here (record a reply, redeliver it, count
+// unread) moved to the 'inbound' and 'threads' sections below, which exercise
+// the same behaviour against SQL instead of the in-memory object recordInbound
+// no longer writes to. describeInbound is describe() — a pure function,
+// untouched by the storage migration — so those two stay.
 console.log('\ninbound messages');
-{
-  const msg = (id, body) => ({ id, from: '919000000003', type: 'text',
-                               timestamp: String(Math.floor(Date.now() / 1000)), text: { body } });
-  S.inbox = {};
-  test('a text reply is recorded on its thread', () => {
-    const e = recordInbound(msg('w1', 'yes please'), 'Asha');
-    assert.equal(e.text, 'yes please');
-    assert.equal(e.dir, 'in');
-    assert.equal(S.inbox['919000000003'].unread, 1);
-  });
-  test('the profile name from Meta becomes the thread name', () => {
-    assert.equal(S.inbox['919000000003'].name, 'Asha');
-  });
-  test('a redelivered wamid is ignored instead of duplicating the message', () => {
-    assert.equal(recordInbound(msg('w1', 'yes please'), 'Asha'), null);
-    assert.equal(S.inbox['919000000003'].messages.length, 1);
-    assert.equal(S.inbox['919000000003'].unread, 1);
-  });
-  test('a second distinct message increments unread', () => {
-    recordInbound(msg('w2', 'what is the price'), 'Asha');
-    assert.equal(S.inbox['919000000003'].messages.length, 2);
-    assert.equal(S.inbox['919000000003'].unread, 2);
-  });
-  test('the unread summary totals every thread', () => {
-    assert.equal(inboxSummary().unread, 2);
-    assert.equal(inboxSummary().threads.length, 1);
-  });
-  test('a button tap is described by its label, not left blank', () => {
-    assert.equal(describeInbound({ type: 'button', button: { text: 'Stop promotions' } }), 'Stop promotions');
-  });
-  test('an unsupported type is labelled rather than dropped silently', () => {
-    assert.equal(describeInbound({ type: 'image' }), '[image]');
-  });
-  S.inbox = {};
-}
+test('a button tap is described by its label, not left blank', () => {
+  assert.equal(describeInbound({ type: 'button', button: { text: 'Stop promotions' } }), 'Stop promotions');
+});
+test('an unsupported type is labelled rather than dropped silently', () => {
+  assert.equal(describeInbound({ type: 'image' }), '[image]');
+});
+
+console.log('\ninbound');
+const inbound = (id, from = '919812345678', extra = {}) =>
+  recordInbound({ id, from, type: 'text', timestamp: '1700000000', text: { body: 'hello' }, ...extra }, 'Rahul');
+const threadRow = waId => testDb.prepare('SELECT * FROM threads WHERE wa_id = ?').get(waId);
+
+test('an inbound message creates the thread and the row', () => {
+  const e = inbound('in-1');
+  assert.equal(e.dir, 'in');
+  assert.equal(e.text, 'hello');
+  assert.equal(e.at, 1700000000000);
+  const t = threadRow('919812345678');
+  assert.equal(t.name, 'Rahul');
+  assert.equal(t.unread, 1);
+  assert.equal(t.last_inbound_at, 1700000000000);
+});
+test('a redelivered wamid neither duplicates nor double-counts unread', () => {
+  const again = inbound('in-1');
+  assert.equal(again, null);
+  assert.equal(threadRow('919812345678').unread, 1);
+  const n = testDb.prepare("SELECT count(*) AS n FROM messages WHERE wamid = 'in-1'").get().n;
+  assert.equal(n, 1);
+});
+test('a second distinct message increments unread', () => {
+  inbound('in-2');
+  assert.equal(threadRow('919812345678').unread, 2);
+});
+test('markRead zeroes unread', () => {
+  markRead('919812345678');
+  assert.equal(threadRow('919812345678').unread, 0);
+});
+test('markRead on an unknown thread returns null', () => {
+  assert.equal(markRead('910000000000'), null);
+});
+test('the raw envelope is stored for later phases', () => {
+  const raw = JSON.parse(testDb.prepare("SELECT raw FROM messages WHERE wamid = 'in-1'").get().raw);
+  assert.equal(raw.text.body, 'hello');
+});
+test('an image records a media row with no bytes fetched', () => {
+  const before = global.fetch;
+  let called = false;
+  global.fetch = () => { called = true; throw new Error('P1 must not call the network'); };
+  try {
+    recordInbound({ id: 'in-img', from: '919812345678', type: 'image', timestamp: '1700000100',
+      image: { id: 'MEDIA-1', mime_type: 'image/jpeg', sha256: 'abc', file_size: 2048 } }, 'Rahul');
+  } finally { global.fetch = before; }
+  assert.equal(called, false);
+  const m = testDb.prepare("SELECT * FROM media WHERE media_id = 'MEDIA-1'").get();
+  assert.equal(m.wamid, 'in-img');
+  assert.equal(m.mime_type, 'image/jpeg');
+  assert.equal(m.file_size, 2048);
+  assert.equal(m.path, null);
+  assert.equal(m.downloaded_at, null);
+});
+test('a document records its filename', () => {
+  recordInbound({ id: 'in-doc', from: '919812345678', type: 'document', timestamp: '1700000200',
+    document: { id: 'MEDIA-2', mime_type: 'application/pdf', filename: 'invoice.pdf' } }, 'Rahul');
+  assert.equal(testDb.prepare("SELECT filename FROM media WHERE media_id = 'MEDIA-2'").get().filename, 'invoice.pdf');
+});
+test('a media message with no id stores the message but no media row', () => {
+  recordInbound({ id: 'in-broken', from: '919812345678', type: 'image', timestamp: '1700000300', image: {} }, 'Rahul');
+  assert.ok(testDb.prepare("SELECT 1 AS ok FROM messages WHERE wamid = 'in-broken'").get());
+  assert.equal(testDb.prepare("SELECT count(*) AS n FROM media WHERE wamid = 'in-broken'").get().n, 0);
+});
+test('a message with no timestamp falls back to now', () => {
+  const before = Date.now();
+  const e = recordInbound({ id: 'in-nots', from: '919812345678', type: 'text', text: { body: 'x' } }, 'Rahul');
+  assert.ok(e.at >= before);
+});
+// This section leaves 919812345678 with unread > 0 (four recordInbound calls
+// land after the markRead test above). Cleaning that up here — rather than
+// leaving it for the next section to blanket-reset away — is what makes this
+// section self-contained: any later section that shares the :memory: DB (this
+// one included, on a re-run of the suite in one process) sees the thread the
+// way an operator who actually read it would, and nobody downstream needs to
+// know or care that this section ran first.
+markRead('919812345678');
+
+console.log('\nthreads');
+// This section owns the 9100000000xx wa_id range and touches nothing outside
+// it. A reset scoped to that prefix — rather than a blanket
+// `UPDATE threads SET unread = 0` — means a future section inserted anywhere
+// before this one keeps whatever thread state it set up; only this section's
+// own fixtures get zeroed between runs.
+testDb.prepare("UPDATE threads SET unread = 0 WHERE wa_id LIKE '9100000000%'").run();
+const seedThread = (waId, name, lastInboundAt, lastAt) =>
+  testDb.prepare('INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES (?,?,0,?,?)')
+        .run(waId, name, lastInboundAt, lastAt);
+
+test('summary hides campaign-only threads by default', () => {
+  seedThread('910000000001', 'Replied',  1700000000000, 1700000000000);
+  seedThread('910000000002', 'BlastOnly', 0,            1700000000000);
+  const ids = inboxSummary().threads.map(t => t.waId);
+  assert.ok(ids.includes('910000000001'));
+  assert.ok(!ids.includes('910000000002'));
+});
+test('summary all:true shows campaign-only threads', () => {
+  const ids = inboxSummary({ all: true }).threads.map(t => t.waId);
+  assert.ok(ids.includes('910000000002'));
+});
+test('summary sorts most recent first', () => {
+  seedThread('910000000003', 'Newest', 1700000000000, 1900000000000);
+  assert.equal(inboxSummary().threads[0].waId, '910000000003');
+});
+test('summary carries the last message as the preview', () => {
+  testDb.prepare("INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES ('p1','910000000001','in','text','first',1)").run();
+  testDb.prepare("INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES ('p2','910000000001','out','text','latest reply',2)").run();
+  const t = inboxSummary().threads.find(x => x.waId === '910000000001');
+  assert.equal(t.preview, 'latest reply');
+  assert.equal(t.lastDir, 'out');
+});
+test('summary unread is the sum across visible threads', () => {
+  // Two threads, both non-zero, so this actually exercises summation — one
+  // thread reading back its own value would still pass if unread() summed
+  // wrong (e.g. returned the max, or just the first row).
+  testDb.prepare("UPDATE threads SET unread = 3 WHERE wa_id = '910000000001'").run();
+  testDb.prepare("UPDATE threads SET unread = 2 WHERE wa_id = '910000000003'").run();
+  assert.equal(inboxSummary().unread, 5);
+  testDb.prepare("UPDATE threads SET unread = 0 WHERE wa_id IN ('910000000001', '910000000003')").run();
+});
+test('the window is open inside 24h and closed outside it', () => {
+  const now = 1700000000000;
+  seedThread('910000000004', 'Fresh', now - 1000, now);
+  seedThread('910000000005', 'Stale', now - 25 * 3600 * 1000, now);
+  const t = inboxSummary({ now });
+  assert.equal(t.threads.find(x => x.waId === '910000000004').windowOpen, true);
+  assert.equal(t.threads.find(x => x.waId === '910000000005').windowOpen, false);
+});
+test('the window boundary holds exactly at WINDOW_MS', () => {
+  const now = 1700000000000;
+  const WINDOW = 24 * 60 * 60 * 1000;
+  seedThread('910000000006', 'Edge', now - WINDOW + 1, now);
+  seedThread('910000000007', 'Past', now - WINDOW,     now);
+  const t = inboxSummary({ now });
+  assert.equal(t.threads.find(x => x.waId === '910000000006').windowOpen, true);
+  assert.equal(t.threads.find(x => x.waId === '910000000007').windowOpen, false);
+});
+test('thread returns messages oldest first in the shape the UI reads', () => {
+  const t = inboxThread('910000000001');
+  assert.equal(t.name, 'Replied');
+  assert.equal(t.messages[0].id, 'p1');
+  assert.equal(t.messages[0].text, 'first');
+  assert.equal(t.messages[1].id, 'p2');
+  assert.equal(t.messages[1].dir, 'out');
+  assert.ok('status' in t.messages[1]);
+});
+test('thread returns null for an unknown number', () => {
+  assert.equal(inboxThread('910000009999'), null);
+});
+test('there is no per-thread message cap', () => {
+  for (let i = 0; i < 250; i++) {
+    testDb.prepare('INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(`bulk-${i}`, '910000000008', 'in', 'text', `m${i}`, 1000 + i);
+  }
+  seedThread('910000000008', 'Chatty', 1700000000000, 1700000000000);
+  assert.equal(inboxThread('910000000008').messages.length, 250);
+});
 
 console.log('\nauthentication');
 test('the right password is accepted', () => {
@@ -387,4 +589,543 @@ test('a destroyed session stops validating', () => {
   assert.equal(validSession(t), false);
 });
 
-console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);
+console.log('\ndb');
+test('node 22.5 and above is accepted', () => {
+  assert.equal(nodeVersionOk('22.5.0'), true);
+  assert.equal(nodeVersionOk('23.7.0'), true);
+  assert.equal(nodeVersionOk('24.0.1'), true);
+});
+test('node below 22.5 is rejected', () => {
+  assert.equal(nodeVersionOk('22.4.9'), false);
+  assert.equal(nodeVersionOk('20.11.0'), false);
+  assert.equal(nodeVersionOk('18.20.0'), false);
+});
+test('the schema creates every table', () => {
+  const d = openDb(':memory:');
+  const names = d.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
+  assert.deepEqual(names, ['campaign_runs', 'media', 'messages', 'threads', 'webhook_events']);
+});
+test('the schema creates the thread and run indexes', () => {
+  const d = openDb(':memory:');
+  const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
+  assert.deepEqual(names, ['idx_messages_run', 'idx_messages_thread']);
+});
+test('opening twice does not throw', () => {
+  const d = openDb(':memory:');
+  assert.doesNotThrow(() => d.exec(SCHEMA));   // every CREATE is IF NOT EXISTS
+});
+test('busy_timeout is applied', () => {
+  const d = openDb(':memory:');
+  assert.equal(d.prepare('PRAGMA busy_timeout').get().timeout, 5000);
+});
+test('dir is constrained to in or out', () => {
+  const d = openDb(':memory:');
+  assert.throws(() => d.prepare(
+    "INSERT INTO messages (wamid, wa_id, dir, type, at) VALUES ('x','1','sideways','text',1)"
+  ).run(), /CHECK constraint failed/);
+});
+
+console.log('\nwebhook durability');
+test('an envelope is recorded unprocessed', () => {
+  const id = recordEnvelope('{"object":"whatsapp_business_account"}');
+  const row = testDb.prepare('SELECT * FROM webhook_events WHERE id = ?').get(id);
+  assert.equal(row.body, '{"object":"whatsapp_business_account"}');
+  assert.equal(row.processed_at, null);
+  assert.ok(row.received_at > 0);
+});
+test('marking processed stamps the row', () => {
+  const id = recordEnvelope('{"a":1}');
+  markEnvelopeProcessed(id);
+  assert.ok(testDb.prepare('SELECT processed_at FROM webhook_events WHERE id = ?').get(id).processed_at > 0);
+});
+test('recordEnvelope throws when it cannot write — this is what makes the route 500', () => {
+  testDb.exec('ALTER TABLE webhook_events RENAME TO webhook_events_hidden');
+  try {
+    assert.throws(() => recordEnvelope('{"lost":true}'));
+  } finally {
+    testDb.exec('ALTER TABLE webhook_events_hidden RENAME TO webhook_events');
+  }
+});
+test('a recorded envelope survives to be replayed', () => {
+  const id = recordEnvelope('{"replayable":true}');
+  const pending = testDb.prepare('SELECT count(*) AS n FROM webhook_events WHERE processed_at IS NULL').get().n;
+  assert.ok(pending >= 1);
+  assert.equal(JSON.parse(testDb.prepare('SELECT body FROM webhook_events WHERE id = ?').get(id).body).replayable, true);
+});
+
+console.log('\nwebhook route (integration)');
+// These mount the real router and go over a real HTTP+HMAC round trip, because
+// the durability guarantee is about what the ROUTE does with a throw — a unit
+// test on recordEnvelope alone cannot prove the try/catch turns that throw into
+// a 500 instead of an accidental 200.
+const http = require('http');
+const crypto = require('crypto');
+const express = require('express');
+const { CFG } = require('./src/config');
+
+// limit mirrors server.js's real body-parser config (F2). Without it this
+// helper would silently test against Express's 100kb default instead of what
+// the app actually runs, and the oversized-payload test below would pass or
+// fail for the wrong reason.
+function startWebhookServer() {
+  const app = express();
+  app.use(express.json({ limit: '5mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
+  app.use('/', require('./src/routes/webhook'));
+  const server = http.createServer(app);
+  return new Promise(resolve => server.listen(0, () => resolve(server)));
+}
+
+function sign(body, secret) {
+  return 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
+}
+
+testAsync('a validly signed POST is acknowledged with 200 and recorded', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const server = await startWebhookServer();
+  let res;
+  try {
+    const port = server.address().port;
+    const payload = JSON.stringify({ object: 'whatsapp_business_account', entry: [] });
+    res = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-hub-signature-256': sign(payload, 'test-secret') },
+      body: payload,
+    });
+  } finally {
+    server.close();
+    CFG.appSecret = savedSecret;
+  }
+  assert.equal(res.status, 200);
+  const row = testDb.prepare('SELECT * FROM webhook_events ORDER BY id DESC LIMIT 1').get();
+  assert.equal(row.body, '{"object":"whatsapp_business_account","entry":[]}');
+});
+testAsync('when the write fails the route answers 500, never 200, and stores nothing', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const server = await startWebhookServer();
+  const before = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  testDb.exec('ALTER TABLE webhook_events RENAME TO webhook_events_hidden');
+  let res;
+  try {
+    const port = server.address().port;
+    const payload = JSON.stringify({ object: 'whatsapp_business_account', entry: [], marker: 'should-not-be-stored' });
+    res = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-hub-signature-256': sign(payload, 'test-secret') },
+      body: payload,
+    });
+  } finally {
+    testDb.exec('ALTER TABLE webhook_events_hidden RENAME TO webhook_events');
+    server.close();
+    CFG.appSecret = savedSecret;
+  }
+  assert.equal(res.status, 500);
+  const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  assert.equal(after, before, 'the failed write must leave no phantom row');
+});
+
+console.log('\nreply');
+const stubGraph = (impl) => {
+  const before = global.fetch;
+  global.fetch = impl;
+  return () => { global.fetch = before; };
+};
+
+testAsync('a reply outside the window is refused without calling the network', async () => {
+  let called = false;
+  const restore = stubGraph(async () => { called = true; throw new Error('must not send'); });
+  try {
+    testDb.prepare("INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES ('919700000001','Stale',0,1,1)").run();
+    const r = await sendReply('919700000001', 'hello?');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /24-hour reply window/);
+    assert.equal(called, false);
+  } finally { restore(); }
+});
+testAsync('a reply to an unknown thread is refused', async () => {
+  const r = await sendReply('919700009999', 'hello?');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /24-hour reply window/);
+});
+testAsync('an empty reply is refused before anything else', async () => {
+  const r = await sendReply('919700000001', '   ');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /empty/);
+});
+testAsync('a reply inside the window is stored with no run_id', async () => {
+  const now = Date.now();
+  testDb.prepare("INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES ('919700000002','Fresh',0,?,?)").run(now, now);
+  const restore = stubGraph(async () => ({
+    ok: true,
+    headers: new Map(),
+    json: async () => ({ messages: [{ id: 'reply-1' }] }),
+  }));
+  const savedToken = require('./src/config').CFG.accessToken;
+  const savedPhone = require('./src/config').CFG.phoneNumberId;
+  require('./src/config').CFG.accessToken   = 'test-token';
+  require('./src/config').CFG.phoneNumberId = '1234567890';
+  try {
+    const r = await sendReply('919700000002', 'on my way');
+    assert.equal(r.ok, true);
+    assert.equal(r.message.id, 'reply-1');
+    const row = testDb.prepare("SELECT * FROM messages WHERE wamid = 'reply-1'").get();
+    assert.equal(row.dir, 'out');
+    assert.equal(row.body, 'on my way');
+    assert.equal(row.status, 'sent');
+    assert.equal(row.run_id, null, 'an inbox reply must not be counted in a campaign run');
+    assert.equal(testDb.prepare("SELECT last_at FROM threads WHERE wa_id = '919700000002'").get().last_at, row.at);
+  } finally {
+    restore();
+    require('./src/config').CFG.accessToken   = savedToken;
+    require('./src/config').CFG.phoneNumberId = savedPhone;
+  }
+});
+
+console.log('\nruns');
+test('startRun returns an id and records the label', () => {
+  const id = startRun('diwali_offer');
+  assert.equal(typeof id, 'number');
+  assert.equal(testDb.prepare('SELECT label FROM campaign_runs WHERE id = ?').get(id).label, 'diwali_offer');
+  assert.equal(S.currentRunId, id);
+});
+test('recordOutbound writes the message and the thread in one go', () => {
+  const runId = startRun('run-a');
+  recordOutbound({ wamid: 'out-1', waId: '919900000001', name: 'Asha', body: 'Hi Asha', at: 5000, runId });
+  const m = testDb.prepare("SELECT * FROM messages WHERE wamid = 'out-1'").get();
+  assert.equal(m.dir, 'out');
+  assert.equal(m.type, 'template');
+  assert.equal(m.status, 'accepted');
+  assert.equal(m.run_id, runId);
+  const t = testDb.prepare("SELECT * FROM threads WHERE wa_id = '919900000001'").get();
+  assert.equal(t.name, 'Asha');
+  assert.equal(t.last_at, 5000);
+  assert.equal(t.last_inbound_at, 0);   // an outbound send does not open the window
+});
+test('a campaign send does not mark the thread unread', () => {
+  assert.equal(testDb.prepare("SELECT unread FROM threads WHERE wa_id = '919900000001'").get().unread, 0);
+});
+test('a new run zeroes the displayed counters and deletes nothing', () => {
+  const runA = startRun('run-b');
+  recordOutbound({ wamid: 'out-2', waId: '919900000002', name: 'B', body: 'x', runId: runA });
+  applyStatus({ id: 'out-2', status: 'delivered' });
+  assert.deepEqual(countsForRun(runA), { accepted: 1, delivered: 1, read: 0, failed: 0 });
+
+  const runB = startRun('run-c');
+  assert.deepEqual(countsForRun(runB), { accepted: 0, delivered: 0, read: 0, failed: 0 });
+  assert.ok(testDb.prepare("SELECT 1 AS ok FROM messages WHERE wamid = 'out-2'").get(), 'prior run message must survive');
+});
+test('a status for a previous run updates that message without touching the current run', () => {
+  const runA = startRun('run-d');
+  recordOutbound({ wamid: 'out-3', waId: '919900000003', name: 'C', body: 'x', runId: runA });
+  const runB = startRun('run-e');
+  recordOutbound({ wamid: 'out-4', waId: '919900000004', name: 'D', body: 'x', runId: runB });
+  applyStatus({ id: 'out-3', status: 'read' });
+  assert.equal(countsForRun(runA).read, 1);
+  assert.equal(countsForRun(runB).read, 0);
+});
+test('a redelivered outbound wamid does not duplicate the row', () => {
+  const runId = startRun('run-f');
+  recordOutbound({ wamid: 'out-5', waId: '919900000005', name: 'E', body: 'x', runId });
+  recordOutbound({ wamid: 'out-5', waId: '919900000005', name: 'E', body: 'x', runId });
+  assert.equal(testDb.prepare("SELECT count(*) AS n FROM messages WHERE wamid = 'out-5'").get().n, 1);
+});
+test('an outbound send to a thread that replied leaves the window intact', () => {
+  testDb.prepare("INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES ('919900000006','F',0,4000,4000)").run();
+  recordOutbound({ wamid: 'out-6', waId: '919900000006', name: 'F', body: 'x', at: 9000, runId: startRun('run-g') });
+  const t = testDb.prepare("SELECT * FROM threads WHERE wa_id = '919900000006'").get();
+  assert.equal(t.last_inbound_at, 4000);
+  assert.equal(t.last_at, 9000);
+});
+
+console.log('\nstate snapshot');
+test('displayed counters are derived from the current run', () => {
+  const runId = startRun('snapshot-run');
+  recordOutbound({ wamid: 'snap-1', waId: '919911000001', name: 'One', body: 'x', runId });
+  recordOutbound({ wamid: 'snap-2', waId: '919911000002', name: 'Two', body: 'x', runId });
+  applyStatus({ id: 'snap-1', status: 'read' });
+  const st = buildState();
+  assert.equal(st.accepted, 2);
+  assert.equal(st.delivered, 1);
+  assert.equal(st.read, 1);
+});
+test('a webhook failure is counted alongside API failures', () => {
+  const runId = S.currentRunId;
+  recordOutbound({ wamid: 'snap-3', waId: '919911000003', name: 'Three', body: 'x', runId });
+  applyStatus({ id: 'snap-3', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+  S.failed = 2;                      // two sends the Graph API rejected outright
+  assert.equal(buildState().failed, 3);
+  S.failed = 0;
+});
+test('starting a new run resets the displayed counters to zero', () => {
+  startRun('snapshot-run-2');
+  const st = buildState();
+  assert.equal(st.accepted, 0);
+  assert.equal(st.delivered, 0);
+  assert.equal(st.read, 0);
+});
+test('spent is priced on delivered messages in the current run', () => {
+  const runId = startRun('snapshot-run-3');
+  recordOutbound({ wamid: 'snap-4', waId: '919911000004', name: 'Four', body: 'x', runId });
+  applyStatus({ id: 'snap-4', status: 'delivered' });
+  const st = buildState();
+  assert.equal(st.pricing.spent, spentCost(1, rateFor(S.config.templateCategory)));
+});
+test('the snapshot still carries every key the frontend reads', () => {
+  const st = buildState();
+  for (const k of ['phase','currentIdx','total','accepted','delivered','read','failed','skipped',
+                   'dailyCount','dailyCap','quality','warmup','pricing','inboxUnread','pauseReason',
+                   'config','configured','currentContact','limits','optOutCount','optOutLabel']) {
+    assert.ok(k in st, `buildState lost the "${k}" key`);
+  }
+});
+
+console.log('\nmigration');
+const fsx   = require('node:fs');
+const pathx = require('node:path');
+const osx   = require('node:os');
+
+// Never point these at src/config's real FILES. The migration RENAMES its
+// sources when it finishes, so a test using the real paths would overwrite and
+// then delete the repo's actual inbox.json and msg-index.json — destroying a
+// self-hoster's message history the first time they ran `npm test`.
+const migDir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'wa-migrate-'));
+const F = {
+  inbox:    pathx.join(migDir, 'inbox.json'),
+  msgIndex: pathx.join(migDir, 'msg-index.json'),
+};
+
+test('migration is idempotent and moves both files', () => {
+  const fresh = openDb(':memory:');
+  const inboxFixture = {
+    '919800000001': {
+      waId: '919800000001', name: 'Old Friend', unread: 2,
+      lastInboundAt: 1600000000000, lastAt: 1600000001000,
+      messages: [
+        { id: 'old-in-1',  dir: 'in',  type: 'text', text: 'hi',    at: 1600000000000 },
+        { id: 'old-out-1', dir: 'out', type: 'text', text: 'hello', at: 1600000001000, status: 'read' },
+      ],
+    },
+  };
+  const indexFixture = { msgIndex: { 'old-tmpl-1': { phone: '919800000002', name: 'Blast', status: 'delivered' } } };
+
+  fsx.writeFileSync(F.inbox,    JSON.stringify(inboxFixture));
+  fsx.writeFileSync(F.msgIndex, JSON.stringify(indexFixture));
+  try {
+    const first = migrateJsonToSql(fresh, F);
+    // 2, not 1: the inbox.json thread (919800000001) plus the msgIndex-only
+    // recipient (919800000002), which used to insert a thread without ever
+    // incrementing this counter (F9).
+    assert.equal(first.threads, 2);
+    assert.equal(first.inboundMessages, 1);
+    assert.equal(first.outboundMessages, 2);   // 1 from the thread, 1 from msgIndex
+
+    const rows = fresh.prepare('SELECT count(*) AS n FROM messages').get().n;
+    assert.equal(rows, 3);
+    assert.equal(fresh.prepare("SELECT status FROM messages WHERE wamid = 'old-out-1'").get().status, 'read');
+    assert.equal(fresh.prepare("SELECT status FROM messages WHERE wamid = 'old-tmpl-1'").get().status, 'delivered');
+    assert.equal(fresh.prepare("SELECT unread FROM threads WHERE wa_id = '919800000001'").get().unread, 2);
+
+    // The files are renamed, so a second boot has nothing to do.
+    assert.equal(fsx.existsSync(F.inbox), false);
+    assert.equal(fsx.existsSync(`${F.inbox}.migrated`), true);
+
+    const second = migrateJsonToSql(fresh, F);
+    assert.deepEqual(second, { threads: 0, inboundMessages: 0, outboundMessages: 0, skipped: true });
+    assert.equal(fresh.prepare('SELECT count(*) AS n FROM messages').get().n, 3, 'a second run must not change the data');
+  } finally {
+    for (const f of [F.inbox, F.msgIndex, `${F.inbox}.migrated`, `${F.msgIndex}.migrated`]) {
+      if (fsx.existsSync(f)) fsx.unlinkSync(f);
+    }
+  }
+});
+test('migration with no files present is a no-op', () => {
+  const fresh = openDb(':memory:');
+  assert.deepEqual(migrateJsonToSql(fresh, F), { threads: 0, inboundMessages: 0, outboundMessages: 0, skipped: false });
+});
+test('migration skips when messages already exist', () => {
+  const fresh = openDb(':memory:');
+  fresh.prepare("INSERT INTO messages (wamid, wa_id, dir, type, at) VALUES ('x','1','in','text',1)").run();
+  assert.equal(migrateJsonToSql(fresh, F).skipped, true);
+});
+test('a number that is both an inbox thread and a campaign recipient keeps the inbox row', () => {
+  // The inbox loop runs before the msgIndex loop and both insertThread calls
+  // use INSERT OR IGNORE, so the first write — the inbox one, with real
+  // unread/lastInboundAt — must win. If a future refactor reorders the two
+  // loops, this number would silently flatten to unread:0, last_inbound_at:0.
+  const overlapDir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'wa-migrate-overlap-'));
+  const OF = {
+    inbox:    pathx.join(overlapDir, 'inbox.json'),
+    msgIndex: pathx.join(overlapDir, 'msg-index.json'),
+  };
+  const waId = '919800000099';
+  const inboxFixture = {
+    [waId]: {
+      waId, name: 'Both Worlds', unread: 5,
+      lastInboundAt: 1700000000000, lastAt: 1700000001000,
+      messages: [
+        { id: 'ov-in-1', dir: 'in', type: 'text', text: 'hey', at: 1700000000000 },
+      ],
+    },
+  };
+  const indexFixture = { msgIndex: { 'ov-tmpl-1': { phone: waId, name: 'Blast', status: 'delivered' } } };
+
+  fsx.writeFileSync(OF.inbox,    JSON.stringify(inboxFixture));
+  fsx.writeFileSync(OF.msgIndex, JSON.stringify(indexFixture));
+  try {
+    const fresh = openDb(':memory:');
+    migrateJsonToSql(fresh, OF);
+    const t = fresh.prepare('SELECT unread, last_inbound_at FROM threads WHERE wa_id = ?').get(waId);
+    assert.equal(t.unread, 5, 'the inbox row\'s unread must survive, not be flattened to 0');
+    assert.equal(t.last_inbound_at, 1700000000000, 'the inbox row\'s last_inbound_at must survive, not be flattened to 0');
+  } finally {
+    for (const f of [OF.inbox, OF.msgIndex, `${OF.inbox}.migrated`, `${OF.msgIndex}.migrated`]) {
+      if (fsx.existsSync(f)) fsx.unlinkSync(f);
+    }
+  }
+});
+
+console.log('\nF7 — corrupt migration source');
+test('a source file that fails to parse is left in place, not renamed, and logged as an error', () => {
+  // readJSON (src/lib/store.js) swallows a JSON.parse throw and returns {} —
+  // from migrate.js's side that is indistinguishable from a file that was
+  // genuinely empty. Either way, nothing must be renamed out from under a
+  // false "0 threads, 0 messages" success line.
+  const corruptDir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'wa-migrate-corrupt-'));
+  const CF = { inbox: pathx.join(corruptDir, 'inbox.json'), msgIndex: pathx.join(corruptDir, 'msg-index.json') };
+  fsx.writeFileSync(CF.inbox, '{ this is not valid json');
+  try {
+    const fresh = openDb(':memory:');
+    const before = S.logs.length;
+    const result = migrateJsonToSql(fresh, CF);
+    assert.equal(result.threads, 0);
+    assert.equal(result.inboundMessages, 0);
+    assert.equal(result.outboundMessages, 0);
+    assert.equal(fsx.existsSync(CF.inbox), true, 'a corrupt source must not be renamed away');
+    assert.equal(fsx.existsSync(`${CF.inbox}.migrated`), false);
+    const logged = S.logs.slice(before).some(l => l.level === 'error' && l.msg.includes(CF.inbox));
+    assert.ok(logged, 'a corrupt or empty source must be logged as an error, not silently declared migrated');
+  } finally {
+    for (const f of [CF.inbox, CF.msgIndex, `${CF.inbox}.migrated`, `${CF.msgIndex}.migrated`]) {
+      if (fsx.existsSync(f)) fsx.unlinkSync(f);
+    }
+  }
+});
+
+console.log('\nF6 — idempotent failure handling');
+test('a redelivered failed status yields one failLog entry, not one per redelivery', () => {
+  seedOut('m-f1');
+  const before = S.failLog.length;
+  applyStatus({ id: 'm-f1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+  assert.equal(S.failLog.length, before + 1);
+  assert.equal(statusOf('m-f1').status, 'failed');
+  // Meta redelivers webhooks it did not get a 200 for, so the identical
+  // 'failed' status for the same wamid can arrive more than once.
+  applyStatus({ id: 'm-f1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+  assert.equal(S.failLog.length, before + 1, 'a redelivered failure must not push a second failLog entry');
+  assert.equal(statusOf('m-f1').status, 'failed');
+});
+test('a later failed webhook still updates the error code and title', () => {
+  // Still worth recording the best detail seen, even though only the FIRST
+  // transition into 'failed' reaches the operator-visible failLog.
+  seedOut('m-f2');
+  applyStatus({ id: 'm-f2', status: 'failed', errors: [{ code: 1, title: 'Generic' }] });
+  applyStatus({ id: 'm-f2', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+  const r = statusOf('m-f2');
+  assert.equal(r.error_code, 131026);
+  assert.equal(r.error_title, 'Undeliverable');
+});
+
+console.log('\nF1 — run attribution');
+test('a null current run reports zero counters and zero spend even with unattributed traffic', () => {
+  // By this point in the suite the db already holds inbox replies ('reply'
+  // section) and migrated legacy rows ('migration' section), both landed
+  // with run_id NULL by design. A null current run must report "no campaign
+  // running", not surface that unrelated traffic as if it were one (F1).
+  const savedRunId = S.currentRunId;
+  const savedFailed = S.failed;
+  S.currentRunId = null;
+  S.failed = 0;
+  assert.deepEqual(countsForRun(null), { accepted: 0, delivered: 0, read: 0, failed: 0 });
+  const st = buildState();
+  assert.equal(st.accepted, 0);
+  assert.equal(st.delivered, 0);
+  assert.equal(st.read, 0);
+  assert.equal(st.failed, 0);
+  assert.equal(st.pricing.spent, 0);
+  S.currentRunId = savedRunId;
+  S.failed = savedFailed;
+});
+
+const { FILES: F1_FILES } = require('./src/config');
+// campaign.json is real runtime state (not customer data, unlike
+// inbox.json/msg-index.json), so unlike the migration tests above these two
+// are allowed to touch its real path — but they still save and restore
+// whatever was there before, leaving no trace either way.
+const withSavedCampaignFile = fn => {
+  const savedState = { contacts: S.contacts, currentIdx: S.currentIdx, phase: S.phase,
+                        dailyCount: S.dailyCount, dailyDate: S.dailyDate, skipped: S.skipped,
+                        currentRunId: S.currentRunId, pauseReason: S.pauseReason };
+  const existed = fsx.existsSync(F1_FILES.campaign);
+  const contents = existed ? fsx.readFileSync(F1_FILES.campaign, 'utf8') : null;
+  try {
+    fn();
+  } finally {
+    Object.assign(S, savedState);
+    if (existed) fsx.writeFileSync(F1_FILES.campaign, contents);
+    else if (fsx.existsSync(F1_FILES.campaign)) fsx.unlinkSync(F1_FILES.campaign);
+  }
+};
+
+test('a resumed campaign restores the run id it had before the restart', () => withSavedCampaignFile(() => {
+  const runId = startRun('resume-test');
+  Object.assign(S, { contacts: [{ name: 'X', dialStr: '910000000000' }], currentIdx: 0, phase: 'running', currentRunId: runId });
+  saveCampaignNow();
+
+  // Simulate a fresh process: nothing carries over except what is on disk.
+  S.currentRunId = null; S.currentIdx = 0; S.phase = 'idle'; S.contacts = [];
+  resumeIfInterrupted();
+  assert.equal(S.currentRunId, runId,
+    'the persisted run id must survive a restart — a resumed send stamped with a different (or no) run id merges into the wrong bucket');
+}));
+test('a resumed campaign with no persisted run id opens one rather than resuming unattributed', () => withSavedCampaignFile(() => {
+  // What campaign.json looked like before run ids were persisted: no
+  // currentRunId field at all.
+  const legacy = { contacts: [{ name: 'Y', dialStr: '910000000001' }], currentIdx: 0,
+                    phase: 'running', dailyCount: 0, dailyDate: null, skipped: 0, config: {} };
+  fsx.writeFileSync(F1_FILES.campaign, JSON.stringify(legacy));
+  S.currentRunId = null; S.currentIdx = 0; S.phase = 'idle'; S.contacts = [];
+  resumeIfInterrupted();
+  assert.ok(S.currentRunId, 'a run id must be opened so resumed sends are attributed instead of landing on run_id NULL');
+}));
+
+console.log('\nF2 — webhook body size limit');
+testAsync('a signed envelope well over the old 100kb express default is accepted and recorded', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const server = await startWebhookServer();
+  const before = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  let res;
+  try {
+    const port = server.address().port;
+    // 150kb of padding — comfortably past Express's 100kb default, which is
+    // roughly 300 batched statuses for this app and the normal shape of a
+    // Meta status webhook for a bulk sender, not an edge case.
+    const payload = JSON.stringify({ object: 'whatsapp_business_account', entry: [], padding: 'x'.repeat(150 * 1024) });
+    res = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-hub-signature-256': sign(payload, 'test-secret') },
+      body: payload,
+    });
+  } finally {
+    server.close();
+    CFG.appSecret = savedSecret;
+  }
+  assert.equal(res.status, 200, 'a batched webhook over the 100kb express default must not be rejected with 413');
+  const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  assert.equal(after, before + 1, 'the oversized envelope must actually be recorded, not merely accepted');
+});
+
+Promise.all(pending).then(() => {
+  console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);
+});

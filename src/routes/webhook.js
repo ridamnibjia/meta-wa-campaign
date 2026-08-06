@@ -5,7 +5,7 @@ const { S, log, emit } = require('../state');
 const { verifySignature } = require('../lib/signature');
 const { broadcast } = require('../services/status');
 const { addOptOut } = require('../services/optouts');
-const { applyStatus, saveMsgIndex } = require('../services/messages');
+const { applyStatus, recordEnvelope, markEnvelopeProcessed } = require('../services/messages');
 const inbox = require('../services/inbox');
 
 const router = express.Router();
@@ -28,15 +28,8 @@ router.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
-router.post('/webhook', (req, res) => {
-  if (!verifySignature(req.rawBody, req.get('x-hub-signature-256'), CFG.appSecret)) {
-    log('warn', 'webhook POST rejected — bad or missing X-Hub-Signature-256');
-    return res.sendStatus(401);
-  }
-  res.sendStatus(200); // always ACK immediately — Meta retries anything slower than ~20s
-  const body = req.body;
+function processEnvelope(body) {
   if (body.object !== 'whatsapp_business_account') return;
-
   for (const entry of (body.entry || [])) {
     // Meta stamps every webhook with the WABA ID that produced it. A System User
     // token without business_management cannot look that ID up from the Business
@@ -77,10 +70,42 @@ router.post('/webhook', (req, res) => {
 
       for (const status of (change.value?.statuses || [])) {
         applyStatus(status);
-        saveMsgIndex();
         broadcast();
       }
     }
+  }
+}
+
+router.post('/webhook', (req, res) => {
+  if (!verifySignature(req.rawBody, req.get('x-hub-signature-256'), CFG.appSecret)) {
+    log('warn', 'webhook POST rejected — bad or missing X-Hub-Signature-256');
+    return res.sendStatus(401);
+  }
+
+  // Durability first, acknowledgement second. If this insert fails the batch is
+  // NOT acknowledged: Meta retries, and a retry the system survives beats a 200
+  // that was not true.
+  let eventId;
+  try {
+    // req.rawBody is guaranteed here: verifySignature returns false without it
+    // (lib/signature.js:9), so a request that got this far has the raw bytes.
+    // Never re-serialise req.body as a fallback — that would store a
+    // normalised copy, or `{}`, in place of what Meta actually sent.
+    eventId = recordEnvelope(req.rawBody.toString('utf8'));
+  } catch (e) {
+    log('error', `webhook NOT stored — refusing to acknowledge so Meta retries: ${e.message}`);
+    return res.sendStatus(500);
+  }
+
+  res.sendStatus(200);   // ~20s and Meta retries; everything below is after the ACK
+
+  try {
+    processEnvelope(req.body);
+    markEnvelopeProcessed(eventId);
+  } catch (e) {
+    // The row keeps processed_at = NULL, so it can be replayed after a parser
+    // fix without asking Meta for anything. Never crash the process.
+    log('error', `webhook ${eventId} parsed with errors — kept for replay: ${e.message}`);
   }
 });
 

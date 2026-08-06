@@ -6,7 +6,9 @@ const { broadcast } = require('../services/status');
 
 const router = express.Router();
 
-router.get('/inbox', (req, res) => res.json(inbox.summary()));
+// ?all=1 includes threads that only ever received a campaign message. Default
+// is replied-only, or a 1000-contact blast turns the console into a phone book.
+router.get('/inbox', (req, res) => res.json(inbox.summary({ all: req.query.all === '1' })));
 
 router.get('/inbox/:waId', (req, res) => {
   const waId = normalizePhone(req.params.waId) || req.params.waId;

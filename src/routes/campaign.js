@@ -5,7 +5,7 @@ const { S, flags, log, todayKey } = require('../state');
 const { broadcast } = require('../services/status');
 const { optOuts } = require('../services/optouts');
 const { W, effectiveCap } = require('../services/warmup');
-const { saveMsgIndex } = require('../services/messages');
+const { startRun, recordOutbound } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
 const { validateTemplate, adoptTemplate } = require('../services/templates');
 const { fetchAccountInfo } = require('../services/graph');
@@ -41,10 +41,10 @@ router.post('/test-send', async (req, res) => {
     const r = await sendTemplate(contact);
     if (r.ok) {
       // Counted like any other send so the stat tiles walk accepted → delivered
-      // → read in front of you; /api/start zeroes them before the real campaign.
-      S.accepted++; S.dailyCount++;
-      S.msgIndex[r.messageId] = { phone: dialStr, name: contact.name, status: 'accepted' };
-      saveMsgIndex();
+      // → read in front of you; /api/start opens a new run before the campaign.
+      S.dailyCount++;
+      recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
+                       body: contact.name, runId: S.currentRunId });
       log('success', `test send accepted — +${dialStr}`);
     } else {
       log('error', `test send failed — +${dialStr} [${r.errorCode}] ${r.error}`);
@@ -87,8 +87,9 @@ router.post('/start', async (req, res) => {
   const info = await fetchAccountInfo().catch(() => ({}));
   if (info.qualityRating) S.quality = info.qualityRating;
 
-  S.accepted = S.failed = S.skipped = S.delivered = S.read = 0;
-  S.currentIdx = 0; S.msgIndex = {}; S.failLog = []; S.logs = []; saveMsgIndex();
+  S.failed = S.skipped = 0;
+  S.currentIdx = 0; S.failLog = []; S.logs = [];
+  startRun(S.config.templateName);
   flags.stopFlag = false; flags.pauseFlag = false; flags.running = false;
   S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast();
   if (W.enabled) log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${effectiveCap()} today`);
@@ -102,8 +103,9 @@ router.post('/stop',   (req, res) => { flags.stopFlag = true; flags.running = fa
 
 router.post('/reset',  (req, res) => {
   flags.stopFlag = true; flags.running = false; flags.pauseFlag = false;
-  Object.assign(S, { contacts: [], currentIdx: 0, accepted: 0, delivered: 0, read: 0, failed: 0, skipped: 0, dailyCount: 0, phase: 'idle', logs: [], msgIndex: {}, failLog: [], pauseReason: null });
-  saveMsgIndex();
+  Object.assign(S, { contacts: [], currentIdx: 0, failed: 0, skipped: 0, dailyCount: 0,
+                     phase: 'idle', logs: [], failLog: [], pauseReason: null });
+  startRun(S.config.templateName);
   clearCampaignFile();
   broadcast(); log('info', 'Reset'); res.json({ ok: true });
 });

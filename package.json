@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "WhatsApp Cloud API bulk campaign manager — self-hosted, open source",
   "main": "server.js",
-  "engines": { "node": ">=18.0.0" },
+  "engines": { "node": ">=22.5.0" },
   "scripts": {
     "start": "node server.js",
     "dev":   "node --watch server.js",

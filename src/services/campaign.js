@@ -5,7 +5,7 @@ const { S, flags, log, sleep, todayKey, checkDaily } = require('../state');
 const { broadcast } = require('./status');
 const { optOuts } = require('./optouts');
 const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
-const { saveMsgIndex } = require('./messages');
+const { recordOutbound, countsForRun, startRun } = require('./messages');
 const { sanitizeParam } = require('./templates');
 const { explainError } = require('../lib/errors');
 const { graphHeaders } = require('./graph');
@@ -17,14 +17,18 @@ const { graphHeaders } = require('./graph');
 const writer = debouncedWriter(FILES.campaign, 2000);
 
 const snapshot = () => ({
-  contacts:   S.contacts,
-  currentIdx: S.currentIdx,
-  phase:      S.phase,
-  dailyCount: S.dailyCount,
-  dailyDate:  S.dailyDate,
-  skipped:    S.skipped,
-  config:     S.config,
-  savedAt:    Date.now(),
+  contacts:     S.contacts,
+  currentIdx:   S.currentIdx,
+  phase:        S.phase,
+  dailyCount:   S.dailyCount,
+  dailyDate:    S.dailyDate,
+  skipped:      S.skipped,
+  config:       S.config,
+  // Without this a restart forgets which run is current, applyStatus/recordOutbound
+  // fall back to run_id NULL, and a resumed send merges into the inbox-reply /
+  // migrated-legacy bucket that countsForRun(null) used to expose (see F1).
+  currentRunId: S.currentRunId,
+  savedAt:      Date.now(),
 });
 
 const saveCampaign      = () => writer.schedule(snapshot);
@@ -35,12 +39,13 @@ function loadCampaign() {
   const d = readJSON(FILES.campaign, {});
   if (!Array.isArray(d.contacts) || !d.contacts.length) return null;
   Object.assign(S, {
-    contacts:   d.contacts,
-    currentIdx: d.currentIdx || 0,
-    phase:      d.phase      || 'idle',
-    dailyCount: d.dailyCount || 0,
-    dailyDate:  d.dailyDate  || null,
-    skipped:    d.skipped    || 0,
+    contacts:     d.contacts,
+    currentIdx:   d.currentIdx   || 0,
+    phase:        d.phase        || 'idle',
+    dailyCount:   d.dailyCount   || 0,
+    dailyDate:    d.dailyDate    || null,
+    skipped:      d.skipped      || 0,
+    currentRunId: d.currentRunId ?? null,
   });
   if (d.config) Object.assign(S.config, d.config);
   return d;
@@ -135,7 +140,8 @@ async function campaignLoop() {
     if (flags.stopFlag)  { log('info', 'Stopped'); S.phase = 'done'; saveCampaignNow(); broadcast(); break; }
     if (flags.pauseFlag) { await sleep(500); continue; }
     if (S.currentIdx >= S.contacts.length) {
-      log('info', `Done — accepted:${S.accepted} failed:${S.failed} skipped:${S.skipped}`);
+      const c = countsForRun(S.currentRunId);
+      log('info', `Done — accepted:${c.accepted} failed:${S.failed} skipped:${S.skipped}`);
       S.phase = 'done'; saveCampaignNow(); broadcast(); break;
     }
     checkDaily();
@@ -163,10 +169,10 @@ async function campaignLoop() {
     log('info', `${n} ${c.name} +${c.dialStr}`);
     const result = await sendTemplate(c);
     if (result.ok) {
-      S.accepted++; S.dailyCount++;
+      S.dailyCount++;
       markWarmupDay();
-      S.msgIndex[result.messageId] = { phone: c.dialStr, name: c.name, status: 'accepted' };
-      saveMsgIndex();
+      recordOutbound({ wamid: result.messageId, waId: c.dialStr, name: c.name,
+                       body: c.name, runId: S.currentRunId });
       log('success', `${n} accepted — today:${S.dailyCount}/${cap}`);
     } else if (result.skip) {
       S.skipped++;
@@ -209,6 +215,16 @@ function resumeIfInterrupted() {
   if (saved.phase !== 'running' || left <= 0) {
     log('info', `Campaign restored — ${S.currentIdx}/${S.contacts.length} done, phase ${S.phase}`);
     return;
+  }
+  // A campaign.json saved before run ids existed, or one whose run was
+  // otherwise never opened, has no run id to restore. Resuming it silently
+  // would attribute every resumed send to run_id NULL — the same bucket
+  // inbox replies and migrated legacy messages live in — which merges the
+  // campaign's counters and spend into unrelated traffic (F1). Open a run
+  // rather than resume unattributed.
+  if (S.currentRunId == null) {
+    startRun(S.config.templateName);
+    log('warn', `Resumed campaign had no run id on file — opened run ${S.currentRunId} so resumed sends are attributed`);
   }
   S.phase       = 'paused';
   S.pauseReason = `Server restarted — resuming ${left} remaining contacts in ${RESUME_GRACE_MS / 1000}s`;

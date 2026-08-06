@@ -296,25 +296,36 @@ meta-wa-campaign/
 │   └── views/           dashboard, campaign, inbox, settings
 │
 ├── test.js              Self-check for the pure functions — `node test.js`
-│                        No framework. 117 cases covering template validation,
-│                        payload building, phone normalising, pricing maths,
-│                        the 24h reply window, webhook dedupe and auth
+│                        No framework. Covers template validation, payload
+│                        building, phone normalising, pricing maths, the 24h
+│                        reply window, webhook durability and auth
 │
 ├── CSV-FORMAT.md        What the contact CSV parser accepts
 ├── contacts-template.csv  Sample contact list to fill in
 │
 ├── opt-outs.json        Numbers that tapped "Stop promotions"
-├── msg-index.json       messageId → status, so late read receipts still count
-├── inbox.json           Conversation threads
+├── wa.db                SQLite message store — threads, messages, raw webhook
+│                        events and campaign runs. Opened in WAL mode, so
+│                        `wa.db-wal` and `wa.db-shm` sit alongside it; back up
+│                        all three together, not just wa.db, or a backup can
+│                        miss writes that were committed to the WAL sidecar
+│                        but not yet checkpointed into the main file.
 ├── campaign.json        Send queue + cursor, so a restart resumes
 ├── warmup.json          Which sending days have happened
-│                        (all five created at runtime and gitignored)
+│                        (all created at runtime and gitignored)
 │
 ├── package.json         4 deps: express, socket.io, multer, dotenv
 ├── Dockerfile           For containerised deployment (Render, DigitalOcean)
-├── .gitignore           Excludes .env, node_modules and the runtime JSON
+├── .gitignore           Excludes .env, node_modules and the runtime state
 └── README.md
 ```
+
+`inbox.json` and `msg-index.json` no longer exist in a fresh install — both moved
+into `wa.db` (§ below). A server that still has them from before this change
+migrates them into SQLite once, automatically, on its next boot, then renames
+each to `<name>.migrated` so a later boot has nothing left to do. The `.migrated`
+files are not read again; delete them once you have confirmed the data is in
+`wa.db`.
 
 Dependencies run one way only: `routes → services → lib → config`. Nothing in
 `lib/` knows about Express, and nothing in `services/` knows about HTTP.
@@ -348,11 +359,16 @@ open http://localhost:3000
 
 Boot prints exactly which of those four are missing, and the app tells you at the
 login screen if `APP_PASSWORD` is unset rather than silently letting you in.
+Every boot also prints an `ExperimentalWarning: SQLite is an experimental
+feature` from Node itself — that is expected, not a misconfiguration. It comes
+from the built-in `node:sqlite` module this app stores messages in, and it is
+deliberately not suppressed: it is Node's own way of telling a self-hoster if
+that module's behaviour is about to change in a future release.
 
 Run the self-check any time — no framework, no network, ~1 second:
 
 ```bash
-node test.js     # 117 cases
+node test.js     # 176 cases
 ```
 
 ### The three-step flow
@@ -454,7 +470,7 @@ tunnel dials out, so the VM's firewall stays shut.
 
 Outline — roughly 20 minutes end to end:
 
-1. Create the VM, install Node 20 and clone the repo with a read-only deploy key.
+1. Create the VM, install Node 22 (22.5.0 or newer — the message store uses the built-in `node:sqlite` module, which does not exist before that) and clone the repo with a read-only deploy key.
 2. Write `.env` by hand on the VM. It is gitignored, so it never arrives via `git pull`. `APP_PASSWORD` and `APP_SECRET` are both mandatory here — this box is on the public internet.
 3. A `systemd` unit (`Restart=always`) keeps the app alive across crashes and reboots.
 4. `cloudflared tunnel create`, then `cloudflared tunnel route dns <tunnel> your.domain`, then run `cloudflared` as its own service.
@@ -613,9 +629,11 @@ loop advances, and `resumeIfInterrupted()` runs at boot. A crash, a redeploy or
 an `systemctl restart` mid-campaign picks up at the next unsent contact — it does
 not restart the list, so nobody gets messaged twice.
 
-**Late receipts.** `msg-index.json` maps `messageId → status`. A read receipt that
-arrives an hour after the campaign finished still increments the right counter,
-because the mapping outlives the in-memory run.
+**Late receipts.** Every message — inbound or outbound, campaign or reply — lives
+in the `messages` table in `wa.db`, keyed by wamid. A read receipt that arrives
+an hour after the campaign finished still updates the right row and the right
+counter, because the row outlives the in-memory run: counters are derived by
+querying `messages`, not incremented by hand.
 
 **Campaign loop:** A `while` loop inside an async function. Uses `await sleep(ms)` to pause between sends — this yields the event loop so Express can still handle HTTP requests (pause, stop) while the campaign runs. No background threads. No workers. Just async/await.
 
