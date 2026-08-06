@@ -114,7 +114,7 @@ if (!CFG.appPassword)   console.warn('[WARN] APP_PASSWORD not set — the API is
 // unconditionally at require-time would rename the repo's own inbox.json and
 // msg-index.json the moment `npm test` loaded this file.
 if (require.main === module) {
-  migrateJsonToSql();
+  migrateJsonToSql(undefined, undefined, { templateName: S.config.templateName || null });
   resumeIfInterrupted();
   server.listen(CFG.port, () => {
     console.log(`\n[WA-CAMPAIGN] Server running → http://localhost:${CFG.port}`);

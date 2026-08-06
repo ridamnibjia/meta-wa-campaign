@@ -9,7 +9,7 @@ const { readJSON } = require('../lib/store');
 const { db } = require('../lib/db');
 const { log } = require('../state');
 
-function migrateJsonToSql(handle = db, files = FILES) {
+function migrateJsonToSql(handle = db, files = FILES, { templateName = null } = {}) {
   const already = handle.prepare('SELECT count(*) AS n FROM messages').get().n;
   if (already > 0) return { threads: 0, inboundMessages: 0, outboundMessages: 0, skipped: true };
 
@@ -61,7 +61,8 @@ function migrateJsonToSql(handle = db, files = FILES) {
       // source actually created the row.
       const r = insertThread.run(m.phone, m.name ?? m.phone, 0, 0, indexAt);
       if (r.changes > 0) counts.threads++;
-      insertMsg.run(wamid, m.phone, 'out', 'template', '[template]', indexAt, m.status ?? null);
+      const body = templateName ? `[template: ${templateName}]` : '[template]';
+      insertMsg.run(wamid, m.phone, 'out', 'template', body, indexAt, m.status ?? null);
       counts.outboundMessages++;
       indexWrites++;
     }
