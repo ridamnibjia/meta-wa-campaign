@@ -1905,6 +1905,126 @@ console.log('\ninbound media — save, serve, expire');
   });
 }
 
+console.log('\nfile risk classification');
+{
+  const { classify, sniff, extOf, worst, TIERS } = require('./server');
+  const TIERSET = new Set(TIERS);
+
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]);
+  const png  = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const pdf  = Buffer.from('%PDF-1.7\n');
+  const mz   = Buffer.from('MZ\x90\x00\x03\x00\x00\x00');
+  const elf  = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 1, 1, 1, 0]);
+  const zip  = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0]);
+  const ole2 = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  const html = Buffer.from('<!DOCTYPE html><script>alert(1)</script>');
+  const mp4  = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypmp42')]);
+
+  test('worst() orders the tiers by severity', () => {
+    assert.equal(worst('safe', 'ok'), 'ok');
+    assert.equal(worst('block', 'safe'), 'block');
+    assert.equal(worst('warn', 'ok'), 'warn');
+    assert.equal(worst('safe', 'safe'), 'safe');
+  });
+
+  test('sniff() recognises the formats the table claims to', () => {
+    assert.equal(sniff(jpeg), 'jpeg');
+    assert.equal(sniff(png),  'png');
+    assert.equal(sniff(pdf),  'pdf');
+    assert.equal(sniff(mz),   'exe');
+    assert.equal(sniff(elf),  'elf');
+    assert.equal(sniff(zip),  'zip');
+    assert.equal(sniff(ole2), 'ole2');
+    assert.equal(sniff(html), 'html');
+    assert.equal(sniff(mp4),  'mp4');
+    assert.equal(sniff(Buffer.from('OggS\x00\x02\x00\x00')), 'ogg');
+    assert.equal(sniff(Buffer.from('#!AMR\n')), 'amr');
+    assert.equal(sniff(Buffer.from('#!/bin/sh\nrm -rf /')), 'script');
+    assert.equal(sniff(Buffer.from('nothing recognisable at all')), null);
+    assert.equal(sniff(Buffer.alloc(0)), null);
+    assert.equal(sniff(null), null);
+  });
+
+  test('extOf() strips anything that could reach a filesystem path', () => {
+    assert.equal(extOf('holiday.JPG'), '.jpg');
+    assert.equal(extOf('report.pdf'), '.pdf');
+    assert.equal(extOf('no-extension'), '');
+    assert.equal(extOf('../../../etc/passwd'), '');
+    assert.equal(extOf('evil.'), '');
+    assert.equal(extOf('evil..'), '');
+    assert.equal(extOf('a.' + 'x'.repeat(50)), '');   // over 10 chars is not an extension
+    assert.equal(extOf('shell.sh; rm -rf /'), '');
+    assert.equal(extOf('x.tar/../../y'), '');
+    assert.equal(extOf(null), '');
+  });
+
+  test('a genuine photo classifies safe', () => {
+    const v = classify({ mime: 'image/jpeg', filename: 'holiday.jpg', bytes: jpeg });
+    assert.equal(v.tier, 'safe');
+    assert.equal(v.sniffed, 'jpeg');
+  });
+
+  test('a voice note with codec parameters still classifies safe', () => {
+    const ogg = Buffer.from('OggS\x00\x02\x00\x00');
+    assert.equal(classify({ mime: 'audio/ogg; codecs=opus', filename: undefined, bytes: ogg }).tier, 'safe');
+  });
+
+  test('safe needs all three signals — unrecognised bytes demote to ok', () => {
+    const v = classify({ mime: 'image/png', filename: 'x.png', bytes: Buffer.from('not a png at all') });
+    assert.equal(v.tier, 'ok', 'nothing renders inline on the strength of a declared mime alone');
+    assert.match(v.reason, /bytes/i);
+  });
+
+  test('an executable wearing a pdf name and mime is blocked by its bytes', () => {
+    const v = classify({ mime: 'application/pdf', filename: 'invoice.pdf', bytes: mz });
+    assert.equal(v.tier, 'block');
+    assert.equal(v.sniffed, 'exe');
+  });
+
+  test('an executable extension blocks even with innocent bytes', () => {
+    assert.equal(classify({ mime: 'application/octet-stream', filename: 'setup.exe', bytes: jpeg }).tier, 'block');
+  });
+
+  test('html and svg are blocked — they are the XSS vector this feature exists for', () => {
+    assert.equal(classify({ mime: 'text/html', filename: 'a.html', bytes: html }).tier, 'block');
+    assert.equal(classify({ mime: 'image/svg+xml', filename: 'logo.svg', bytes: Buffer.from('<svg onload=alert(1)>') }).tier, 'block');
+    // The bytes alone are enough: a customer who declares image/png and names
+    // it .png but sends markup must not slip through on two forged signals.
+    assert.equal(classify({ mime: 'image/png', filename: 'logo.png', bytes: Buffer.from('  <svg onload=alert(1)>') }).tier, 'block');
+  });
+
+  test('zip resolves by extension because the magic bytes cannot', () => {
+    assert.equal(classify({ mime: 'application/zip', filename: 'app.apk',  bytes: zip }).tier, 'block');
+    assert.equal(classify({ mime: 'application/zip', filename: 'lib.jar',  bytes: zip }).tier, 'block');
+    assert.equal(classify({ mime: 'application/zip', filename: 'q3.docm',  bytes: zip }).tier, 'warn');
+    assert.equal(classify({ mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename: 'q3.docx', bytes: zip }).tier, 'ok');
+    assert.equal(classify({ mime: 'application/zip', filename: 'stuff.zip', bytes: zip }).tier, 'warn');
+    assert.equal(classify({ mime: 'application/zip', filename: undefined,   bytes: zip }).tier, 'warn');
+  });
+
+  test('legacy OLE2 Office is warn — it can carry a macro', () => {
+    assert.equal(classify({ mime: 'application/msword', filename: 'old.doc', bytes: ole2 }).tier, 'warn');
+  });
+
+  test('a csv is warn — spreadsheet formula injection is a real delivery route', () => {
+    assert.equal(classify({ mime: 'text/csv', filename: 'contacts.csv', bytes: Buffer.from('=cmd|calc') }).tier, 'warn');
+  });
+
+  test('a plain pdf is ok — downloads, never renders inline', () => {
+    assert.equal(classify({ mime: 'application/pdf', filename: 'invoice.pdf', bytes: pdf }).tier, 'ok');
+  });
+
+  test('an unknown mime with no filename and no bytes is ok, not safe', () => {
+    assert.equal(classify({}).tier, 'ok');
+  });
+
+  test('classify() never throws on hostile input', () => {
+    for (const bad of [undefined, null, {}, { mime: 123 }, { filename: {} }, { bytes: 'not a buffer' }]) {
+      assert.ok(TIERSET.has(classify(bad).tier));
+    }
+  });
+}
+
 Promise.all(pending).then(() => {
   console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);
 });
