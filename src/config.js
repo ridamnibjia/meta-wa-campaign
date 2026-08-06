@@ -64,4 +64,10 @@ const PUBLIC_DIR = path.join(ROOT, 'public');
 // P1 writes to it, so it is not created until something needs it.
 const MEDIA_DIR = path.join(ROOT, 'media');
 
-module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, FILES, PUBLIC_DIR, MEDIA_DIR, ROOT };
+// Files uploaded for use as a template header. Separate from MEDIA_DIR, which
+// holds INBOUND customer media — different provenance, different retention.
+// WA_UPLOAD_DIR exists so test.js can point at a temp directory before
+// requiring the app, exactly like WA_DB_PATH. It is not a deployment knob.
+const UPLOAD_DIR = process.env.WA_UPLOAD_DIR || path.join(ROOT, 'uploads');
+
+module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, FILES, PUBLIC_DIR, MEDIA_DIR, UPLOAD_DIR, ROOT };

@@ -25,6 +25,9 @@ campaign.json
 # Inbound media saved by an operator. Customer content.
 media/
 
+# Files uploaded as template headers. Customer-facing business documents.
+uploads/
+
 # Private working notes: the deployment runbook names real infrastructure, and
 # the design specs and video outline are not for publication. The public CSV
 # guide lives at ./CSV-FORMAT.md instead.

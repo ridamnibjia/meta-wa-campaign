@@ -137,6 +137,7 @@ module.exports = {
   ...require('./src/services/messages'),
   ...require('./src/services/campaign'),
   ...require('./src/services/graph'),
+  ...require('./src/services/media'),
   isWindowOpen:   require('./src/services/inbox').isWindowOpen,
   recordInbound:  require('./src/services/inbox').recordInbound,
   inboxSummary:   require('./src/services/inbox').summary,

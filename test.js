@@ -3,6 +3,11 @@
 // set before ./server is required, because src/lib/db.js opens on import.
 process.env.WA_DB_PATH = ':memory:';
 
+// Uploads go to a throwaway directory for the same reason the database does:
+// a test run must never write into the repo.
+process.env.WA_UPLOAD_DIR = require('path').join(
+  require('os').tmpdir(), `wa-uploads-${process.pid}-${Date.now()}`);
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
@@ -23,6 +28,7 @@ const {
   startRun, recordOutbound,
   buildState,
   migrateJsonToSql, db,
+  MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
 
@@ -726,6 +732,61 @@ console.log('\nschema — media + template tables');
     } finally {
       for (const suffix of ['', '-wal', '-shm']) { try { fsx.unlinkSync(f + suffix); } catch {} }
     }
+  });
+}
+
+console.log('\nmedia — saveUpload');
+{
+  const fsx = require('fs');
+  const file = (buf, name, mime) => ({ buffer: buf, originalname: name, mimetype: mime });
+  const pdf  = Buffer.from('%PDF-1.4 fake bytes for a test');
+
+  test('accepts a PDF and writes exactly one row and one file', () => {
+    const r = saveUpload(file(pdf, 'price-list.pdf', 'application/pdf'));
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.asset.kind, 'document');
+    assert.equal(r.asset.filename, 'price-list.pdf');
+    assert.equal(r.asset.file_size, pdf.length);
+    assert.ok(fsx.existsSync(assetPath(r.asset)), 'bytes were not written to disk');
+  });
+
+  test('the same bytes twice is one row and one file', () => {
+    const before = listAssets().length;
+    const r = saveUpload(file(pdf, 'renamed-but-identical.pdf', 'application/pdf'));
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.deduped, true, 'a byte-identical re-upload must reuse the existing row');
+    assert.equal(listAssets().length, before, 'dedupe must not add a row');
+  });
+
+  test('rejects an image over 5 MB, naming the limit', () => {
+    const r = saveUpload(file(Buffer.alloc(6 * 1024 * 1024), 'big.png', 'image/png'));
+    assert.equal(r.ok, false);
+    assert.match(r.error, /5(\.0)? MB/, 'the operator must be told what the limit is');
+  });
+
+  test('rejects a video over 16 MB, naming the limit', () => {
+    const r = saveUpload(file(Buffer.alloc(17 * 1024 * 1024), 'clip.mp4', 'video/mp4'));
+    assert.equal(r.ok, false);
+    assert.match(r.error, /16(\.0)? MB/);
+  });
+
+  test('rejects a type WhatsApp does not accept as a header', () => {
+    const r = saveUpload(file(Buffer.from('MZ'), 'installer.exe', 'application/x-msdownload'));
+    assert.equal(r.ok, false);
+    assert.match(r.error, /does not accept/i);
+  });
+
+  test('a charset suffix on the mime type does not defeat the type check', () => {
+    const r = saveUpload(file(Buffer.from('hello'), 'note.txt', 'text/plain; charset=utf-8'));
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.asset.kind, 'document');
+  });
+
+  test('kindFor maps each accepted type to its kind', () => {
+    assert.equal(kindFor('image/png'), 'image');
+    assert.equal(kindFor('video/mp4'), 'video');
+    assert.equal(kindFor('application/pdf'), 'document');
+    assert.equal(kindFor('image/gif'), null);
   });
 }
 
