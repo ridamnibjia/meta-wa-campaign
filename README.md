@@ -423,6 +423,7 @@ Render backend (server.js)
    BUSINESS_ID           = your_business_portfolio_id
    WABA_ID               = (optional — auto-resolved)
    APP_SECRET            = your_meta_app_secret
+   APP_ID                = your_meta_app_id   ← only for media headers
    APP_PASSWORD          = a_long_random_password_you_choose
    WEBHOOK_VERIFY_TOKEN  = any_random_string_you_choose
    FRONTEND_URL          = https://your-project.pages.dev   ← add after step 3
@@ -430,6 +431,15 @@ Render backend (server.js)
 
    `APP_PASSWORD` is not optional in practice — the API returns `503 setup required`
    for every call until it is set. Generate one with `openssl rand -base64 24`.
+
+   Two easily confused names: **`APP_SECRET` is Meta's** (App → Settings → Basic →
+   App Secret) and verifies webhook signatures. **`APP_PASSWORD` is yours** — you
+   invent it, and it is the dashboard login. There is nowhere to "get" it.
+
+   `APP_ID` (App → Settings → Basic → App ID) is only needed to attach an image,
+   video or document header to a template: Meta's Resumable Upload API keys on the
+   app id, and nothing else substitutes for it. Leave it unset and everything else
+   works — the composer greys media headers out and says why.
 6. Click **Create Web Service**. Render gives you a URL like `https://meta-wa-campaign.onrender.com`
 
 > **Free tier caveat:** Render free tier sleeps after 15 minutes of inactivity. The frontend sends a keep-alive ping every 10 minutes when it has an open connection, so as long as you keep the browser tab open during a campaign, the backend stays awake. If you close the tab mid-campaign, it may sleep. For reliability on multi-day campaigns, upgrade to the Starter plan ($7/mo) or use DigitalOcean.
@@ -728,7 +738,7 @@ a working default.
 |---|---|
 | `ACCESS_TOKEN` | Permanent System User token from Meta. Equivalent to admin access to your WhatsApp account. |
 | `PHONE_NUMBER_ID` | Phone Number ID from the Meta dashboard — not the phone number. |
-| `APP_PASSWORD` | The password for the dashboard. **Until this is set, every API call returns 503 and the app is unusable.** Not a default on purpose. |
+| `APP_PASSWORD` | The password for the dashboard — **one you invent**, not one Meta issues. Do not confuse it with `APP_SECRET` below. **Until this is set, every API call returns 503 and the app is unusable.** Not a default on purpose. |
 | `APP_SECRET` | Meta App Secret, used to verify webhook signatures. Without it every webhook `POST` is rejected with 401, so you get no delivery receipts, replies or opt-outs. |
 
 ### Optional
@@ -736,6 +746,7 @@ a working default.
 | Variable | Default | Description |
 |---|---|---|
 | `WABA_ID` | auto-resolved | WhatsApp Business Account ID. Learned from the first webhook if blank. |
+| `APP_ID` | unset | Meta App ID. Needed **only** to put an image, video or document header on a template — Meta's Resumable Upload API keys on the app id, and neither the WABA id nor the business id substitutes. Unset, the composer greys media headers out and explains why; everything else is unaffected. |
 | `BUSINESS_ID` | — | Business Portfolio ID, used to auto-resolve `WABA_ID`. |
 | `WEBHOOK_VERIFY_TOKEN` | — | Any random string. Must match what you type into Meta's webhook config. |
 | `FRONTEND_URL` | (same-origin only) | Set to your exact frontend origin for the split Pages + Render deployment. |
