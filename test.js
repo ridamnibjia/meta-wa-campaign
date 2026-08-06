@@ -603,7 +603,7 @@ test('node below 22.5 is rejected', () => {
 test('the schema creates every table', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['campaign_runs', 'media', 'messages', 'threads', 'webhook_events']);
+  assert.deepEqual(names, ['campaign_runs', 'media', 'media_assets', 'messages', 'templates', 'threads', 'webhook_events']);
 });
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
@@ -624,6 +624,59 @@ test('dir is constrained to in or out', () => {
     "INSERT INTO messages (wamid, wa_id, dir, type, at) VALUES ('x','1','sideways','text',1)"
   ).run(), /CHECK constraint failed/);
 });
+
+console.log('\nschema — media + template tables');
+{
+  const os    = require('os');
+  const fsx   = require('fs');
+  const pathx = require('path');
+  const cols  = (d, t) => d.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+
+  test('campaign_runs carries the run-time template snapshot columns', () => {
+    const d = openDb(':memory:');
+    const c = cols(d, 'campaign_runs');
+    assert.ok(c.includes('template_body'), 'template_body missing');
+    assert.ok(c.includes('template_lang'), 'template_lang missing');
+    assert.ok(c.includes('header_asset'),  'header_asset missing');
+    d.close();
+  });
+
+  test('media_assets and templates exist with their key columns', () => {
+    const d = openDb(':memory:');
+    assert.ok(cols(d, 'media_assets').includes('sha256'));
+    assert.ok(cols(d, 'media_assets').includes('meta_handle'));
+    assert.ok(cols(d, 'media_assets').includes('media_id_at'));
+    assert.ok(cols(d, 'templates').includes('header_format'));
+    assert.ok(cols(d, 'templates').includes('display_name'));
+    d.close();
+  });
+
+  test('the same sha256 cannot be stored twice', () => {
+    const d = openDb(':memory:');
+    const ins = d.prepare(`INSERT INTO media_assets
+      (sha256, path, filename, mime_type, file_size, kind, uploaded_at)
+      VALUES (?,?,?,?,?,?,?)`);
+    ins.run('abc', 'abc.pdf', 'a.pdf', 'application/pdf', 10, 'document', 1);
+    assert.throws(() => ins.run('abc', 'abc.pdf', 'a.pdf', 'application/pdf', 10, 'document', 1),
+      /UNIQUE/i, 'sha256 must be the dedupe key at the schema level, not only in JS');
+    d.close();
+  });
+
+  // Re-opening an existing file re-runs every ALTER. SQLite has no
+  // ADD COLUMN IF NOT EXISTS, so without the addColumn guard this throws
+  // "duplicate column name" on the second boot of any real deployment.
+  test('re-opening an existing database file does not throw', () => {
+    const f = pathx.join(os.tmpdir(), `wa-schema-${process.pid}-${Date.now()}.db`);
+    try {
+      openDb(f).close();
+      const d = openDb(f);
+      assert.ok(cols(d, 'campaign_runs').includes('template_body'));
+      d.close();
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) { try { fsx.unlinkSync(f + suffix); } catch {} }
+    }
+  });
+}
 
 console.log('\nwebhook durability');
 test('an envelope is recorded unprocessed', () => {

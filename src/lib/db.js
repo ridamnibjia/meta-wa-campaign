@@ -38,6 +38,51 @@ CREATE TABLE IF NOT EXISTS threads (
   last_at         INTEGER NOT NULL DEFAULT 0
 );
 
+-- Files uploaded for use as a template header. sha256 is the dedupe key: the
+-- same PDF dragged in twice is one row and one file on disk, which also means
+-- one Resumable Upload and one media id.
+--
+-- Two Meta identifiers for the same bytes, and they are not interchangeable.
+-- meta_handle (h:…) is what template CREATION requires and is single-use per
+-- submission; media_id is what SENDING requires and Meta deletes it at 30 days.
+-- A template approved with a handle cannot be sent with that handle, which is
+-- why the file needs a row rather than a variable.
+CREATE TABLE IF NOT EXISTS media_assets (
+  id           INTEGER PRIMARY KEY,
+  sha256       TEXT NOT NULL UNIQUE,
+  path         TEXT NOT NULL,
+  filename     TEXT NOT NULL,
+  mime_type    TEXT NOT NULL,
+  file_size    INTEGER NOT NULL,
+  kind         TEXT NOT NULL CHECK (kind IN ('image','video','document')),
+  meta_handle  TEXT,
+  media_id     TEXT,
+  media_id_at  INTEGER,
+  uploaded_at  INTEGER NOT NULL,
+  last_used_at INTEGER
+);
+
+-- Local memory of what WE submitted, not a cache of Meta's copy. Meta stays the
+-- source of truth for the status column — the approval poller keeps reading it
+-- from Graph. But GET /message_templates returns no display name and no link
+-- back to the file on our disk, so without this row a template approved with an
+-- attachment cannot find its own attachment.
+CREATE TABLE IF NOT EXISTS templates (
+  name          TEXT PRIMARY KEY,
+  display_name  TEXT,
+  language      TEXT NOT NULL,
+  category      TEXT NOT NULL,
+  header_format TEXT,
+  header_text   TEXT,
+  header_asset  INTEGER REFERENCES media_assets(id),
+  body_text     TEXT NOT NULL,
+  footer_text   TEXT,
+  buttons_json  TEXT,
+  var_count     INTEGER NOT NULL DEFAULT 0,
+  status        TEXT,
+  created_at    INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS campaign_runs (
   id         INTEGER PRIMARY KEY,
   started_at INTEGER NOT NULL,
@@ -73,6 +118,15 @@ CREATE TABLE IF NOT EXISTS media (
 );
 `;
 
+// SQLite has no ALTER TABLE … ADD COLUMN IF NOT EXISTS, and openDb runs on
+// every boot, so a bare ALTER would throw "duplicate column name" the second
+// time any real deployment started. Reading the current columns first is what
+// keeps a schema addition a line of code rather than a migration framework.
+function addColumn(d, table, column, decl) {
+  const present = d.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === column);
+  if (!present) d.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+}
+
 function openDb(file) {
   const d = new DatabaseSync(file);
   // WAL lets the socket broadcast read while a webhook batch writes. It is a
@@ -87,6 +141,11 @@ function openDb(file) {
   d.exec('PRAGMA synchronous  = FULL');
   d.exec('PRAGMA busy_timeout = 5000');
   d.exec(SCHEMA);
+  // A run records which template it sent, so a thread read months later is not
+  // dependent on that template still existing on Meta's side.
+  addColumn(d, 'campaign_runs', 'template_body', 'TEXT');
+  addColumn(d, 'campaign_runs', 'template_lang', 'TEXT');
+  addColumn(d, 'campaign_runs', 'header_asset',  'INTEGER REFERENCES media_assets(id)');
   return d;
 }
 
@@ -94,4 +153,4 @@ function openDb(file) {
 // It is not a documented deployment knob.
 const db = openDb(process.env.WA_DB_PATH || FILES.db);
 
-module.exports = { db, openDb, nodeVersionOk, SCHEMA };
+module.exports = { db, openDb, nodeVersionOk, SCHEMA, addColumn };
