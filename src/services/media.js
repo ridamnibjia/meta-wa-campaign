@@ -208,7 +208,21 @@ async function ensureMediaId(id, { force = false } = {}) {
   }
 }
 
+// The per-message attachment. `filename` is what the recipient actually sees in
+// WhatsApp, which is why the original name is carried on the row rather than
+// reconstructed from the sha256 path. Images and videos show no filename, so
+// sending one would be noise Meta ignores.
+async function headerComponent(assetId, { force = false } = {}) {
+  const r = await ensureMediaId(assetId, { force });
+  if (!r.ok) return r;
+  const kind  = r.asset.kind;
+  const inner = kind === 'document'
+    ? { id: r.mediaId, filename: r.asset.filename }
+    : { id: r.mediaId };
+  return { ok: true, component: { type: 'header', parameters: [{ type: kind, [kind]: inner }] } };
+}
+
 module.exports = {
   MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath,
-  ensureHandle, ensureMediaId,
+  ensureHandle, ensureMediaId, headerComponent,
 };

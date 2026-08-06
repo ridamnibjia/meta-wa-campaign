@@ -9,6 +9,7 @@ const { recordOutbound, countsForRun, startRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError } = require('../lib/errors');
 const { graphHeaders } = require('./graph');
+const { headerComponent } = require('./media');
 
 // ── Campaign persistence ───────────────────────────────────────────────────────
 // Without this the send queue lives only in memory: a VM reboot, a systemd
@@ -80,28 +81,61 @@ async function sendTemplate(contact) {
   if (!CFG.accessToken || !CFG.phoneNumberId) {
     return { ok: false, error: 'Missing credentials', errorCode: -1 };
   }
-  const body = {
-    messaging_product: 'whatsapp',
-    recipient_type:    'individual',
-    to:                contact.dialStr,
-    type:              'template',
-    template: {
-      name:     S.config.templateName,
-      language: { code: S.config.templateLanguage },
-    },
-  };
-  // Only attach components when the template actually has variables — sending an
-  // empty parameters array is itself an error, as is omitting a required one (132000).
   const params = buildParams(contact);
-  if (params.length) {
-    body.template.components = [{ type: 'body', parameters: params }];
-  }
-  try {
-    const res  = await fetch(
+
+  // The template a campaign sends is approved for the SHAPE of its header — a
+  // document — not for a particular document. Resolving the asset here rather
+  // than at approval is what lets next month's price list reuse this month's
+  // approved template.
+  const attach = async ({ force = false } = {}) => {
+    if (!S.config.headerAssetId) return null;
+    const h = await headerComponent(S.config.headerAssetId, { force });
+    if (!h.ok) throw new Error(h.error);
+    return h.component;
+  };
+
+  const post = async header => {
+    const body = {
+      messaging_product: 'whatsapp',
+      recipient_type:    'individual',
+      to:                contact.dialStr,
+      type:              'template',
+      template: {
+        name:     S.config.templateName,
+        language: { code: S.config.templateLanguage },
+      },
+    };
+    // Meta requires header before body, and rejects an empty parameters array
+    // as readily as a missing required one (132000) — so each component is
+    // attached only when it actually carries something.
+    const components = [];
+    if (header)        components.push(header);
+    if (params.length) components.push({ type: 'body', parameters: params });
+    if (components.length) body.template.components = components;
+
+    const res = await fetch(
       `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/messages`,
       { method: 'POST', headers: graphHeaders(), body: JSON.stringify(body) }
     );
-    const data = await res.json();
+    return { res, data: await res.json() };
+  };
+
+  try {
+    let header = await attach();
+    let { res, data } = await post(header);
+
+    // Meta deletes media at 30 days and our refresh clock is not their clock.
+    // Re-uploading the file and retrying once turns an expired attachment into
+    // a hiccup instead of the point where a campaign of hundreds stops.
+    //
+    // Keyed on data.error, not res.ok: Graph returns HTTP 200 carrying an
+    // error object for this class of failure.
+    if (header && /media/i.test(data.error?.message || '')) {
+      log('warn', 'Send rejected over the header media — re-uploading it and retrying once');
+      header = await attach({ force: true });
+      ({ res, data } = await post(header));
+    }
+
     // params travels back with the result so the caller renders the stored body
     // from exactly what was sent, rather than rebuilding it and hoping the two
     // agree. This is the whole "cannot drift" guarantee.
@@ -124,9 +158,10 @@ async function sendTemplate(contact) {
     }
     return { ok: false, error: msg, errorCode: code, hint };
   } catch (e) {
-    // fetch itself threw — DNS, TLS, or no outbound network from this host.
-    return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}`, errorCode: -1,
-             hint: 'Network problem on the machine running this server, not a Meta error. Check outbound HTTPS.' };
+    // fetch itself threw — DNS, TLS, or no outbound network from this host — or
+    // the header asset could not be uploaded, which attach() raises.
+    return { ok: false, error: `Could not send: ${e.message}`, errorCode: -1,
+             hint: 'Network problem on the machine running this server, or the header file could not be uploaded to Meta.' };
   }
 }
 

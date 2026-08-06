@@ -22,6 +22,13 @@ router.post('/config', (req, res) => {
   if (delaySec)         S.config.delaySec = Math.max(1, parseInt(delaySec));
   if (dailyCap)         S.config.dailyCap = Math.max(1, parseInt(dailyCap));
 
+  // Checked with `in` rather than truthiness so null can clear it. The
+  // template's own approval example is restored on the next adoptTemplate, so
+  // clearing is never destructive.
+  if ('headerAssetId' in req.body) {
+    S.config.headerAssetId = req.body.headerAssetId ? Number(req.body.headerAssetId) : null;
+  }
+
   // Session-only rate overrides. The .env values are the defaults every restart
   // returns to — nothing here writes to disk, matching how credentials behave.
   if (prices && typeof prices === 'object') {

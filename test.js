@@ -29,7 +29,7 @@ const {
   buildState, app,
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
-  ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS,
+  ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
@@ -1555,6 +1555,107 @@ console.log('\nmedia — Meta identifiers');
         assert.match(r.error, /Upload failed/);
       });
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+}
+
+console.log('\nsend path — header component');
+{
+  const withFetch = async (impl, fn) => {
+    const real = global.fetch;
+    const calls = [];
+    global.fetch = async (url, opts) => { calls.push({ url: String(url), opts }); return impl(String(url), opts, calls); };
+    try { return await fn(calls); } finally { global.fetch = real; }
+  };
+  const json = obj => ({ ok: true, status: 200, json: async () => obj, headers: new Headers() });
+  const seedDoc = () => saveUpload({ buffer: Buffer.from(`doc-${Math.random()}`),
+                                     originalname: 'price-list.pdf', mimetype: 'application/pdf' }).asset.id;
+
+  testAsync('a document header carries the original filename, not the hash path', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seedDoc();
+    try {
+      await withFetch(() => json({ id: '555' }), async () => {
+        const r = await headerComponent(id);
+        assert.equal(r.ok, true, r.error);
+        assert.deepEqual(r.component, {
+          type: 'header',
+          parameters: [{ type: 'document', document: { id: '555', filename: 'price-list.pdf' } }],
+        });
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  testAsync('an image header carries no filename — WhatsApp does not show one', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = saveUpload({ buffer: Buffer.from(`img-${Math.random()}`),
+                            originalname: 'banner.png', mimetype: 'image/png' }).asset.id;
+    try {
+      await withFetch(() => json({ id: '777' }), async () => {
+        const r = await headerComponent(id);
+        assert.deepEqual(r.component.parameters[0], { type: 'image', image: { id: '777' } });
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  testAsync('sendTemplate prepends the header before the body component', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId, savedCfg = { ...S.config };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seedDoc();
+    Object.assign(S.config, { headerAssetId: id, templateName: 'plan_test', templateLanguage: 'en',
+                              paramCount: 1, paramValues: [{ source: 'name', value: '' }] });
+    try {
+      await withFetch(url => url.includes('/media')
+        ? json({ id: '888' })
+        : json({ messages: [{ id: 'wamid.plan.header' }] }), async calls => {
+        const r = await sendTemplate({ name: 'Asha', dialStr: '910000000000' });
+        assert.equal(r.ok, true, r.error);
+        const sent = JSON.parse(calls.find(c => c.url.endsWith('/messages')).opts.body);
+        assert.equal(sent.template.components[0].type, 'header');
+        assert.equal(sent.template.components[1].type, 'body');
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; Object.assign(S.config, savedCfg); }
+  });
+
+  // Meta deletes media at 30 days and our clock is not their clock. A send that
+  // comes back complaining about the media must not fail the whole campaign
+  // when re-uploading the file fixes it.
+  testAsync('a media failure re-uploads once and retries the send', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId, savedCfg = { ...S.config };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seedDoc();
+    Object.assign(S.config, { headerAssetId: id, templateName: 'plan_test', templateLanguage: 'en',
+                              paramCount: 0, paramValues: [] });
+    let sends = 0;
+    try {
+      await withFetch(url => {
+        if (url.includes('/media')) return json({ id: `media-${Date.now()}` });
+        sends += 1;
+        return sends === 1
+          ? json({ error: { message: 'Media upload error: media not found', code: 131053 } })
+          : json({ messages: [{ id: 'wamid.plan.retry' }] });
+      }, async () => {
+        const r = await sendTemplate({ name: 'Asha', dialStr: '910000000000' });
+        assert.equal(r.ok, true, 'the retry after a media refresh must succeed');
+        assert.equal(sends, 2, 'exactly one retry, not a loop');
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; Object.assign(S.config, savedCfg); }
+  });
+
+  testAsync('a send with no header asset is unchanged', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId, savedCfg = { ...S.config };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    Object.assign(S.config, { headerAssetId: null, templateName: 'plan_test', templateLanguage: 'en',
+                              paramCount: 1, paramValues: [{ source: 'name', value: '' }] });
+    try {
+      await withFetch(() => json({ messages: [{ id: 'wamid.plan.plain' }] }), async calls => {
+        await sendTemplate({ name: 'Asha', dialStr: '910000000000' });
+        const sent = JSON.parse(calls[0].opts.body);
+        assert.equal(sent.template.components.length, 1);
+        assert.equal(sent.template.components[0].type, 'body');
+      });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; Object.assign(S.config, savedCfg); }
   });
 }
 
