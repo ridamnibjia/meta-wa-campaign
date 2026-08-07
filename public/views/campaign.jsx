@@ -202,6 +202,81 @@ function ButtonEditor({ buttons, onChange }) {
 // component gets a fresh function identity on every render, so React sees a
 // different component type, throws the old subtree away and mounts a new one —
 // which destroys the focused <input> after every single keystroke.
+// ── Who did not get the message, and what you can do about it ─────────────────
+// Grouped by disposition rather than by error code: "try these again" and "give
+// up on these" are different actions, and an operator reading a list of numeric
+// codes has to make that call themselves every time.
+const SKIP_GROUPS = [
+  { key: 'retry',     title: 'Worth trying again',
+    blurb: 'These failed because of the moment — a rate limit, a Meta hiccup, a per-person cap that resets. Re-upload and run again on another day.' },
+  { key: 'fix',       title: 'Fix something first',
+    blurb: 'These failed because of a setting on your side. Retrying unchanged repeats the failure; correcting the cause makes the whole list sendable.' },
+  { key: 'permanent', title: 'Meta will not deliver these',
+    blurb: 'A property of the number, not of the attempt. They have been disabled so later runs skip them automatically.' },
+  { key: 'disabled',  title: 'Switched off before the run',
+    blurb: 'Nobody attempted these — they were already disabled when the queue was built.' },
+  { key: 'unclassified', title: 'Not yet classified',
+    blurb: 'skipDisposition() in src/lib/errors.js has no body yet, so these are shown as-is rather than sorted for you.' },
+];
+
+function SkipReport({ phase }) {
+  const [data, setData] = useState(null);
+  const [open, setOpen] = useState(null);
+
+  // Reloads when the run finishes or is stopped, which is when the report is
+  // worth reading. Polling it mid-run would be a lot of noise for a list that
+  // is still growing.
+  useEffect(() => {
+    api.get('/api/campaign/skips').then(setData).catch(() => setData(null));
+  }, [phase]);
+
+  if (!data || !data.total) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Not messaged — {num(data.total)} of {num(data.progress?.total || 0)}</CardTitle>
+        <CardDescription>
+          None of these were billed. {data.classifierReady ? '' :
+            'The classifier that sorts them is not written yet, so they are listed together below.'}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2 p-5 pt-0">
+        {SKIP_GROUPS.filter(g => (data.groups[g.key] || []).length).map(g => {
+          const rows = data.groups[g.key];
+          return (
+            <div key={g.key} className="rounded-md border border-border">
+              <button className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left"
+                      onClick={() => setOpen(open === g.key ? null : g.key)}>
+                <span className="text-sm font-medium">{g.title}</span>
+                <span className="flex items-center gap-2">
+                  <Badge variant="secondary">{num(rows.length)}</Badge>
+                  <span className="text-xs text-muted-foreground">{open === g.key ? '▾' : '▸'}</span>
+                </span>
+              </button>
+              {open === g.key && (
+                <div className="border-t border-border">
+                  <p className="px-3 py-2 text-xs text-muted-foreground">{g.blurb}</p>
+                  <div className="max-h-56 divide-y divide-border overflow-y-auto">
+                    {rows.map(r => (
+                      <div key={r.phone} className="px-3 py-1.5 text-xs">
+                        <p className="font-medium">
+                          {r.name} <span className="font-mono text-muted-foreground">+{r.phone}</span>
+                        </p>
+                        {r.code ? <p className="text-muted-foreground">[{r.code}] {r.explanation || r.reason}</p> : null}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </CardContent>
+    </Card>
+  );
+}
+
 const Step = ({ n, title, state, right, children }) => (
   <Card>
     <CardHeader row className="gap-3">
@@ -656,6 +731,8 @@ function Campaign() {
               )}
           </CardContent>
         </Card>
+
+        <SkipReport phase={ss.phase} />
 
         {failLog.length > 0 && (
           <Card>

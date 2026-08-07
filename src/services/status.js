@@ -2,9 +2,9 @@
 const { CFG, LIMITS, OPT_OUT_LABEL, PRICES } = require('../config');
 const { S, emit, todayKey } = require('../state');
 const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap } = require('./warmup');
-const { isDisabled, counts: contactCounts } = require('./contacts');
-const { countsForRun } = require('./messages');
-const { rateFor, billableCount, estimateCost, spentCost } = require('../lib/pricing');
+const { counts: contactCounts } = require('./contacts');
+const { countsForRun, progressForRun, nextPending } = require('./messages');
+const { rateFor, estimateCost, spentCost } = require('../lib/pricing');
 const inbox = require('./inbox');
 
 // The single snapshot every client renders from. The counters are a GROUP BY
@@ -13,13 +13,18 @@ const inbox = require('./inbox');
 // disagree with the messages it counts.
 function buildState() {
   const rate     = rateFor(S.config.templateCategory);
-  const billable = billableCount(S.contacts, isDisabled);
   const known    = contactCounts();
   const c        = countsForRun(S.currentRunId);
+  // The queue is the source of truth for every progress number now. `billable`
+  // is what is left to attempt plus what already went out — a disabled row is
+  // staged but never charged.
+  const p        = progressForRun(S.currentRunId);
+  const billable = p.total - p.disabled;
+  const next     = nextPending(S.currentRunId);
   return {
     phase:          S.phase,
-    currentIdx:     S.currentIdx,
-    total:          S.contacts.length,
+    currentIdx:     p.sent + p.skipped,
+    total:          p.total,
     accepted:       c.accepted,
     delivered:      c.delivered,
     read:           c.read,
@@ -27,7 +32,7 @@ function buildState() {
     // row — S.failed) and a delivery failure webhook (a row — c.failed).
     // The operator wants "did not arrive", which is both.
     failed:         S.failed + c.failed,
-    skipped:        S.skipped,
+    skipped:        p.skipped,
     dailyCount:     S.dailyCount,
     dailyCap:       effectiveCap(),
     quality:        S.quality,
@@ -59,7 +64,7 @@ function buildState() {
     // Surfacing it here is what lets the composer grey the option out rather
     // than accepting an upload and failing at submit time.
     mediaHeadersAvailable: !!CFG.appId,
-    currentContact: S.contacts[S.currentIdx] || null,
+    currentContact: next ? { name: next.name, dialStr: next.phone } : null,
     limits:         LIMITS,
     // OPT_OUT_LABEL stays: it builds the quick-reply button and matches the
     // inbound reply. The COUNT is now every disabled contact, whatever turned

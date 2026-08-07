@@ -192,8 +192,98 @@ function recordOutbound({ wamid, waId, name, type = 'template', body = null, at 
   }
 }
 
+// ── The send queue ─────────────────────────────────────────────────────────────
+// Written when a CSV is uploaded, walked when the campaign runs. The resume
+// point is a query, never a saved integer: a counter that a crash leaves ahead
+// of reality silently skips people, and this is the shape that cannot.
+const insertRecipient = db.prepare(`
+  INSERT OR REPLACE INTO run_recipients (run_id, phone, name, seq, skipped_reason, error_code)
+  VALUES (?, ?, ?, ?, ?, NULL)
+`);
+
+// LIMIT 1, ORDER BY seq, on the partial index. The loop asks this once per
+// message rather than holding the list in memory.
+const nextPendingQ = db.prepare(`
+  SELECT phone, name, seq FROM run_recipients
+   WHERE run_id = ? AND wamid IS NULL AND skipped_reason IS NULL
+   ORDER BY seq LIMIT 1
+`);
+
+const markSent = db.prepare(
+  'UPDATE run_recipients SET wamid = ?, attempted_at = ? WHERE run_id = ? AND phone = ?');
+const markSkipped = db.prepare(
+  'UPDATE run_recipients SET skipped_reason = ?, error_code = ?, attempted_at = ? WHERE run_id = ? AND phone = ?');
+
+// `disabled` is broken out from `skipped` because it is the only skip that
+// costs nothing and was known in advance: pricing subtracts it to get the
+// billable count, and the operator reads it as "these people are on your list
+// but switched off" rather than "these sends failed".
+const progressQ = db.prepare(`
+  SELECT count(*)                                                    AS total,
+         sum(CASE WHEN wamid IS NOT NULL THEN 1 ELSE 0 END)          AS sent,
+         sum(CASE WHEN skipped_reason IS NOT NULL THEN 1 ELSE 0 END) AS skipped,
+         sum(CASE WHEN skipped_reason = 'disabled' THEN 1 ELSE 0 END) AS disabled
+    FROM run_recipients WHERE run_id = ?
+`);
+
+const skippedQ = db.prepare(`
+  SELECT phone, name, skipped_reason, error_code, attempted_at
+    FROM run_recipients
+   WHERE run_id = ? AND skipped_reason IS NOT NULL
+   ORDER BY seq
+`);
+
+const recipientsQ = db.prepare(
+  'SELECT phone, name, seq, wamid, skipped_reason, error_code FROM run_recipients WHERE run_id = ? ORDER BY seq');
+
+// Building a run twice for the same id replaces it: /upload-csv opens a fresh
+// run for every upload, so this only ever fires if a caller reuses one.
+const clearRun = db.prepare('DELETE FROM run_recipients WHERE run_id = ?');
+
+// `disabledFor` is passed in rather than imported, because services/messages.js
+// has no business knowing why a contact is off — services/campaign.js supplies
+// the predicate from services/contacts.js. A disabled contact is recorded as a
+// SKIPPED ROW, not omitted: "we did not message these 40 people, and here is
+// why" is the report, and a row that was never written cannot say anything.
+function buildRun(runId, contacts, disabledFor = () => null) {
+  db.exec('BEGIN');
+  try {
+    clearRun.run(runId);
+    let seq = 0;
+    for (const c of contacts) {
+      insertRecipient.run(runId, c.dialStr, c.name || c.dialStr, seq++,
+        disabledFor(c.dialStr) ? 'disabled' : null);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return progressForRun(runId);
+}
+
+const nextPending = runId => (runId == null ? null : nextPendingQ.get(runId) || null);
+
+const recordRecipientSent = (runId, phone, wamid) =>
+  markSent.run(wamid, Date.now(), runId, phone);
+
+const recordRecipientSkipped = (runId, phone, reason, errorCode = null) =>
+  markSkipped.run(reason, errorCode, Date.now(), runId, phone);
+
+function progressForRun(runId) {
+  if (runId == null) return { total: 0, sent: 0, skipped: 0, disabled: 0, pending: 0 };
+  const r = progressQ.get(runId);
+  const total = r.total || 0, sent = r.sent || 0, skipped = r.skipped || 0;
+  return { total, sent, skipped, disabled: r.disabled || 0, pending: total - sent - skipped };
+}
+
+const skippedForRun   = runId => (runId == null ? [] : skippedQ.all(runId));
+const recipientsForRun = runId => (runId == null ? [] : recipientsQ.all(runId));
+
 module.exports = {
   applyStatus, STATUS_RANK, countsForRun,
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
+  buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
+  progressForRun, skippedForRun, recipientsForRun,
 };

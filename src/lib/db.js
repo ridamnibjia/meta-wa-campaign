@@ -121,6 +121,33 @@ CREATE TABLE IF NOT EXISTS campaign_runs (
   label      TEXT
 );
 
+-- The send queue, on disk. This replaces the contacts array that used to be
+-- snapshotted into campaign.json and the S.currentIdx integer that walked it.
+--
+-- The resume point is DERIVED from what was actually sent rather than saved as
+-- a counter. An index that a crash leaves ahead of reality silently skips
+-- people, and nothing downstream can tell — the old design's worst failure mode
+-- and the reason this table exists at all.
+--
+-- Rows are written at CSV upload, not at /start: the queue is then durable from
+-- the moment the operator has one, so a restart before sending begins loses
+-- nothing either.
+CREATE TABLE IF NOT EXISTS run_recipients (
+  run_id         INTEGER NOT NULL REFERENCES campaign_runs(id),
+  phone          TEXT    NOT NULL,
+  name           TEXT,
+  seq            INTEGER NOT NULL,   -- send order, fixed when the run is built
+  wamid          TEXT,               -- set on accept; NULL = not yet attempted
+  skipped_reason TEXT,               -- 'disabled' | 'failed' | 'skipped'
+  error_code     INTEGER,            -- Meta's code, for the skip report
+  attempted_at   INTEGER,
+  PRIMARY KEY (run_id, phone)
+);
+-- Partial index: the pending query is the hot one, and it only ever looks at
+-- rows that are neither sent nor skipped.
+CREATE INDEX IF NOT EXISTS idx_run_recipients_pending ON run_recipients(run_id, seq)
+  WHERE wamid IS NULL AND skipped_reason IS NULL;
+
 CREATE TABLE IF NOT EXISTS messages (
   wamid       TEXT PRIMARY KEY,
   wa_id       TEXT NOT NULL,

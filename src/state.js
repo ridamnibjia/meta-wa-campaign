@@ -4,12 +4,12 @@ const { CFG } = require('./config');
 // ── Campaign state ─────────────────────────────────────────────────────────────
 // Counters and the send queue. Persisted by services/campaign.js and
 // services/messages.js — this module only owns the shape.
+// The send queue is NOT here. It lives in run_recipients, keyed on the current
+// run, and the resume point is derived from it — see services/messages.js. What
+// is left is pacing state a database row has no opinion about.
 const S = {
   phase:      'idle',   // idle | running | paused | done
-  contacts:   [],
-  currentIdx: 0,
   failed:     0,        // Graph API rejected the send — no wamid exists, so no row
-  skipped:    0,        // opted out / ecosystem health skip
   dailyCount: 0,
   dailyDate:  null,
   currentRunId: null,   // campaign_runs.id — scopes every derived counter

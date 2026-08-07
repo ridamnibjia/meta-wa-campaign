@@ -42,4 +42,41 @@ function explainError(code) {
   return e ? `${e[0]} — ${e[1]}` : null;
 }
 
-module.exports = { META_ERRORS, explainError };
+// ── The skip report's classifier ───────────────────────────────────────────────
+// After a run, the operator gets two lists: people worth trying again, and
+// people Meta will refuse no matter how many times you ask. This function is
+// what sorts one from the other, and it is a POLICY call rather than a lookup —
+// which is why it is a function with a table in front of it rather than another
+// column in META_ERRORS.
+//
+// The distinction that matters is about the FUTURE, not the past:
+//
+//   'retry'      — the send failed because of this moment. A rate limit, a Meta
+//                  outage, a per-user marketing cap that resets. Trying again
+//                  on another day is reasonable and may well work.
+//   'permanent'  — the send failed because of this NUMBER. Not on WhatsApp,
+//                  blocked on quality grounds. Retrying is never right, and the
+//                  contact has already been disabled with 'failed_hard'.
+//   'fix'        — the send failed because of something on OUR side that a
+//                  human can correct: a template that needs re-approval, a
+//                  billing problem, a bad variable. Retrying unchanged repeats
+//                  the failure; fixing the cause makes the whole list sendable.
+//
+// Codes worth thinking about, with their meanings from META_ERRORS above:
+//   131026 undeliverable · 131049 per-user marketing cap · 131047 outside the
+//   24h window · 130429 / 80007 / 4 rate limits · 131000 / 131016 transient
+//   Meta faults · 132000 / 132001 / 131008 template mismatches · 132015 /
+//   132016 template paused or disabled · 131042 billing · 131031 policy lock
+//
+// TODO(you): write the body. Everything downstream is wired and tested against
+// whatever you decide — services/campaign.js records the code on the recipient
+// row, and routes/campaign.js groups the report by this return value. Until it
+// returns something, every skip lands in the 'unclassified' bucket, which the
+// report renders honestly rather than guessing on your behalf.
+const SKIP_DISPOSITIONS = ['retry', 'permanent', 'fix', 'unclassified'];
+
+function skipDisposition(code) {   // eslint-disable-line no-unused-vars
+  return 'unclassified';
+}
+
+module.exports = { META_ERRORS, explainError, skipDisposition, SKIP_DISPOSITIONS };

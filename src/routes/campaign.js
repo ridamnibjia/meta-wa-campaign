@@ -5,10 +5,11 @@ const { S, flags, log, todayKey } = require('../state');
 const { broadcast } = require('../services/status');
 const { isDisabled, markMessaged, getRow } = require('../services/contacts');
 const { W, effectiveCap } = require('../services/warmup');
-const { startRun, recordOutbound } = require('../services/messages');
+const { recordOutbound, progressForRun, skippedForRun } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
 const { validateTemplate, adoptTemplate, renderBody } = require('../services/templates');
 const { fetchAccountInfo } = require('../services/graph');
+const { skipDisposition, explainError, SKIP_DISPOSITIONS } = require('../lib/errors');
 const {
   sendTemplate, missingParams, startLoop, saveCampaignNow, clearCampaignFile,
 } = require('../services/campaign');
@@ -67,7 +68,9 @@ router.post('/test-send', async (req, res) => {
 router.post('/start', async (req, res) => {
   if (!CFG.phoneNumberId) return res.json({ ok: false, error: 'Phone Number ID not configured' });
   if (!CFG.accessToken)   return res.json({ ok: false, error: 'Access Token not configured' });
-  if (!S.contacts.length) return res.json({ ok: false, error: 'Upload a CSV first' });
+  const staged = progressForRun(S.currentRunId);
+  if (!staged.total) return res.json({ ok: false, error: 'Upload a CSV first' });
+  if (!staged.pending) return res.json({ ok: false, error: 'Every contact in this run has already been attempted. Upload a CSV to start a new one.' });
 
   // Re-check with Meta rather than trusting the client. A stale browser tab
   // could otherwise launch a campaign against a template that was since rejected.
@@ -95,9 +98,10 @@ router.post('/start', async (req, res) => {
   const info = await fetchAccountInfo().catch(() => ({}));
   if (info.qualityRating) S.quality = info.qualityRating;
 
-  S.failed = S.skipped = 0;
-  S.currentIdx = 0; S.failLog = []; S.logs = [];
-  startRun(S.config.templateName);
+  // The queue was staged at upload and is NOT rebuilt here. Rebuilding would
+  // reset every wamid, and /start after a pause would re-send to everyone who
+  // had already received the message.
+  S.failed = 0; S.failLog = []; S.logs = [];
   flags.stopFlag = false; flags.pauseFlag = false; flags.running = false;
   S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast();
   if (W.enabled) log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${effectiveCap()} today`);
@@ -111,11 +115,58 @@ router.post('/stop',   (req, res) => { flags.stopFlag = true; flags.running = fa
 
 router.post('/reset',  (req, res) => {
   flags.stopFlag = true; flags.running = false; flags.pauseFlag = false;
-  Object.assign(S, { contacts: [], currentIdx: 0, failed: 0, skipped: 0, dailyCount: 0,
-                     phase: 'idle', logs: [], failLog: [], pauseReason: null });
-  startRun(S.config.templateName);
+  // A reset abandons the current run rather than deleting it: campaign_runs and
+  // run_recipients are history, and the counters were never the history.
+  Object.assign(S, { failed: 0, dailyCount: 0, phase: 'idle', logs: [], failLog: [],
+                     pauseReason: null, currentRunId: null });
   clearCampaignFile();
   broadcast(); log('info', 'Reset'); res.json({ ok: true });
+});
+
+// ── The skip report ────────────────────────────────────────────────────────────
+// After a run: who did not get the message, and what — if anything — you can do
+// about it. Two questions, and they have different answers, which is why this is
+// grouped by disposition rather than by error code.
+//
+// The grouping is lib/errors.js:skipDisposition. Until that function has a body
+// every failed send lands in `unclassified`, which the report says plainly
+// rather than guessing on the operator's behalf — a wrong "retry these" is a
+// list of people you message again for no reason, and a wrong "give up on
+// these" is customers you quietly stop talking to.
+router.get('/campaign/skips', (req, res) => {
+  const runId = req.query.run ? Number(req.query.run) : S.currentRunId;
+  const rows  = skippedForRun(runId);
+
+  const groups = {};
+  for (const r of rows) {
+    // A contact who was switched off before the run started is not a failure
+    // and does not belong in either "try again" or "give up" — nobody attempted
+    // anything.
+    const key = r.skipped_reason === 'disabled' ? 'disabled' : skipDisposition(r.error_code);
+    (groups[key] ||= []).push({
+      phone: r.phone, name: r.name,
+      reason: r.skipped_reason, code: r.error_code,
+      explanation: explainError(r.error_code),
+      at: r.attempted_at,
+    });
+  }
+
+  res.json({
+    runId,
+    progress: progressForRun(runId),
+    total: rows.length,
+    // Named so the UI does not have to know the vocabulary, and so an empty
+    // group is still a group the operator can see is empty.
+    groups: {
+      retry:        groups.retry        || [],
+      fix:          groups.fix          || [],
+      permanent:    groups.permanent    || [],
+      disabled:     groups.disabled     || [],
+      unclassified: groups.unclassified || [],
+    },
+    classifierReady: SKIP_DISPOSITIONS.some(d => d !== 'unclassified' && (groups[d] || []).length > 0)
+      || rows.length === 0,
+  });
 });
 
 module.exports = router;

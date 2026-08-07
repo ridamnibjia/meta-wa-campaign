@@ -4,8 +4,8 @@ const multer  = require('multer');
 const { S, log, todayKey } = require('../state');
 const { parseCSV, normalizePhone } = require('../lib/phone');
 const contacts = require('../services/contacts');
-const { startRun } = require('../services/messages');
-const { saveCampaignNow } = require('../services/campaign');
+const { recipientsForRun, progressForRun } = require('../services/messages');
+const { saveCampaignNow, stageRun } = require('../services/campaign');
 const { broadcast } = require('../services/status');
 const { rateFor, billableCount, estimateCost } = require('../lib/pricing');
 
@@ -22,9 +22,10 @@ router.post('/upload-csv', upload.single('csv'), (req, res) => {
     const upload = contacts.upsertFromCsv(parsed, {
       filename: req.file.originalname || null, skippedCount: skipped.length,
     });
-    S.contacts = parsed; S.currentIdx = 0; S.phase = 'idle';
-    S.failed = S.skipped = 0; S.failLog = [];
-    startRun(S.config.templateName);
+    S.phase = 'idle'; S.failed = 0; S.failLog = [];
+    // The queue is staged now, not at /start: it is then durable from the moment
+    // the operator has one, so a restart before sending begins loses nothing.
+    stageRun(parsed);
     saveCampaignNow();
     log('info', `CSV loaded — ${parsed.length} contacts (${upload.newCount} new to this server)`);
     // Loudly, and at warn level. A row the parser could not read is a customer
@@ -46,21 +47,26 @@ router.post('/upload-csv', upload.single('csv'), (req, res) => {
   } catch (e) { res.json({ ok: false, error: e.message }); }
 });
 
-// The SEND QUEUE — the last CSV, in the order the loop will walk it. `sent`
-// marks the ones already past, `disabled` the ones that will be skipped.
+// The SEND QUEUE — the current run, in the order the loop walks it. Read from
+// run_recipients rather than from memory, so it survives a restart and says
+// exactly what happened to each person rather than only where the cursor got to.
 // ponytail: whole list in one response; paginate if a CSV ever gets past ~50k.
-router.get('/contacts', (req, res) => res.json({
-  count: S.contacts.length,
-  contacts: S.contacts.map((c, i) => {
-    const row = contacts.getRow(c.dialStr);
-    return {
-      name: c.name, dialStr: c.dialStr, phone: c.phone,
-      disabled: !!row && !row.enabled,
-      disabledReason: row && !row.enabled ? row.disabled_reason : null,
-      sent: i < S.currentIdx,
-    };
-  }),
-}));
+router.get('/contacts', (req, res) => {
+  const rows = recipientsForRun(S.currentRunId);
+  res.json({
+    count: rows.length,
+    progress: progressForRun(S.currentRunId),
+    contacts: rows.map(r => ({
+      name: r.name, dialStr: r.phone, phone: r.phone,
+      sent: !!r.wamid,
+      disabled: r.skipped_reason === 'disabled',
+      disabledReason: r.skipped_reason === 'disabled'
+        ? (contacts.getRow(r.phone)?.disabled_reason || 'disabled') : null,
+      skippedReason: r.skipped_reason,
+      errorCode: r.error_code,
+    })),
+  });
+});
 
 // The DIRECTORY — every contact this server has ever seen, whether or not they
 // are in the current CSV. This is the list that survives an upload.

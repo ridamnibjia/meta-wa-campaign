@@ -818,12 +818,13 @@ test('the schema creates every table', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
   assert.deepEqual(names, ['campaign_runs', 'contacts', 'csv_uploads', 'media', 'media_assets',
-                           'messages', 'templates', 'threads', 'webhook_events']);
+                           'messages', 'run_recipients', 'templates', 'threads', 'webhook_events']);
 });
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_run', 'idx_messages_thread']);
+  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_run', 'idx_messages_thread',
+                           'idx_run_recipients_pending']);
 });
 test('opening twice does not throw', () => {
   const d = openDb(':memory:');
@@ -1360,6 +1361,131 @@ console.log('\ncontacts — opt-outs.json import');
   });
 }
 
+// ── P2b: the queue on disk ────────────────────────────────────────────────────
+console.log('\nrun_recipients — the send queue');
+{
+  const M = require('./server');
+  const C = M.contacts;
+  const { buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
+          progressForRun, skippedForRun, recipientsForRun } = M;
+
+  let runSeq = 0;
+  const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
+    .run(Date.now(), `t${++runSeq}`).lastInsertRowid);
+  let pseq = 0;
+  const people = n => Array.from({ length: n }, (_, i) => ({
+    name: `P${i}`, dialStr: `9198800${String(++pseq).padStart(5, '0')}` }));
+
+  test('a run stages every contact in order, and pending starts at the first', () => {
+    const run = newRun();
+    const p = people(3);
+    const prog = buildRun(run, p);
+    assert.equal(prog.total, 3);
+    assert.equal(prog.pending, 3);
+    assert.equal(nextPending(run).phone, p[0].dialStr, 'seq order, not insertion luck');
+  });
+
+  test('pending advances only when a row is actually resolved', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+
+    recordRecipientSent(run, p[0].dialStr, 'wamid.a');
+    assert.equal(nextPending(run).phone, p[1].dialStr);
+
+    recordRecipientSkipped(run, p[1].dialStr, 'failed', 131000);
+    assert.equal(nextPending(run).phone, p[2].dialStr);
+
+    recordRecipientSent(run, p[2].dialStr, 'wamid.c');
+    assert.equal(nextPending(run), null, 'an exhausted queue is null, not an index past the end');
+    assert.deepEqual(progressForRun(run), { total: 3, sent: 2, skipped: 1, disabled: 0, pending: 0 });
+  });
+
+  // The whole reason this table exists. The old design saved an integer, and an
+  // integer a crash leaves ahead of reality silently skips people.
+  test('resume after a crash re-reads the queue and repeats nobody', () => {
+    const run = newRun();
+    const p = people(5);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.0');
+    recordRecipientSent(run, p[1].dialStr, 'wamid.1');
+
+    // "Crash": nothing in memory survives. The queue is asked again from zero.
+    assert.equal(nextPending(run).phone, p[2].dialStr,
+      'resume lands on the first unsent row, derived from what was actually sent');
+    const sent = recipientsForRun(run).filter(r => r.wamid).map(r => r.phone);
+    assert.deepEqual(sent, [p[0].dialStr, p[1].dialStr], 'and nobody already messaged is queued again');
+  });
+
+  test('a disabled contact is staged as a skipped row, not left out', () => {
+    const run = newRun();
+    const p = people(3);
+    C.upsertFromCsv(p, {});
+    C.disable(p[1].dialStr, 'opt_out');
+    const prog = buildRun(run, p, phone => (C.isDisabled(phone) ? 'disabled' : null));
+
+    assert.equal(prog.total, 3, 'they are still on the list');
+    assert.equal(prog.disabled, 1);
+    assert.equal(prog.pending, 2, 'but the loop never reaches them');
+    assert.equal(nextPending(run).phone, p[0].dialStr);
+
+    const report = skippedForRun(run);
+    assert.equal(report.length, 1);
+    assert.equal(report[0].phone, p[1].dialStr,
+      'a row that was never inserted could not tell the operator anything');
+    assert.equal(report[0].skipped_reason, 'disabled');
+  });
+
+  test('the skip report carries the Meta code that caused each one', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientSkipped(run, p[0].dialStr, 'skipped', 131049);
+    recordRecipientSkipped(run, p[1].dialStr, 'failed', 132001);
+    const byPhone = Object.fromEntries(skippedForRun(run).map(r => [r.phone, r]));
+    assert.equal(byPhone[p[0].dialStr].error_code, 131049);
+    assert.equal(byPhone[p[1].dialStr].skipped_reason, 'failed');
+    assert.ok(byPhone[p[0].dialStr].attempted_at > 0);
+  });
+
+  test('rebuilding a run replaces its queue rather than doubling it', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    const again = buildRun(run, p);
+    assert.equal(again.total, 2, 'a primary key on (run_id, phone) is not enough on its own');
+  });
+
+  test('progress for no run at all is zeroes, never a throw', () => {
+    assert.deepEqual(progressForRun(null), { total: 0, sent: 0, skipped: 0, disabled: 0, pending: 0 });
+    assert.equal(nextPending(null), null);
+    assert.deepEqual(skippedForRun(null), []);
+  });
+
+  test('the same person twice in one CSV is staged once', () => {
+    const run = newRun();
+    const p = people(1);
+    const prog = buildRun(run, [p[0], { ...p[0], name: 'Duplicate' }]);
+    assert.equal(prog.total, 1, 'the primary key is (run_id, phone)');
+  });
+}
+
+console.log('\nskipDisposition — the classifier the report groups by');
+{
+  const { skipDisposition, SKIP_DISPOSITIONS } = require('./server');
+  test('every code it returns is one the report knows how to render', () => {
+    for (const code of [131026, 131049, 131047, 130429, 132001, 131042, 0, null, undefined]) {
+      assert.ok(SKIP_DISPOSITIONS.includes(skipDisposition(code)),
+        `skipDisposition(${code}) returned something the report cannot group`);
+    }
+  });
+  test('it never throws, whatever it is handed', () => {
+    for (const junk of ['', 'abc', {}, [], NaN, Infinity, -1]) {
+      assert.doesNotThrow(() => skipDisposition(junk));
+    }
+  });
+}
+
 console.log('\nmigration');
 
 // Never point these at src/config's real FILES. The migration RENAMES its
@@ -1565,15 +1691,22 @@ test('a resumed campaign restores the run id it had before the restart', () => w
   assert.equal(S.currentRunId, runId,
     'the persisted run id must survive a restart — a resumed send stamped with a different (or no) run id merges into the wrong bucket');
 }));
-test('a resumed campaign with no persisted run id opens one rather than resuming unattributed', () => withSavedCampaignFile(() => {
-  // What campaign.json looked like before run ids were persisted: no
-  // currentRunId field at all.
+// The original F1 fix opened a run so resumed sends were not attributed to
+// run_id NULL. run_recipients supersedes it: a campaign.json with no run id has
+// no queue, and there is nothing to attribute. Re-sending to the whole array —
+// with no record of who was already messaged — is the one outcome that must not
+// happen, so this now refuses to resume and says why.
+test('a pre-queue campaign.json is refused rather than resumed against no queue', () => withSavedCampaignFile(() => {
   const legacy = { contacts: [{ name: 'Y', dialStr: '910000000001' }], currentIdx: 0,
                     phase: 'running', dailyCount: 0, dailyDate: null, skipped: 0, config: {} };
   fsx.writeFileSync(F1_FILES.campaign, JSON.stringify(legacy));
-  S.currentRunId = null; S.currentIdx = 0; S.phase = 'idle'; S.contacts = [];
+  S.currentRunId = null; S.phase = 'idle';
+  const before = S.logs.length;
   resumeIfInterrupted();
-  assert.ok(S.currentRunId, 'a run id must be opened so resumed sends are attributed instead of landing on run_id NULL');
+  assert.equal(S.currentRunId, null, 'no run is opened for a queue that does not exist');
+  assert.equal(S.phase, 'idle', 'and nothing starts sending');
+  assert.ok(S.logs.slice(before).some(l => /NOT resumed/.test(l.msg)),
+    'the operator must be told their interrupted run did not come back');
 }));
 
 console.log('\nF2 — webhook body size limit');
