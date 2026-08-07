@@ -15,28 +15,81 @@ function normalizePhone(raw) {
   return d;
 }
 
-// Google Contacts exports work as-is: the header names vary but always contain
-// "name" and "mobile"/"home". One contact can yield two rows (mobile + home);
-// `seen` keeps the same person from being messaged twice on one number.
-function parseCSV(buffer) {
-  const lines = buffer.toString('utf8').split('\n').map(l => l.trim()).filter(Boolean);
-  if (!lines.length) return [];
-  const hdr   = lines[0].split(',');
-  const nameI = hdr.findIndex(h => /first.?name|^name/i.test(h));
-  const mobI  = hdr.findIndex(h => /mobile.?phone|mobile/i.test(h));
-  const homeI = hdr.findIndex(h => /home.?phone|home/i.test(h));
-  const out = [], seen = new Set();
-  for (let i = 1; i < lines.length; i++) {
-    const p    = lines[i].split(',');
-    const name = (nameI >= 0 ? p[nameI] : '').replace(/"/g, '').trim() || 'Contact';
-    for (const raw of [mobI >= 0 ? p[mobI] : '', homeI >= 0 ? p[homeI] : ''].filter(Boolean)) {
-      const d = normalizePhone(raw.replace(/"/g, '').trim());
-      if (!d || seen.has(d)) continue;
-      seen.add(d);
-      out.push({ name, phone: raw.trim(), dialStr: d });
-    }
+// RFC 4180 fields. Splitting on a bare comma was wrong in a way that never
+// announced itself: a quoted name like "Doe, John" shifted every column to its
+// right, the phone index landed on a name fragment, and the row was dropped
+// with no error anywhere. A quoted field may contain commas, and a doubled
+// quote inside one is a literal quote.
+function splitCsvLine(line) {
+  const out = [];
+  let field = '', quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quoted) {
+      if (c !== '"') { field += c; continue; }
+      if (line[i + 1] === '"') { field += '"'; i++; continue; }
+      quoted = false;
+    } else if (c === '"') quoted = true;
+    else if (c === ',')   { out.push(field); field = ''; }
+    else field += c;
   }
-  return out;
+  out.push(field);
+  return out.map(f => f.trim());
 }
 
-module.exports = { normalizePhone, parseCSV };
+// Google Contacts has emitted "Phone 1 - Value" for years; older exports said
+// "Mobile Phone", and other tools say "Home Phone" or just "Phone". Rather than
+// name every variant, take every column whose header mentions a phone at all,
+// in the order they appear. `seen` keeps the same person from being messaged
+// twice when two of those columns hold the same number.
+//
+// Deliberately NOT matched: anything merely called a "number". An account or
+// membership number is often 11 digits, which normalizePhone would accept — and
+// the failure mode is messaging a stranger, not dropping a row.
+const isPhoneHeader = h => /phone|mobile/i.test(h);
+
+// Returns the skipped rows as well as the contacts. A row that yields no usable
+// number is the operator's problem to see, not ours to swallow: uploading 500
+// rows and being told "480 contacts" with no mention of the other 20 is how a
+// broken export goes unnoticed for a whole campaign.
+//
+// ponytail: no multi-line quoted fields. A newline inside a quoted cell is legal
+// RFC 4180 and no contact export this app has seen produces one; add a proper
+// tokenizer the day one does.
+function parseCSV(buffer) {
+  const lines = buffer.toString('utf8').split('\n')
+    .map(l => l.replace(/\r$/, '')).filter(l => l.trim());
+  if (!lines.length) return { contacts: [], skipped: [] };
+
+  const hdr    = splitCsvLine(lines[0]);
+  const firstI = hdr.findIndex(h => /^first.?name/i.test(h));
+  const lastI  = hdr.findIndex(h => /^last.?name/i.test(h));
+  const nameI  = hdr.findIndex(h => /name/i.test(h));
+  const phoneCols = hdr.map((h, i) => (isPhoneHeader(h) ? i : -1)).filter(i => i >= 0);
+
+  const contacts = [], skipped = [], seen = new Set();
+  for (let i = 1; i < lines.length; i++) {
+    const p = splitCsvLine(lines[i]);
+    // A modern Google export splits the name across two columns; an older one
+    // has a single column. Joining is what keeps "Asha Rao" from becoming "Asha".
+    const name = (firstI >= 0
+      ? [p[firstI], lastI >= 0 ? p[lastI] : ''].filter(Boolean).join(' ')
+      : (nameI >= 0 ? p[nameI] : '')).trim() || 'Contact';
+
+    let usable = false;
+    for (const col of phoneCols) {
+      const raw = p[col] || '';
+      if (!raw) continue;
+      const d = normalizePhone(raw);
+      if (!d) continue;
+      usable = true;                       // the row had a number; a duplicate
+      if (seen.has(d)) continue;           // is not a row that failed to parse
+      seen.add(d);
+      contacts.push({ name, phone: raw, dialStr: d });
+    }
+    if (!usable) skipped.push({ row: i + 1, name, reason: 'no usable phone number in this row' });
+  }
+  return { contacts, skipped };
+}
+
+module.exports = { normalizePhone, parseCSV, splitCsvLine };

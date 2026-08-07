@@ -246,7 +246,24 @@ const setInboundVerdict = db.prepare(
   'UPDATE media SET scan_status = ?, scan_signature = ?, scan_at = ? WHERE media_id = ?');
 const clearInboundFile = db.prepare('UPDATE media SET path = NULL WHERE media_id = ?');
 
+// Every row sharing these bytes is the same malware, so they are condemned
+// together. Clearing only the row that happened to be requested would leave a
+// sibling reporting `clean` over a file that has just been deleted.
+const condemnPath = db.prepare(`
+  UPDATE media SET scan_status = 'infected', scan_signature = ?, scan_at = ?, path = NULL
+   WHERE path = ?`);
+
 const getInbound = mediaId => inboundRow.get(String(mediaId));
+
+// Saved files are named for their own sha256, so the same bytes arriving twice
+// — a forwarded photo, one price list sent to two customers — are TWO rows over
+// ONE file. Nothing in the schema prevents that and nothing should: the dedupe
+// is the point. But it means no row owns its file, and unlinking on behalf of
+// one of them would leave the others still claiming `saved`, still rendering a
+// preview, and 404ing on click. Ask before deleting.
+const siblingCount = db.prepare(
+  'SELECT count(*) AS n FROM media WHERE path = ? AND media_id != ?');
+const pathIsShared = row => !!row.path && siblingCount.get(row.path, row.media_id).n > 0;
 
 // Same rule as assetPath: the row stores a bare filename so WA_MEDIA_DIR can
 // move the whole store without rewriting a single row.
@@ -398,12 +415,19 @@ async function rescanIfNeeded(row) {
   // whole function exists to provide would never fire again.
   if (scan.status === 'skipped' || scan.status === 'error') return row;
 
-  setInboundVerdict.run(scan.status, scan.signature, Date.now(), row.media_id);
   if (scan.status === 'infected') {
+    // Condemn first, unlink second. If the process dies between them the rows
+    // point at a file that still exists — recoverable. The other order leaves
+    // rows vouching for bytes that are already gone.
+    const shared = pathIsShared(row);
+    condemnPath.run(scan.signature, Date.now(), row.path);
     fs.rmSync(file, { force: true });
-    clearInboundFile.run(row.media_id);
-    log('warn', `Removed already-saved media ${row.media_id} — a later scan matched ${scan.signature}`);
+    log('warn', `Removed already-saved media ${row.media_id} — a later scan matched ${scan.signature}`
+      + (shared ? ' (and every other message carrying the same bytes)' : ''));
+    return getInbound(row.media_id);
   }
+
+  setInboundVerdict.run(scan.status, scan.signature, Date.now(), row.media_id);
   return getInbound(row.media_id);
 }
 
@@ -411,4 +435,5 @@ module.exports = {
   MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, headerComponent,
   INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound, rescanIfNeeded,
+  pathIsShared, clearInboundFile,
 };

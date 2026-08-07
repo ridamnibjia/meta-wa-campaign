@@ -15,18 +15,25 @@ const upload = multer({ storage: multer.memoryStorage() });
 router.post('/upload-csv', upload.single('csv'), (req, res) => {
   try {
     if (!req.file) return res.json({ ok: false, error: 'No file received' });
-    const contacts = parseCSV(req.file.buffer);
+    const { contacts, skipped } = parseCSV(req.file.buffer);
     S.contacts = contacts; S.currentIdx = 0; S.phase = 'idle';
     S.failed = S.skipped = 0; S.failLog = [];
     startRun(S.config.templateName);
     saveCampaignNow();
     log('info', `CSV loaded — ${contacts.length} contacts`);
+    // Loudly, and at warn level. A row the parser could not read is a customer
+    // who will not be messaged, and the operator is the only one who can tell
+    // whether that is a blank line at the end of the file or a broken export.
+    if (skipped.length) {
+      log('warn', `CSV — ${skipped.length} row(s) had no usable phone number and were not loaded (rows ${skipped.slice(0, 10).map(s => s.row).join(', ')}${skipped.length > 10 ? '…' : ''})`);
+    }
     broadcast();
 
     const rate     = rateFor(S.config.templateCategory);
     const billable = billableCount(contacts, optOuts);
     res.json({
       ok: true, count: contacts.length, sample: contacts.slice(0, 5),
+      skipped: skipped.length, skippedRows: skipped.slice(0, 20),
       billable, estimate: estimateCost(billable, rate), rate,
     });
   } catch (e) { res.json({ ok: false, error: e.message }); }

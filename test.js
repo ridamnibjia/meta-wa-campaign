@@ -330,14 +330,66 @@ test('rejects empty input', () => assert.equal(normalizePhone(''), null));
 console.log('\nparseCSV');
 test('reads name and mobile, and dedupes', () => {
   const csv = 'First Name,Mobile Phone\nRahul,9000000001\nPriya,9000000002\nDupe,+91 90000 00001\n';
-  const out = parseCSV(Buffer.from(csv));
-  assert.equal(out.length, 2);
-  assert.equal(out[0].name, 'Rahul');
-  assert.equal(out[0].dialStr, '919000000001');
+  const { contacts } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 2);
+  assert.equal(contacts[0].name, 'Rahul');
+  assert.equal(contacts[0].dialStr, '919000000001');
 });
 test('defaults a missing name to Contact', () => {
-  const out = parseCSV(Buffer.from('First Name,Mobile Phone\n,9000000001\n'));
-  assert.equal(out[0].name, 'Contact');
+  const { contacts } = parseCSV(Buffer.from('First Name,Mobile Phone\n,9000000001\n'));
+  assert.equal(contacts[0].name, 'Contact');
+});
+
+// Every case below silently produced ZERO contacts before the RFC 4180 split
+// and the widened header match. A CSV that half-parses is worse than one that
+// fails outright: the operator sees a plausible number and never learns which
+// customers were left out.
+test('a quoted comma in a name does not shift the phone column', () => {
+  const csv = 'Name,Mobile Phone,Notes\n"Doe, John",+919000000001,"member 2024"\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].name, 'Doe, John');
+  assert.equal(contacts[0].dialStr, '919000000001');
+  assert.equal(skipped.length, 0);
+});
+test('a doubled quote inside a quoted field is one literal quote', () => {
+  const { contacts } = parseCSV(Buffer.from('Name,Phone\n"Ali ""Bo"" Rao",+919000000001\n'));
+  assert.equal(contacts[0].name, 'Ali "Bo" Rao');
+});
+test('reads a modern Google Contacts export', () => {
+  const csv = 'First Name,Last Name,Phone 1 - Type,Phone 1 - Value\nAsha,Rao,Mobile,+919000000001\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].name, 'Asha Rao');
+  assert.equal(contacts[0].dialStr, '919000000001');
+  assert.equal(skipped.length, 0, 'the "- Type" column holds "Mobile", which is not a failed row');
+});
+test('a row with no usable number is reported, not dropped in silence', () => {
+  const csv = 'Name,Mobile Phone\nAsha,+919000000001\nRahul,not-a-number\nPriya,\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(skipped.length, 2);
+  assert.deepEqual(skipped.map(s => s.row), [3, 4]);
+  assert.equal(skipped[0].name, 'Rahul');
+});
+test('an account number column is never mistaken for a phone number', () => {
+  // 11 digits, so normalizePhone would happily accept it. The header match is
+  // the only thing standing between a membership id and a message to a stranger.
+  const csv = 'Name,Account Number,Mobile Phone\nAsha,12345678901,+919000000001\n';
+  const { contacts } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].dialStr, '919000000001');
+});
+test('two phone columns on one row both count, deduped', () => {
+  const csv = 'Name,Mobile Phone,Home Phone\nAsha,+919000000001,+919000000002\nDup,+919000000003,+919000000003\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 3);
+  assert.equal(skipped.length, 0, 'a duplicate number is not a row that failed to parse');
+});
+test('a CRLF file does not leave a stray return on the last column', () => {
+  const { contacts } = parseCSV(Buffer.from('Name,Mobile Phone\r\nAsha,+919000000001\r\n'));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].dialStr, '919000000001');
 });
 
 console.log('\nverifySignature');
@@ -2406,6 +2458,60 @@ console.log('\ninbound media — save, serve, expire');
                   VALUES ('mid.neversaved', 'wamid.neversaved', 'image/jpeg', NULL, NULL)`).run();
       sweepMedia();
       assert.equal(db.prepare("SELECT path FROM media WHERE media_id = 'mid.neversaved'").get().path, null);
+    });
+
+    // Saved files are named for their own sha256, so identical bytes arriving
+    // twice — a forwarded photo, one price list sent to two customers — are two
+    // rows over one file with two independent 90-day clocks. The sweep used to
+    // unlink on behalf of whichever row expired first, leaving the other one
+    // still reporting `saved`, still rendering a preview, and 404ing on click.
+    testAsync('an expiring row does not unlink a file another row still points at', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
+                                   Buffer.from(`shared${Date.now()}`)]);
+      const first  = seedInbound({ bytes });
+      const second = seedInbound({ bytes });
+      const save = id => withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      await save(first);
+      await save(second);
+
+      const file = inboundPath(getInbound(first));
+      assert.equal(getInbound(second).path, getInbound(first).path,
+        'identical bytes must dedupe onto one file — that is the premise of this test');
+
+      age(first, 91 * DAY);
+      sweepMedia();
+
+      assert.equal(getInbound(first).path, null, 'the expired row still retires');
+      assert.ok(getInbound(second).path, 'the row inside its own window keeps its claim');
+      assert.ok(fsm.existsSync(file), 'and the bytes it claims are still there');
+
+      // Last row out turns off the lights.
+      age(second, 91 * DAY);
+      sweepMedia();
+      assert.equal(getInbound(second).path, null);
+      assert.ok(!fsm.existsSync(file), 'once nobody points at it, the file goes');
+    });
+
+    testAsync('a later infection verdict condemns every row over the same bytes', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
+                                   Buffer.from(`twins${Date.now()}`)]);
+      const first  = seedInbound({ bytes });
+      const second = seedInbound({ bytes });
+      const save = id => withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      await save(first);
+      await save(second);
+      const file = inboundPath(getInbound(first));
+
+      // Both rows are `skipped` — saved before a scanner existed. Installing one
+      // and asking for the first row is what triggers the rescan.
+      await withClamd('stream: Twin-Test-Signature FOUND\x00',
+        () => rescanIfNeeded(getInbound(first)));
+
+      assert.equal(getInbound(first).scan_status,  'infected');
+      assert.equal(getInbound(second).scan_status, 'infected',
+        'the sibling is the same malware — leaving it `skipped` over deleted bytes is a lie');
+      assert.equal(getInbound(second).path, null);
+      assert.ok(!fsm.existsSync(file));
     });
   }
 

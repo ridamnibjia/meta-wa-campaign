@@ -79,6 +79,13 @@ app.get('/health', (req, res) => res.json({
 auth.mount(app);      // /api/login, /api/logout, /api/session — outside the gate
 routes.mount(app);    // /webhook (signed), then everything behind requireAuth
 
+// Anything under /api that no router claimed is a 404 in JSON, not the SPA
+// shell. Without this the catch-all below answers a mistyped endpoint with a
+// 200 and an HTML login page, which a client cannot tell apart from success.
+app.use('/api', (req, res) => res.status(404).json({
+  error: `No such endpoint: ${req.method} ${req.originalUrl}`,
+}));
+
 // Catch-all: serve the SPA shell for any non-API path.
 app.get('*', (req, res) => {
   const f = path.join(PUBLIC_DIR, 'index.html');
