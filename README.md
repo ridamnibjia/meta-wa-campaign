@@ -756,6 +756,18 @@ a working default.
 | `API_VERSION` | `v23.0` | Meta Graph API version. |
 | `PORT` | `3000` | Server port. |
 
+### Inbound media safety
+
+See [Inbound customer media](#inbound-customer-media) for what these actually do.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLAMAV_ADDRESS` | unset | Unix socket path (`/var/run/clamav/clamd.ctl`) or `host:port` for `clamd`. Unset disables scanning and files are labelled "not virus-scanned". Set but unreachable **refuses saves** rather than silently passing them. Budget ~1 GB RAM for `clamd`. |
+| `CLAMAV_TIMEOUT_MS` | `30000` | How long to wait for a scan verdict before refusing the save. |
+| `WA_MEDIA_RETENTION_DAYS` | `90` | How long a saved inbound file stays on this server. The row survives the sweep; only the bytes go. |
+| `WA_MEDIA_MAX_BYTES` | `104857600` | Largest inbound file this server will download (100 MB — Meta's own document maximum). |
+| `WA_MEDIA_MIN_FREE_BYTES` | `2147483648` | Free-disk floor (2 GB) below which saves are refused, so a download cannot fill the disk out from under SQLite. |
+
 ### Pricing (cost estimates only — never affects what Meta charges)
 
 | Variable | Default | Description |
@@ -832,6 +844,111 @@ best customers or plant fake conversations.
   jurisdictions, and a public repo is a permanent, indexed, un-deletable copy.
 - Set `FRONTEND_URL` to your exact frontend origin in production if you split the
   deployment. Leave it blank when the backend serves the UI itself.
+
+### Inbound customer media
+
+A customer can send you anything WhatsApp accepts. Everything below is about
+that: files this app did not create, from people you may never have met.
+
+**Nothing downloads automatically.** The webhook records a *descriptor* — media
+id, mime type, filename, size, checksum — and stops there. The bytes only reach
+this server when an operator clicks **Save** on that specific attachment.
+
+#### Files are classified from three signals, not one
+
+The mime type on the row is a string the sender chose, and so is the filename.
+Trusting either alone is how `invoice.pdf` turns out to be an executable. So
+every saved file gets a verdict from three independent signals — the declared
+mime, the filename extension, and the file's actual leading bytes — and the
+**worst** of the three wins.
+
+| Tier | Examples | What happens |
+|---|---|---|
+| `safe` | JPEG, PNG, WebP, GIF, WhatsApp audio and video | Previews in the thread |
+| `ok` | PDF, docx/xlsx/pptx, txt | Downloads as a file. Never rendered. |
+| `warn` | zip/rar/7z, macro Office (docm/xlsm), csv, rtf, xml, legacy `.doc`/`.xls` | Downloads behind a confirmation |
+| `block` | exe, msi, bat, vbs, ps1, jar, apk, dmg, iso, hta, reg, **html**, **svg** | Refused. Downloadable only by explicitly accepting the risk. |
+
+Two rules are worth stating outright:
+
+- **`safe` requires all three signals to agree.** A file declared `image/png`
+  whose bytes match no image signature is demoted to `ok` and downloads instead
+  of previewing. This costs inline preview on exotic formats like HEIC and TIFF.
+  It buys the guarantee that nothing renders in your browser on a stranger's
+  say-so.
+- **Zip is resolved by extension**, because it cannot be resolved any other way:
+  `.docx`, `.xlsx`, `.apk` and `.jar` are all literally zip files with identical
+  magic bytes. `.apk`/`.jar` block, `.docm`/`.xlsm` warn, `.docx`/`.xlsx` are ok,
+  a bare `.zip` warns.
+
+Regardless of tier, every response carries `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox; default-src 'none'`, and anything but `safe`
+is served as `application/octet-stream`.
+
+#### Virus scanning with ClamAV (optional)
+
+If you point the app at a running `clamd`, every file is scanned **in memory,
+before a single byte is written to disk** — so a signature hit never leaves
+malware on the filesystem at all, not even briefly.
+
+```bash
+# Debian / Ubuntu
+sudo apt install clamav clamav-daemon
+sudo systemctl enable --now clamav-freshclam clamav-daemon
+```
+
+```bash
+# .env
+CLAMAV_ADDRESS=/var/run/clamav/clamd.ctl
+# or, if clamd listens on TCP:
+# CLAMAV_ADDRESS=127.0.0.1:3310
+CLAMAV_TIMEOUT_MS=30000
+```
+
+**Budget about 1 GB of RAM.** `clamd` holds the entire signature database in
+memory, and that number — not CPU, not disk — is what decides whether you can
+run it. On a 1 GB VM, leave `CLAMAV_ADDRESS` unset.
+
+Prove it actually works before you trust it. EICAR is a harmless standard test
+string every scanner is required to flag:
+
+```bash
+curl -s https://secure.eicar.org/eicar.com -o /tmp/eicar.txt
+clamdscan /tmp/eicar.txt      # must print: … Eicar-Signature FOUND
+rm /tmp/eicar.txt
+```
+
+The unset-versus-broken distinction is deliberate and matters:
+
+| `CLAMAV_ADDRESS` | Behaviour |
+|---|---|
+| Unset | Files save normally, labelled **"Not virus-scanned"** in the thread. The app works without a scanner. |
+| Set, daemon healthy | Clean files save. A signature hit is **refused and never written**. |
+| Set, daemon down or timing out | **Saves are refused.** Never a silent "clean". |
+
+An operator who asked for a scanner should not quietly stop getting one. A file
+saved before you installed ClamAV is scanned the first time anyone requests it,
+so turning scanning on later still covers what is already on disk.
+
+#### How long files are kept — two separate clocks
+
+| Clock | Window | Who enforces it |
+|---|---|---|
+| Meta's copy | **30 days** from the message | Meta. Nothing you can do about it. |
+| Your saved copy | **90 days** from download (`WA_MEDIA_RETENTION_DAYS`) | This app, swept on boot and daily. |
+| The chat itself | Indefinite | Never swept — message history is not media. |
+
+When a file is swept, only the bytes go: the message and its attachment row
+survive, and the bubble reverts to a **Save** button. If the message is by then
+older than 30 days, that Save honestly reports Meta deleted its copy too.
+
+#### The honest limit
+
+An operator who clicks through the confirmation on a `block` file can still put
+an executable in their own Downloads folder. That is their machine and their
+decision. What this app guarantees is narrower and worth stating plainly: such a
+file is **never rendered inline, never content-sniffable, and never one click
+away**.
 
 ---
 
