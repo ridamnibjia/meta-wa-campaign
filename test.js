@@ -1858,7 +1858,10 @@ console.log('\ninbound media — save, serve, expire');
   // 409, not 404: "you have not downloaded this yet" and "no such media" are
   // different problems with different fixes, and the UI acts on the difference.
   testAsync('GET before save is a 409, after save streams the bytes', async () => {
-    const bytes = Buffer.from(`route-${Date.now()}`);
+    // Real JPEG magic, not a made-up string: `safe` now requires the bytes to
+    // agree with the declared type, so a fixture that only claims to be an
+    // image would (correctly) come back as a download.
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(`route-${Date.now()}`)]);
     const id = seedInbound({ bytes });
     const s = await serve();
     try {
@@ -1894,6 +1897,11 @@ console.log('\ninbound media — save, serve, expire');
   // Meta relays it, it is not ours. Reflecting a script-capable type back with
   // `inline` would run that script on the same origin as the dashboard, with
   // the operator's session cookie attached.
+  //
+  // These types are now `block`, so the default answer is a refusal rather than
+  // a hardened download. The original guarantee still has to hold on the far
+  // side of an explicit risk=accept, which is what the second half asserts:
+  // accepting the risk buys the bytes, never the rendering.
   for (const hostile of ['text/html', 'image/svg+xml', 'application/xhtml+xml']) {
     testAsync(`a customer-supplied ${hostile} attachment is never served inline`, async () => {
       const bytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>fetch("/api/config")</script></svg>');
@@ -1901,11 +1909,15 @@ console.log('\ninbound media — save, serve, expire');
       const s = await serve();
       try {
         const base = `http://127.0.0.1:${s.address().port}`;
-        await withToken(() => withMeta(metaOk(bytes, hostile), async () => {
+        await withoutScanner(() => withToken(() => withMeta(metaOk(bytes, hostile), async () => {
           await fetch(`${base}/api/media/inbound/${id}`, { method: 'POST', ...asOperator });
-        }));
+        })));
 
-        const r = await fetch(`${base}/api/media/inbound/${id}`, asOperator);
+        const refused = await fetch(`${base}/api/media/inbound/${id}`, asOperator);
+        assert.equal(refused.status, 403, 'a script-capable type is not served at all by default');
+        assert.equal((await refused.json()).risk, 'block');
+
+        const r = await fetch(`${base}/api/media/inbound/${id}?risk=accept`, asOperator);
         assert.equal(r.status, 200);
         assert.match(r.headers.get('content-disposition'), /^attachment/,
           'a script-capable type must download, never render');
@@ -1920,7 +1932,7 @@ console.log('\ninbound media — save, serve, expire');
   }
 
   testAsync('a real image is still served inline, and still hardened', async () => {
-    const bytes = Buffer.from(`safe-${Date.now()}`);
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(`safe-${Date.now()}`)]);
     const id = seedInbound({ bytes, mime: 'image/jpeg' });
     const s = await serve();
     try {
@@ -1939,7 +1951,7 @@ console.log('\ninbound media — save, serve, expire');
   // allowlist on the full string would push every voice note down the
   // attachment path and silently break the audio player.
   testAsync('a mime type with parameters still matches the allowlist', async () => {
-    const bytes = Buffer.from(`voice-${Date.now()}`);
+    const bytes = Buffer.concat([Buffer.from('OggS\x00\x02'), Buffer.from(`voice-${Date.now()}`)]);
     const id = seedInbound({ bytes, mime: 'audio/ogg; codecs=opus', type: 'audio' });
     const s = await serve();
     try {
@@ -2128,6 +2140,136 @@ console.log('\ninbound media — save, serve, expire');
       const after = await withClamd('stream: Would-Have-Failed FOUND\x00', () => rescanIfNeeded(getInbound(id)));
       assert.equal(after.scan_status, 'clean');
       assert.equal(after.scan_at, before, 'a clean row is not rescanned on every request');
+    });
+  }
+
+  // ── Serving: the verdict is what decides inline / attachment / refusal ───────
+  console.log('\ninbound media — serving by risk');
+  {
+    // The section above already proved saveInbound stores the verdict. These
+    // set it directly so each test names exactly the tier it is about, rather
+    // than hiding it behind a magic-byte fixture.
+    const setRisk = (id, risk, scan = 'clean') =>
+      db.prepare('UPDATE media SET risk = ?, scan_status = ? WHERE media_id = ?').run(risk, scan, id);
+
+    const savedFile = async (opts = {}) => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
+                                   Buffer.from(`s${Date.now()}${Math.random()}`)]);
+      const id = seedInbound({ bytes, ...opts });
+      await withoutScanner(() => withToken(() =>
+        withMeta(metaOk(bytes, opts.mime || 'image/jpeg'), () => saveInbound(id))));
+      return id;
+    };
+
+    const get = async (id, qs = '') => {
+      const s = await serve();
+      try {
+        return await fetch(`http://127.0.0.1:${s.address().port}/api/media/inbound/${id}${qs}`, asOperator);
+      } finally { s.close(); }
+    };
+
+    testAsync('a safe file still renders inline', async () => {
+      const id = await savedFile();
+      setRisk(id, 'safe');
+      const r = await get(id);
+      assert.equal(r.status, 200);
+      assert.match(r.headers.get('content-disposition'), /^inline/);
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+      assert.match(r.headers.get('content-security-policy'), /sandbox/);
+    });
+
+    testAsync('an ok file downloads as an attachment', async () => {
+      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: 'invoice.pdf' });
+      setRisk(id, 'ok');
+      const r = await get(id);
+      assert.equal(r.status, 200);
+      assert.match(r.headers.get('content-disposition'), /^attachment/);
+    });
+
+    testAsync('a warn file is always opaque bytes, never its declared type', async () => {
+      const id = await savedFile({ mime: 'image/jpeg', filename: 'archive.zip' });
+      setRisk(id, 'warn');
+      const r = await get(id);
+      assert.equal(r.status, 200);
+      assert.match(r.headers.get('content-disposition'), /^attachment/);
+      assert.match(r.headers.get('content-type'), /application\/octet-stream/);
+    });
+
+    testAsync('a block file is refused, and the refusal says why', async () => {
+      const id = await savedFile({ mime: 'text/html', type: 'document', filename: 'page.html' });
+      setRisk(id, 'block');
+      const r = await get(id);
+      assert.equal(r.status, 403);
+      const body = await r.json();
+      assert.equal(body.risk, 'block');
+      assert.ok(body.reason, 'the operator has to be told what they would be accepting');
+    });
+
+    testAsync('risk=accept releases a block file as an attachment, never inline', async () => {
+      const id = await savedFile({ mime: 'text/html', type: 'document', filename: 'page.html' });
+      setRisk(id, 'block');
+      const r = await get(id, '?risk=accept');
+      assert.equal(r.status, 200);
+      assert.match(r.headers.get('content-disposition'), /^attachment/);
+      assert.match(r.headers.get('content-type'), /application\/octet-stream/);
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+      assert.match(r.headers.get('content-security-policy'), /sandbox/);
+    });
+
+    testAsync('risk=accept is not a general override — it cannot force inline', async () => {
+      const id = await savedFile({ mime: 'image/jpeg' });
+      setRisk(id, 'block');
+      const r = await get(id, '?risk=accept');
+      assert.match(r.headers.get('content-disposition'), /^attachment/,
+        'an image mime on a blocked row must not buy back inline rendering');
+      assert.match(r.headers.get('content-type'), /application\/octet-stream/);
+    });
+
+    testAsync('an oversize scan floors the tier at warn — a safe image stops rendering inline', async () => {
+      const id = await savedFile();
+      setRisk(id, 'safe', 'oversize');
+      const r = await get(id);
+      assert.match(r.headers.get('content-disposition'), /^attachment/,
+        'a file too big for the scanner is a file nobody vouched for');
+    });
+
+    testAsync('?download=1 forces an attachment even for a safe file', async () => {
+      const id = await savedFile();
+      setRisk(id, 'safe');
+      const r = await get(id, '?download=1');
+      assert.match(r.headers.get('content-disposition'), /^attachment/);
+    });
+
+    testAsync('a row with no verdict at all is treated as ok, not safe', async () => {
+      const id = await savedFile();
+      db.prepare('UPDATE media SET risk = NULL WHERE media_id = ?').run(id);
+      const r = await get(id);
+      assert.match(r.headers.get('content-disposition'), /^attachment/,
+        'a row saved before this feature existed must not inherit inline rendering');
+    });
+
+    testAsync('an infected row is refused at serve time too', async () => {
+      const id = await savedFile();
+      db.prepare("UPDATE media SET scan_status = 'infected', scan_signature = 'Test-Sig' WHERE media_id = ?").run(id);
+      const r = await get(id);
+      assert.equal(r.status, 403);
+      assert.equal((await r.json()).scan, 'infected');
+    });
+
+    testAsync('the filename is sent RFC5987-encoded so a unicode name survives', async () => {
+      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: 'फ़ाइल.pdf' });
+      setRisk(id, 'ok');
+      const r = await get(id);
+      assert.match(r.headers.get('content-disposition'), /filename\*=UTF-8''/);
+    });
+
+    testAsync('a quote in a customer filename cannot break out of the header', async () => {
+      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: 'a";x=1;b="c.pdf' });
+      setRisk(id, 'ok');
+      const r = await get(id);
+      const cd = r.headers.get('content-disposition');
+      assert.ok(cd, 'the header must still be parseable at all');
+      assert.equal((cd.match(/"/g) || []).length, 2, 'exactly one quoted filename, no injected parameters');
     });
   }
 }
