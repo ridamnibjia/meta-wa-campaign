@@ -15,6 +15,7 @@ const auth   = require('./src/middleware/auth');
 const routes = require('./src/routes');
 const { buildState } = require('./src/services/status');
 const { resumeIfInterrupted } = require('./src/services/campaign');
+const { startRetention } = require('./src/services/retention');
 const { migrateJsonToSql } = require('./src/services/migrate');
 const { unprocessedWebhookCount } = require('./src/services/messages');
 
@@ -116,6 +117,7 @@ if (!CFG.appPassword)   console.warn('[WARN] APP_PASSWORD not set — the API is
 if (require.main === module) {
   migrateJsonToSql(undefined, undefined, { templateName: S.config.templateName || null });
   resumeIfInterrupted();
+  startRetention();
   server.listen(CFG.port, () => {
     console.log(`\n[WA-CAMPAIGN] Server running → http://localhost:${CFG.port}`);
     console.log(`[WA-CAMPAIGN] Phone Number ID : ${CFG.phoneNumberId || 'NOT SET'}`);
@@ -140,6 +142,7 @@ module.exports = {
   ...require('./src/services/media'),
   ...require('./src/lib/filerisk'),
   ...require('./src/lib/clamav'),
+  ...require('./src/services/retention'),
   isWindowOpen:   require('./src/services/inbox').isWindowOpen,
   recordInbound:  require('./src/services/inbox').recordInbound,
   inboxSummary:   require('./src/services/inbox').summary,

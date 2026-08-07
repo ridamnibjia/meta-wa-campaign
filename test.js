@@ -35,7 +35,7 @@ const {
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
-  saveInbound, inboundPath, getInbound, INBOUND_TTL_MS, rescanIfNeeded,
+  saveInbound, inboundPath, getInbound, INBOUND_TTL_MS, rescanIfNeeded, sweepMedia,
   classify, sniff, extOf, worst, TIERS,
   scanBuffer, parseReply, scannerConfigured, EICAR,
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
@@ -2270,6 +2270,111 @@ console.log('\ninbound media — save, serve, expire');
       const cd = r.headers.get('content-disposition');
       assert.ok(cd, 'the header must still be parseable at all');
       assert.equal((cd.match(/"/g) || []).length, 2, 'exactly one quoted filename, no injected parameters');
+    });
+  }
+
+  // ── Retention: our 90-day clock, not Meta's 30-day one ──────────────────────
+  console.log('\ninbound media — retention');
+  {
+    const { MEDIA_LIMITS } = require('./src/config');
+    const DAY = 24 * 60 * 60 * 1000;
+    const age = (id, ms) => db.prepare('UPDATE media SET downloaded_at = ? WHERE media_id = ?')
+      .run(Date.now() - ms, id);
+
+    const saveOne = async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
+                                   Buffer.from(`k${Date.now()}${Math.random()}`)]);
+      const id = seedInbound({ bytes });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      return id;
+    };
+
+    testAsync('a file older than the window is unlinked and the row keeps its history', async () => {
+      const id = await saveOne();
+      const file = inboundPath(getInbound(id));
+      age(id, 91 * DAY);
+
+      const r = sweepMedia();
+      assert.ok(r.swept >= 1);
+      assert.ok(!fsm.existsSync(file), 'the bytes must actually leave the disk');
+
+      const row = getInbound(id);
+      assert.equal(row.path, null, 'path clears so the bubble reverts to a Save button');
+      assert.ok(row.media_id, 'the row itself survives — message history is not media');
+      assert.equal(row.risk, 'safe', 'the verdict survives too, so a re-save need not re-derive it');
+    });
+
+    testAsync('a file inside the window is left alone', async () => {
+      const id = await saveOne();
+      const file = inboundPath(getInbound(id));
+      age(id, 89 * DAY);
+
+      sweepMedia();
+      assert.ok(fsm.existsSync(file));
+      assert.ok(getInbound(id).path);
+    });
+
+    testAsync('the window is configurable', async () => {
+      const saved = MEDIA_LIMITS.retentionDays;
+      MEDIA_LIMITS.retentionDays = 1;
+      try {
+        const id = await saveOne();
+        age(id, 2 * DAY);
+        sweepMedia();
+        assert.equal(getInbound(id).path, null);
+      } finally { MEDIA_LIMITS.retentionDays = saved; }
+    });
+
+    testAsync('a swept file can be saved again from Meta', async () => {
+      // Same bytes on the second fetch, because the row still carries the
+      // sha256 the webhook recorded — a sweep clears the file, never the
+      // receipt, so a re-download that does not match is still refused.
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`again${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+
+      age(id, 91 * DAY);
+      sweepMedia();
+      assert.equal(getInbound(id).path, null);
+
+      // The message itself is recent here, so Meta still has it. The point is
+      // that a swept row is savable at all rather than permanently blank.
+      const again = await withoutScanner(() => withToken(() =>
+        withMeta(metaOk(bytes), () => saveInbound(id))));
+      assert.equal(again.ok, true);
+      assert.ok(getInbound(id).path);
+    });
+
+    test('a row whose file is already gone is cleaned up without an error', () => {
+      db.prepare(`INSERT OR REPLACE INTO media (media_id, wamid, mime_type, path, downloaded_at)
+                  VALUES ('mid.ghost', 'wamid.ghost', 'image/jpeg', 'not-on-disk.jpg', 1)`).run();
+      const r = sweepMedia();
+      assert.equal(r.errors, 0, 'a missing file is the expected end state, not a failure');
+      assert.equal(db.prepare("SELECT path FROM media WHERE media_id = 'mid.ghost'").get().path, null);
+    });
+
+    test('a path that escapes the media directory is refused, not unlinked', () => {
+      db.prepare(`INSERT OR REPLACE INTO media (media_id, wamid, mime_type, path, downloaded_at)
+                  VALUES ('mid.escape', 'wamid.escape', 'image/jpeg', '../../../etc/hosts', 1)`).run();
+      const r = sweepMedia();
+      assert.ok(r.errors >= 1, 'a tampered path must be reported, never followed');
+      assert.equal(db.prepare("SELECT path FROM media WHERE media_id = 'mid.escape'").get().path,
+        '../../../etc/hosts', 'and it must not be quietly cleared either');
+      db.prepare("DELETE FROM media WHERE media_id = 'mid.escape'").run();
+    });
+
+    test('sweeping twice is a no-op the second time', () => {
+      sweepMedia();
+      const second = sweepMedia();
+      assert.equal(second.swept, 0);
+      assert.equal(second.errors, 0);
+    });
+
+    test('a never-downloaded row is not swept', () => {
+      db.prepare(`INSERT OR REPLACE INTO media (media_id, wamid, mime_type, path, downloaded_at)
+                  VALUES ('mid.neversaved', 'wamid.neversaved', 'image/jpeg', NULL, NULL)`).run();
+      sweepMedia();
+      assert.equal(db.prepare("SELECT path FROM media WHERE media_id = 'mid.neversaved'").get().path, null);
     });
   }
 }
