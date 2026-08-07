@@ -2377,6 +2377,56 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(db.prepare("SELECT path FROM media WHERE media_id = 'mid.neversaved'").get().path, null);
     });
   }
+
+  // ── What the thread hands the UI ────────────────────────────────────────────
+  console.log('\ninbound media — what the thread hands the UI');
+  {
+    const entryFor = id => inboxThread('910000000001').messages
+      .find(m => m.media && m.media.mediaId === id);
+
+    testAsync('a thread entry carries the risk verdict the UI renders from', async () => {
+      const bytes = Buffer.concat([Buffer.from('MZ\x90\x00'), Buffer.from(`w${Date.now()}`)]);
+      const id = seedInbound({ bytes, mime: 'application/pdf', type: 'document', filename: 'invoice.pdf' });
+      await withoutScanner(() => withToken(() =>
+        withMeta(metaOk(bytes, 'application/pdf'), () => saveInbound(id))));
+
+      const e = entryFor(id);
+      assert.ok(e, 'the message with this media must be in the thread');
+      assert.equal(e.media.risk, 'block');
+      assert.equal(e.media.scanStatus, 'skipped');
+      assert.ok(e.media.riskReason, 'the UI needs a sentence, not just a tier name');
+    });
+
+    testAsync('a scanned safe photo reports clean', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`g${Date.now()}`)]);
+      const id = seedInbound({ bytes, filename: 'photo.jpg' });
+      await withClamd('stream: OK\x00', () =>
+        withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+
+      const e = entryFor(id);
+      assert.equal(e.media.risk, 'safe');
+      assert.equal(e.media.scanStatus, 'clean');
+    });
+
+    test('an unsaved media entry reports no verdict rather than a wrong one', () => {
+      const id = seedInbound({ bytes: Buffer.from(`v${Date.now()}`) });
+      const e = entryFor(id);
+      assert.equal(e.media.saved, false);
+      assert.equal(e.media.risk, null, 'a red warning on a file nothing has looked at would be a lie');
+      assert.equal(e.media.scanStatus, null);
+    });
+
+    testAsync('a saved row from before this feature reads as ok, never safe', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`h${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      db.prepare('UPDATE media SET risk = NULL, scan_status = NULL WHERE media_id = ?').run(id);
+
+      const e = entryFor(id);
+      assert.equal(e.media.risk, 'ok');
+      assert.equal(e.media.scanStatus, 'skipped');
+    });
+  }
 }
 
 console.log('\nfile risk classification');

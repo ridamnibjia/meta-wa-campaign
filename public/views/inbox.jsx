@@ -16,12 +16,22 @@ const fileSize = n => !n ? ''
 // live on Meta's servers, reachable only with our access token, and the browser
 // has no token — so Save round-trips through the server, which then serves the
 // file from disk behind the same session cookie as every other page.
+//
+// The server decides what is safe; this only renders that decision. Any check
+// here would be a second, drifting copy of a rule the server already enforces —
+// a `block` file is refused by the API whether or not this code asks nicely.
+const RISK_COPY = {
+  warn:  'Archives and macro-capable documents are a common way to deliver malware.',
+  block: 'This file type can run code on your computer. We will not preview it.',
+};
+
 function Attachment({ media, onSaved }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const src = `/api/media/inbound/${encodeURIComponent(media.mediaId)}`;
   const kind = (media.mime || '').split('/')[0];
   const label = media.filename || `${kind || 'file'} attachment`;
+  const icon = kind === 'image' ? '▣' : kind === 'video' ? '▶' : kind === 'audio' ? '♪' : '▤';
 
   if (media.expired) {
     return (
@@ -42,7 +52,7 @@ function Attachment({ media, onSaved }) {
     return (
       <div className="mb-1">
         <div className="flex items-center gap-2 rounded border border-border bg-background/60 px-2 py-1.5">
-          <span className="text-base leading-none">{kind === 'image' ? '▣' : kind === 'video' ? '▶' : kind === 'audio' ? '♪' : '▤'}</span>
+          <span className="text-base leading-none">{icon}</span>
           <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
           {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
           <Button size="sm" variant="outline" disabled={saving} onClick={save}>
@@ -54,22 +64,100 @@ function Attachment({ media, onSaved }) {
     );
   }
 
-  if (kind === 'image') {
+  // Saved, but the server will not hand it over without an explicit acceptance.
+  // The confirm() IS the gate on this side: two deliberate clicks, and what
+  // arrives is still opaque bytes the browser has been told not to sniff.
+  if (media.risk === 'block' || media.risk === 'warn') {
+    const blocked = media.risk === 'block';
+    const why = media.riskReason || RISK_COPY[media.risk];
+    const confirmDownload = e => {
+      if (!window.confirm(`${why}\n\nDownload "${label}" anyway?`)) e.preventDefault();
+    };
     return (
-      <a href={src} target="_blank" rel="noreferrer" className="mb-1 block">
-        <img src={src} alt={label} className="max-h-[260px] max-w-full rounded" />
-      </a>
+      <div className={cn('mb-1 rounded border px-2 py-1.5',
+        blocked ? 'border-destructive/60 bg-destructive/5' : 'border-amber-500/60 bg-amber-500/5')}>
+        <div className="flex items-center gap-2">
+          <span className="text-base leading-none">{blocked ? '⚠' : '▲'}</span>
+          <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
+          {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
+          <a href={blocked ? `${src}?risk=accept&download=1` : `${src}?download=1`}
+             onClick={confirmDownload}
+             className="shrink-0 text-xs font-medium text-primary underline-offset-4 hover:underline">
+            Download anyway
+          </a>
+        </div>
+        <p className="mt-1 text-[11px] text-muted-foreground">{why}</p>
+        {media.scanStatus === 'skipped' && (
+          <p className="mt-0.5 text-[10px] text-muted-foreground">
+            Not virus-scanned — no scanner is configured on this server.
+          </p>
+        )}
+      </div>
     );
   }
-  if (kind === 'video') return <video src={src} controls className="mb-1 max-h-[260px] max-w-full rounded" />;
-  if (kind === 'audio') return <audio src={src} controls className="mb-1 w-full" />;
+
+  // Inline preview needs the server's `safe` verdict, not just a mime prefix.
+  // The server would refuse to render anything else anyway; matching it here is
+  // what stops the UI requesting an <img> that comes back as a download.
+  if (media.risk === 'safe') {
+    if (kind === 'image') {
+      return (
+        <a href={src} target="_blank" rel="noreferrer" className="mb-1 block">
+          <img src={src} alt={label} className="max-h-[260px] max-w-full rounded" />
+        </a>
+      );
+    }
+    if (kind === 'video') return <video src={src} controls className="mb-1 max-h-[260px] max-w-full rounded" />;
+    if (kind === 'audio') return <audio src={src} controls className="mb-1 w-full" />;
+  }
 
   return (
     <div className="mb-1 flex items-center gap-2 rounded border border-border bg-background/60 px-2 py-1.5">
-      <span className="text-base leading-none">▤</span>
+      <span className="text-base leading-none">{icon}</span>
       <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
       {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
       <a href={`${src}?download=1`} className="text-xs text-primary underline-offset-4 hover:underline">Download</a>
+    </div>
+  );
+}
+
+// One popover on the thread header, not one per bubble. Everything an operator
+// needs to know about where these files live and how long they last is the same
+// for every attachment in the thread, so repeating it forty times is noise.
+function MediaInfo() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative shrink-0">
+      <button type="button" onClick={() => setOpen(o => !o)}
+              aria-label="About saved attachments" aria-expanded={open}
+              className="flex h-6 w-6 items-center justify-center rounded-full border border-border text-[11px] font-medium text-muted-foreground hover:bg-accent">
+        i
+      </button>
+      {open && (
+        <>
+          {/* Full-screen catcher so a click anywhere else closes it — cheaper
+              and more reliable than a document listener that has to be torn
+              down on unmount. */}
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 z-20 mt-2 w-72 rounded-lg border border-border bg-card p-3 text-left shadow-lg">
+            <p className="mb-2 text-xs font-semibold">Attachments in this thread</p>
+            <dl className="space-y-2 text-[11px] leading-snug text-muted-foreground">
+              <div>
+                <dt className="font-medium text-foreground">Save to server</dt>
+                <dd>Pulls the file from WhatsApp onto this app's storage so it outlives Meta's copy. Nothing is fetched until you click it.</dd>
+              </div>
+              <div>
+                <dt className="font-medium text-foreground">Download</dt>
+                <dd>Copies the file to your own computer. Anything we flag asks you to confirm first.</dd>
+              </div>
+              <div>
+                <dt className="font-medium text-foreground">How long things are kept</dt>
+                <dd>Chats: indefinitely · Files saved here: 90 days · Meta's own copy: 30 days from the message.</dd>
+              </div>
+            </dl>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -120,6 +208,7 @@ function Thread({ waId, onBack }) {
         <Badge variant={data.windowOpen ? 'success' : 'outline'}>
           {data.windowOpen ? `Reply window ${countdown(msLeft)}` : 'Window closed'}
         </Badge>
+        <MediaInfo />
       </div>
 
       <div className="flex-1 space-y-2 overflow-y-auto bg-muted/30 p-4">

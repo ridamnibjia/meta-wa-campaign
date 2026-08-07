@@ -173,7 +173,8 @@ const getThread = db.prepare('SELECT wa_id, name, last_inbound_at FROM threads W
 // honest answer to "show me the conversation" is all of it.
 const getMessages = db.prepare(`
   SELECT m.wamid, m.dir, m.type, m.body, m.at, m.status,
-         md.media_id, md.mime_type, md.filename, md.file_size, md.path
+         md.media_id, md.mime_type, md.filename, md.file_size, md.path,
+         md.risk, md.risk_reason, md.scan_status, md.scan_signature
     FROM messages m
     LEFT JOIN media md ON md.wamid = m.wamid
    WHERE m.wa_id = ? ORDER BY m.at ASC, m.rowid ASC
@@ -195,6 +196,14 @@ const toEntry = (r, now = Date.now()) => ({
     size:     r.file_size,
     saved:    !!r.path,
     expired:  !r.path && (now - r.at) > INBOUND_TTL_MS,
+    // A verdict is only meaningful once there are bytes to have a verdict
+    // about. Reporting a tier for an unsaved row would put a red warning on a
+    // file nothing has looked at — and `ok` is the floor for a saved row whose
+    // `risk` is NULL because it predates classification.
+    risk:          r.path ? (r.risk || 'ok') : null,
+    riskReason:    r.path ? r.risk_reason : null,
+    scanStatus:    r.path ? (r.scan_status || 'skipped') : null,
+    scanSignature: r.scan_signature || null,
   } : null,
 });
 
