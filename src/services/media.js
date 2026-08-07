@@ -392,7 +392,11 @@ async function rescanIfNeeded(row) {
   if (!fs.existsSync(file)) return row;
 
   const scan = await scanBuffer(fs.readFileSync(file));
-  if (scan.status === 'skipped') return row;
+  // Leave the row `skipped` on both no-op outcomes. Persisting an `error` here
+  // would be worse than doing nothing: a daemon that was restarting for one
+  // request would mark the file permanently unscannable, and the retry this
+  // whole function exists to provide would never fire again.
+  if (scan.status === 'skipped' || scan.status === 'error') return row;
 
   setInboundVerdict.run(scan.status, scan.signature, Date.now(), row.media_id);
   if (scan.status === 'infected') {

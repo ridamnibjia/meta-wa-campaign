@@ -4,7 +4,7 @@ const fs      = require('fs');
 const multer  = require('multer');
 const { MEDIA_KINDS, saveUpload, listAssets, getAsset, assetPath,
         getInbound, inboundPath, saveInbound, rescanIfNeeded } = require('../services/media');
-const { worst } = require('../lib/filerisk');
+const { effectiveRisk } = require('../lib/filerisk');
 const { log } = require('../state');
 
 const router = express.Router();
@@ -80,9 +80,15 @@ router.post('/media/inbound/:mediaId', async (req, res) => {
 // RFC 5987's filename*= form. The plain filename= stays as a fallback for
 // anything that predates it, stripped to ASCII so a quote or a backslash in a
 // customer's filename cannot break out of the header.
+// encodeURIComponent leaves !'()* alone, and none of those are attr-char in
+// RFC 5987's ext-value grammar — an apostrophe in particular is the delimiter,
+// so a filename containing one would split the header. Percent-encode them too.
+const rfc5987 = s => encodeURIComponent(s).replace(/['()!*]/g,
+  c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+
 const disposition = (kind, name) => {
   const ascii = String(name).replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
-  return `${kind}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  return `${kind}; filename="${ascii}"; filename*=UTF-8''${rfc5987(String(name))}`;
 };
 
 router.get('/media/inbound/:mediaId', async (req, res) => {
@@ -106,14 +112,10 @@ router.get('/media/inbound/:mediaId', async (req, res) => {
   const file = inboundPath(row);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'The file for this media is missing from disk' });
 
-  // The stored tier is the worst of three signals taken at save time. NULL
-  // means the row predates classification, and `ok` — downloads, never
-  // renders — is the honest verdict for a file nothing has looked at.
-  //
-  // A file clamd could not scan because it was too big is nobody's vouched-for
-  // file, so it floors at warn however innocent its bytes looked.
-  let risk = row.risk || 'ok';
-  if (row.scan_status === 'oversize') risk = worst(risk, 'warn');
+  // The same function the inbox uses to decide whether to render an <img>.
+  // Sharing it is what stops the UI asking for a preview this route has
+  // already decided to refuse.
+  const risk = effectiveRisk(row.risk, row.scan_status);
 
   if (risk === 'block' && req.query.risk !== 'accept') {
     return res.status(403).json({

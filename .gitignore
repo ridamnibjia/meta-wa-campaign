@@ -41,3 +41,4 @@ docs/
 # exception — it is synthetic and deliberately tracked.
 *.csv
 !contacts-template.csv
+.playwright-mcp/

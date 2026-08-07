@@ -2128,6 +2128,24 @@ console.log('\ninbound media — save, serve, expire');
       assert.ok(!fsm.existsSync(file), 'a late signature hit must remove the bytes, not just relabel them');
     });
 
+    testAsync('a transient rescan failure leaves the row retryable', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`f${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+
+      // The daemon is configured but refuses the connection this once.
+      const savedAddr = CLAMAV.address; CLAMAV.address = '127.0.0.1:1';
+      let after;
+      try { after = await rescanIfNeeded(getInbound(id)); }
+      finally { CLAMAV.address = savedAddr; }
+      assert.equal(after.scan_status, 'skipped',
+        'persisting the error would make one restarting daemon mark the file permanently unscannable');
+
+      // And the retry this function exists to provide still fires.
+      const retried = await withClamd('stream: OK\x00', () => rescanIfNeeded(getInbound(id)));
+      assert.equal(retried.scan_status, 'clean');
+    });
+
     testAsync('rescanIfNeeded leaves an already-clean row alone', async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`q${Date.now()}`)]);
       const id = seedInbound({ bytes });
@@ -2270,6 +2288,19 @@ console.log('\ninbound media — save, serve, expire');
       const cd = r.headers.get('content-disposition');
       assert.ok(cd, 'the header must still be parseable at all');
       assert.equal((cd.match(/"/g) || []).length, 2, 'exactly one quoted filename, no injected parameters');
+    });
+
+    testAsync("an apostrophe cannot split the RFC5987 filename*", async () => {
+      // The apostrophe is ext-value's own delimiter, and encodeURIComponent
+      // leaves it alone — so an unencoded one turns filename*=UTF-8''x into a
+      // header a parser reads differently than intended.
+      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: "o'brien's (final)!.pdf" });
+      setRisk(id, 'ok');
+      const r = await get(id);
+      const star = r.headers.get('content-disposition').split("filename*=")[1];
+      assert.equal(star.split("'").length - 1, 2, "exactly the two delimiters of UTF-8''<value>");
+      assert.equal(decodeURIComponent(star.split("''")[1]), "o'brien's (final)!.pdf",
+        'and it must still round-trip to the real name');
     });
   }
 
@@ -2416,6 +2447,28 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(e.media.scanStatus, null);
     });
 
+    // The bug this catches: the oversize floor lived only in the serve route,
+    // so the UI still saw `safe`, rendered an <img>, and the server answered
+    // with an attachment. The visible symptom is a broken image icon.
+    testAsync('an oversize row reads as warn in the thread, matching what the route serves', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`z${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      await withClamd('INSTREAM size limit exceeded. ERROR\x00', () =>
+        withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      assert.equal(getInbound(id).risk, 'safe', 'the stored tier is still what the bytes said');
+
+      const e = entryFor(id);
+      assert.equal(e.media.risk, 'warn', 'but the UI must see what the route will actually do');
+      assert.equal(e.media.scanStatus, 'oversize');
+
+      const s = await serve();
+      try {
+        const r = await fetch(`http://127.0.0.1:${s.address().port}/api/media/inbound/${id}`, asOperator);
+        assert.match(r.headers.get('content-disposition'), /^attachment/,
+          'route and thread must agree, or the inbox renders a broken image');
+      } finally { s.close(); }
+    });
+
     testAsync('a saved row from before this feature reads as ok, never safe', async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`h${Date.now()}`)]);
       const id = seedInbound({ bytes });
@@ -2540,6 +2593,15 @@ console.log('\nfile risk classification');
 
   test('an unknown mime with no filename and no bytes is ok, not safe', () => {
     assert.equal(classify({}).tier, 'ok');
+  });
+
+  test('effectiveRisk floors an unscannable file at warn', () => {
+    const { effectiveRisk } = require('./server');
+    assert.equal(effectiveRisk('safe', 'clean'), 'safe');
+    assert.equal(effectiveRisk('safe', 'oversize'), 'warn', 'nobody vouched for a file the scanner could not read');
+    assert.equal(effectiveRisk('block', 'oversize'), 'block', 'the floor raises, it never lowers');
+    assert.equal(effectiveRisk(null, 'clean'), 'ok', 'a row from before classification is not safe');
+    assert.equal(effectiveRisk('nonsense', 'clean'), 'ok', 'an unrecognised tier is not safe either');
   });
 
   test('classify() never throws on hostile input', () => {

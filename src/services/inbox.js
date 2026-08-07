@@ -6,6 +6,7 @@ const { normalizePhone } = require('../lib/phone');
 const { graphSend } = require('./graph');
 const { explainError } = require('../lib/errors');
 const { INBOUND_TTL_MS } = require('./media');
+const { effectiveRisk } = require('../lib/filerisk');
 
 // An inbound message opens a 24-hour "customer service window" during which the
 // business may send free-form text — no template, no approval. Outside it, Meta
@@ -198,9 +199,12 @@ const toEntry = (r, now = Date.now()) => ({
     expired:  !r.path && (now - r.at) > INBOUND_TTL_MS,
     // A verdict is only meaningful once there are bytes to have a verdict
     // about. Reporting a tier for an unsaved row would put a red warning on a
-    // file nothing has looked at — and `ok` is the floor for a saved row whose
-    // `risk` is NULL because it predates classification.
-    risk:          r.path ? (r.risk || 'ok') : null,
+    // file nothing has looked at.
+    //
+    // effectiveRisk, not the raw column: it is the same function the serve
+    // route decides with, so the UI never renders an <img> for something the
+    // server has already decided to hand back as a download.
+    risk:          r.path ? effectiveRisk(r.risk, r.scan_status) : null,
     riskReason:    r.path ? r.risk_reason : null,
     scanStatus:    r.path ? (r.scan_status || 'skipped') : null,
     scanSignature: r.scan_signature || null,

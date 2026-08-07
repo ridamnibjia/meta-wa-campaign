@@ -202,4 +202,19 @@ function classify(input) {
   return { tier, reason, sniffed };
 }
 
-module.exports = { TIERS, worst, classify, sniff, extOf, bareMime };
+// The stored tier, adjusted for what the scanner managed to do with it. This
+// has to live in ONE place: the serve route uses it to decide inline versus
+// attachment, and the inbox uses it to decide whether to render an <img> at
+// all. Two copies would drift, and the visible symptom would be a broken image
+// icon — the UI asking for a preview the server has already decided to refuse.
+//
+// A NULL tier means the row predates classification, and `ok` — downloads,
+// never renders — is the honest verdict for a file nothing has looked at.
+// A file clamd could not scan because it was too big is nobody's vouched-for
+// file, so it floors at `warn` however innocent its bytes looked.
+const effectiveRisk = (risk, scanStatus) => {
+  const tier = TIERS.includes(risk) ? risk : 'ok';
+  return scanStatus === 'oversize' ? worst(tier, 'warn') : tier;
+};
+
+module.exports = { TIERS, worst, classify, sniff, extOf, bareMime, effectiveRisk };
