@@ -30,7 +30,7 @@ const {
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
-  markRead, inboxThread, sendReply,
+  markRead, inboxThread, inboxSearch, sendReply,
   checkPassword, createSession, validSession, destroySession,
   PRICES,
   nodeVersionOk, openDb, SCHEMA,
@@ -763,14 +763,162 @@ test('thread returns messages oldest first in the shape the UI reads', () => {
 test('thread returns null for an unknown number', () => {
   assert.equal(inboxThread('910000009999'), null);
 });
-test('there is no per-thread message cap', () => {
+test('there is no per-thread message cap — a page is a page, not a ceiling', () => {
   for (let i = 0; i < 250; i++) {
     testDb.prepare('INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES (?, ?, ?, ?, ?, ?)')
           .run(`bulk-${i}`, '910000000008', 'in', 'text', `m${i}`, 1000 + i);
   }
   seedThread('910000000008', 'Chatty', 1700000000000, 1700000000000);
-  assert.equal(inboxThread('910000000008').messages.length, 250);
+  assert.equal(inboxThread('910000000008').total, 250, 'all 250 are still there');
+  // Walk the whole transcript a page at a time and confirm nothing is lost
+  // between pages — the failure this keyset cursor exists to prevent.
+  const seen = [];
+  let before = null, guard = 0;
+  do {
+    const page = inboxThread('910000000008', { before, limit: 30 });
+    seen.push(...page.messages.map(m => m.id));
+    before = page.nextBefore;
+  } while (before && ++guard < 20);
+  assert.equal(new Set(seen).size, 250, 'every message is reachable by paging, exactly once');
 });
+
+// ── P4: search and pagination ─────────────────────────────────────────────────
+console.log('\ninbox — pagination');
+{
+  // A conversation where several messages share one timestamp. Meta sends whole
+  // seconds, so this is the normal case in a busy thread, not a contrived one —
+  // and a cursor on `at` alone would silently drop every message that ties with
+  // a page boundary.
+  seedThread('910000007777', 'Paged', 1700000000000, 1700000000000);
+  for (let i = 0; i < 7; i++) {
+    testDb.prepare('INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(`pg-${i}`, '910000007777', 'in', 'text', `msg ${i}`, 5000 + Math.floor(i / 3) * 1000);
+  }
+
+  test('a thread opens on its newest page, oldest first within it', () => {
+    const t = inboxThread('910000007777', { limit: 3 });
+    assert.equal(t.messages.length, 3);
+    assert.deepEqual(t.messages.map(m => m.id), ['pg-4', 'pg-5', 'pg-6'],
+      'the three newest, in reading order');
+    assert.equal(t.total, 7, 'and it still says how many there are in total');
+    assert.equal(t.hasMore, true);
+    assert.ok(t.nextBefore);
+  });
+
+  test('paging back reaches every message exactly once, across timestamp ties', () => {
+    const seen = [];
+    let before = null, guard = 0;
+    do {
+      const page = inboxThread('910000007777', { before, limit: 3 });
+      seen.push(...page.messages.map(m => m.id));
+      before = page.nextBefore;
+    } while (before && ++guard < 10);
+    assert.equal(seen.length, 7);
+    assert.equal(new Set(seen).size, 7, 'no message is skipped and none is repeated');
+  });
+
+  test('the last page reports no more, and hands back no cursor', () => {
+    let before = null, page, guard = 0;
+    do { page = inboxThread('910000007777', { before, limit: 3 }); before = page.nextBefore; }
+    while (before && ++guard < 10);
+    assert.equal(page.hasMore, false);
+    assert.equal(page.nextBefore, null, 'a cursor that leads nowhere would page forever');
+  });
+
+  test('a junk cursor is ignored rather than throwing', () => {
+    for (const junk of ['nonsense', '12:', ':45', '-1:-1', 'a:b', '']) {
+      const t = inboxThread('910000007777', { before: junk, limit: 3 });
+      assert.equal(t.messages.length, 3, `"${junk}" should fall back to the newest page`);
+    }
+  });
+
+  test('a page size beyond the ceiling is clamped, not honoured', () => {
+    // The ceiling is what stops a crafted request pulling a 200k-row thread
+    // into memory in one response.
+    assert.ok(inboxThread('910000000008', { limit: 99999 }).messages.length <= 200);
+  });
+}
+
+console.log('\ninbox — search');
+{
+  seedThread('910000008881', 'Asha Rao',  1700000000000, 1700000000000);
+  seedThread('910000008882', 'Rahul Mehta', 1700000000000, 1700000000000);
+  const say = (wamid, waId, body, at) =>
+    testDb.prepare('INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(wamid, waId, 'in', 'text', body, at);
+  say('s-1', '910000008881', 'my invoice never arrived', 9000);
+  say('s-2', '910000008881', 'thanks for the invoice',   9001);
+  say('s-3', '910000008882', 'where is the receipt',      9002);
+  say('s-4', '910000008882', 'discount was 50% off',      9003);
+  say('s-5', '910000008882', 'my_order failed',           9004);
+
+  test('a global search finds the word wherever it was said', () => {
+    const r = inboxSearch('invoice');
+    assert.equal(r.messages.length, 2);
+    assert.ok(r.messages.every(m => m.waId === '910000008881'));
+    assert.equal(r.messages[0].name, 'Asha Rao', 'results name the person, not just the number');
+  });
+
+  test('search is newest first', () => {
+    const r = inboxSearch('invoice');
+    assert.ok(r.messages[0].at >= r.messages[1].at);
+  });
+
+  test('scoping to a thread excludes every other conversation', () => {
+    assert.equal(inboxSearch('the', { waId: '910000008882' }).messages
+      .every(m => m.waId === '910000008882'), true);
+    assert.equal(inboxSearch('invoice', { waId: '910000008882' }).messages.length, 0);
+  });
+
+  // % and _ are LIKE wildcards. Unescaped, "50%" matches every message ever
+  // sent — which reads as a broken search rather than a broken query.
+  test('a percent sign is a literal, not a wildcard', () => {
+    const r = inboxSearch('50%');
+    assert.equal(r.messages.length, 1);
+    assert.equal(r.messages[0].id, 's-4');
+  });
+
+  test('an underscore is a literal, not a single-character wildcard', () => {
+    const r = inboxSearch('my_order');
+    assert.equal(r.messages.length, 1, 'unescaped, this would also match "my order"');
+    assert.equal(r.messages[0].id, 's-5');
+  });
+
+  test('a backslash does not corrupt the escape sequence', () => {
+    assert.doesNotThrow(() => inboxSearch('back\\slash'));
+    assert.doesNotThrow(() => inboxSearch('\\'));
+  });
+
+  test('a global search also finds people by name and by number', () => {
+    const byName = inboxSearch('Rahul');
+    assert.ok(byName.people.some(p => p.waId === '910000008882'));
+    const byNumber = inboxSearch('910000008881');
+    assert.ok(byNumber.people.some(p => p.waId === '910000008881'));
+  });
+
+  test('a thread-scoped search returns no people — you know who it is', () => {
+    assert.deepEqual(inboxSearch('Rahul', { waId: '910000008882' }).people, []);
+  });
+
+  test('one character is refused rather than matching most of the database', () => {
+    const r = inboxSearch('a');
+    assert.equal(r.tooShort, true);
+    assert.deepEqual(r.messages, []);
+  });
+
+  test('an empty or missing query is not an error', () => {
+    for (const q of ['', '   ', null, undefined]) {
+      assert.equal(inboxSearch(q).tooShort, true);
+    }
+  });
+
+  test('a term that matches nothing is an empty result, not a failure', () => {
+    const r = inboxSearch('zzzznothinghere');
+    assert.equal(r.tooShort, false);
+    assert.deepEqual(r.messages, []);
+    assert.deepEqual(r.people, []);
+  });
+}
 
 console.log('\nauthentication');
 test('the right password is accepted', () => {

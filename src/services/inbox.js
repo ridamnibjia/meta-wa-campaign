@@ -170,16 +170,36 @@ const listThreads = db.prepare(`
 
 const getThread = db.prepare('SELECT wa_id, name, last_inbound_at FROM threads WHERE wa_id = ?');
 
-// ponytail: whole transcript, no LIMIT. Pagination is P4; until then the
-// honest answer to "show me the conversation" is all of it.
-const getMessages = db.prepare(`
-  SELECT m.wamid, m.dir, m.type, m.body, m.at, m.status,
+// A page of transcript, newest first, walked backwards from a cursor. Served by
+// idx_messages_thread (wa_id, at DESC) — the index has existed since P1 and this
+// is the query it was built for.
+//
+// The cursor is (at, rowid), not `at` alone: timestamps come from Meta in whole
+// seconds, so several messages in one conversation routinely share one. A cursor
+// on `at` by itself would skip every message that ties with the page boundary,
+// and the gap would be invisible — the transcript would simply be missing lines.
+const PAGE_SIZE = 30;
+
+const pageOfMessages = db.prepare(`
+  SELECT m.wamid, m.dir, m.type, m.body, m.at, m.rowid AS rid, m.status,
          md.media_id, md.mime_type, md.filename, md.file_size, md.path,
          md.risk, md.risk_reason, md.scan_status, md.scan_signature
     FROM messages m
     LEFT JOIN media md ON md.wamid = m.wamid
-   WHERE m.wa_id = ? ORDER BY m.at ASC, m.rowid ASC
+   WHERE m.wa_id = ?
+     AND (? IS NULL OR m.at < ? OR (m.at = ? AND m.rowid < ?))
+   ORDER BY m.at DESC, m.rowid DESC
+   LIMIT ?
 `);
+
+const countMessages = db.prepare('SELECT count(*) AS n FROM messages WHERE wa_id = ?');
+
+// "1712345678901:4821" — opaque to the client, which only ever echoes it back.
+const encodeCursor = r => `${r.at}:${r.rid}`;
+const decodeCursor = c => {
+  const m = /^(\d+):(\d+)$/.exec(String(c || ''));
+  return m ? { at: Number(m[1]), rid: Number(m[2]) } : null;
+};
 
 // wamid → id and body → text: public/views/inbox.jsx renders those two keys and
 // this is the only place that knows the column names differ.
@@ -230,16 +250,95 @@ function summary({ all = false, now = Date.now() } = {}) {
   return { threads, unread: threads.reduce((n, t) => n + t.unread, 0) };
 }
 
-function thread(waId, now = Date.now()) {
+// `before` is the cursor from a previous page; omit it for the newest page.
+// Messages come back oldest-first because that is the order a transcript reads,
+// even though the query walks backwards to find them.
+function thread(waId, { now = Date.now(), before = null, limit = PAGE_SIZE } = {}) {
   const t = getThread.get(waId);
   if (!t) return null;
+
+  const cur = decodeCursor(before);
+  const size = Math.min(Math.max(Number(limit) || PAGE_SIZE, 1), 200);
+  // One extra row, then dropped: asking for 31 to show 30 is how "is there more"
+  // is answered without a second COUNT over the whole thread.
+  const at = cur ? cur.at : null, rid = cur ? cur.rid : 0;
+  // node:sqlite binds anonymous ? placeholders strictly by position, so the
+  // cursor is repeated rather than written as ?2 three times.
+  const rows = pageOfMessages.all(waId, at, at, at, rid, size + 1);
+  const hasMore = rows.length > size;
+  const page = rows.slice(0, size);
+
   return {
     waId: t.wa_id,
     name: t.name || t.wa_id,
-    messages: getMessages.all(waId).map(r => toEntry(r, now)),
+    messages: page.slice().reverse().map(r => toEntry(r, now)),
+    total: countMessages.get(waId).n,
+    hasMore,
+    // The cursor for the NEXT page back — the oldest row on this one.
+    nextBefore: hasMore && page.length ? encodeCursor(page[page.length - 1]) : null,
     windowOpen: isWindowOpen({ lastInboundAt: t.last_inbound_at }, now),
     windowClosesAt: t.last_inbound_at ? t.last_inbound_at + WINDOW_MS : null,
   };
 }
 
-module.exports = { WINDOW_MS, isWindowOpen, recordInbound, markRead, sendReply, summary, thread, describe };
+// ── Search ─────────────────────────────────────────────────────────────────────
+// LIKE '%…%' over messages.body, global or scoped to one thread. Measured at
+// 40ms across 200k rows on this hardware, so there is no FTS5 table, no shadow
+// index and nothing to keep in step with the messages table.
+//
+// ponytail: revisit only if a real deployment measures worse. An FTS5 index is
+// a second copy of every message body, and the day it drifts from the first one
+// the symptom is a search that quietly cannot find a conversation you are
+// looking at.
+const searchAll = db.prepare(`
+  SELECT m.wamid, m.wa_id, m.dir, m.type, m.body, m.at, t.name
+    FROM messages m JOIN threads t ON t.wa_id = m.wa_id
+   WHERE m.body LIKE ? ESCAPE '\\'
+   ORDER BY m.at DESC LIMIT ?
+`);
+
+const searchThread = db.prepare(`
+  SELECT m.wamid, m.wa_id, m.dir, m.type, m.body, m.at, t.name
+    FROM messages m JOIN threads t ON t.wa_id = m.wa_id
+   WHERE m.wa_id = ? AND m.body LIKE ? ESCAPE '\\'
+   ORDER BY m.at DESC LIMIT ?
+`);
+
+// Also searches who you were talking to, not only what was said: an operator
+// looking for "Asha" means the person at least as often as the word.
+const searchPeople = db.prepare(`
+  SELECT wa_id, name, last_at FROM threads
+   WHERE wa_id LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'
+   ORDER BY last_at DESC LIMIT ?
+`);
+
+// % and _ are LIKE wildcards. Left unescaped, a search for "50%" matches every
+// message ever sent — which reads as a broken search rather than a broken query.
+const likeEscape = s => String(s).replace(/[\\%_]/g, c => '\\' + c);
+
+function search(q, { waId = null, limit = 50 } = {}) {
+  const term = String(q || '').trim();
+  // One character matches most of the database and tells the operator nothing.
+  if (term.length < 2) return { query: term, tooShort: true, messages: [], people: [] };
+
+  const like = `%${likeEscape(term)}%`;
+  const n    = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const rows = waId ? searchThread.all(waId, like, n) : searchAll.all(like, n);
+
+  return {
+    query: term,
+    scope: waId || null,
+    tooShort: false,
+    messages: rows.map(r => ({
+      id: r.wamid, waId: r.wa_id, name: r.name || r.wa_id,
+      dir: r.dir, type: r.type, text: r.body ?? '', at: r.at,
+    })),
+    // Only for a global search: inside one thread you already know who it is.
+    people: waId ? [] : searchPeople.all(like, like, 10).map(t => ({
+      waId: t.wa_id, name: t.name || t.wa_id, lastAt: t.last_at,
+    })),
+  };
+}
+
+module.exports = { WINDOW_MS, PAGE_SIZE, isWindowOpen, recordInbound, markRead, sendReply,
+                   summary, thread, describe, search };

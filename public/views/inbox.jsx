@@ -170,17 +170,41 @@ function Thread({ waId, onBack }) {
   const [error, setError] = useState('');
   const endRef = useRef(null);
 
+  // `older` holds the pages walked back from the newest one, oldest page first.
+  // Kept separate from `data` so a reload after sending a reply refreshes the
+  // newest page without discarding the history already fetched.
+  const [older, setOlder] = useState([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+
   const load = useCallback(() => {
+    setOlder([]);
     api.get(`/api/inbox/${waId}`).then(setData).catch(() => setData(null));
   }, [waId]);
 
   useEffect(() => { load(); }, [load]);
 
-  // Scroll the transcript, not the page.
+  // The cursor for the next page back is the oldest one fetched so far.
+  const nextBefore = older.length ? older[0].nextBefore : data?.nextBefore;
+  const hasMore    = older.length ? older[0].hasMore    : data?.hasMore;
+
+  const loadMore = async () => {
+    if (!nextBefore || loadingMore) return;
+    setLoadingMore(true);
+    const page = await api.get(`/api/inbox/${waId}?before=${encodeURIComponent(nextBefore)}`)
+      .catch(() => null);
+    setLoadingMore(false);
+    if (page) setOlder(o => [page, ...o]);
+  };
+
+  const messages = [...older.flatMap(p => p.messages), ...(data?.messages || [])];
+
+  // Scroll the transcript, not the page — and only when the newest page changes.
+  // Jumping to the bottom after loading older messages would undo the thing the
+  // operator just asked for.
   useEffect(() => {
     const box = endRef.current?.parentElement;
     if (box) box.scrollTop = box.scrollHeight;
-  }, [data?.messages?.length]);
+  }, [data?.messages?.length, waId]);
 
   const send = async e => {
     e.preventDefault();
@@ -212,7 +236,18 @@ function Thread({ waId, onBack }) {
       </div>
 
       <div className="flex-1 space-y-2 overflow-y-auto bg-muted/30 p-4">
-        {data.messages.map(m => (
+        {/* ponytail: a button, not scroll detection. Prepending to a scrolled
+            container without the browser jumping needs scroll anchoring that
+            fights React's reconciliation, and "Load earlier" is one line that
+            always works. */}
+        {hasMore && (
+          <div className="flex justify-center pb-1">
+            <Button variant="outline" size="sm" onClick={loadMore} disabled={loadingMore}>
+              {loadingMore ? 'Loading…' : `Load earlier messages${data.total ? ` (${data.total - messages.length} older)` : ''}`}
+            </Button>
+          </div>
+        )}
+        {messages.map(m => (
           <div key={m.id} className={cn('flex', m.dir === 'out' ? 'justify-end' : 'justify-start')}>
             <div className={cn('max-w-[75%] rounded-lg px-3 py-2 text-sm shadow-sm',
               m.dir === 'out' ? 'bg-primary text-primary-foreground' : 'bg-card text-card-foreground border border-border')}>
@@ -253,14 +288,70 @@ function Thread({ waId, onBack }) {
   );
 }
 
+// Global search across every conversation. Debounced because it runs on every
+// keystroke and the query is a LIKE scan — cheap, but not free, and there is no
+// value in searching a half-typed word.
+function SearchResults({ q, onOpen }) {
+  const [data, setData] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (q.trim().length < 2) { setData(null); return; }
+    setBusy(true);
+    const id = setTimeout(() => {
+      api.get(`/api/inbox/search?q=${encodeURIComponent(q)}`)
+        .then(setData).catch(() => setData(null)).finally(() => setBusy(false));
+    }, 250);
+    return () => clearTimeout(id);
+  }, [q]);
+
+  if (q.trim().length < 2) return null;
+  if (!data) return <p className="p-3 text-xs text-muted-foreground">{busy ? 'Searching…' : 'No results'}</p>;
+
+  const nothing = !data.people.length && !data.messages.length;
+  if (nothing) return <p className="p-3 text-xs text-muted-foreground">Nothing matches “{data.query}”.</p>;
+
+  return (
+    <div className="divide-y divide-border">
+      {data.people.length > 0 && (
+        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">People</div>
+      )}
+      {data.people.map(p => (
+        <button key={p.waId} onClick={() => onOpen(p.waId)}
+                className="flex w-full items-center justify-between gap-2 p-3 text-left hover:bg-accent">
+          <span className="truncate text-sm font-medium">{p.name}</span>
+          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">+{p.waId}</span>
+        </button>
+      ))}
+      {data.messages.length > 0 && (
+        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          Messages ({data.messages.length})
+        </div>
+      )}
+      {data.messages.map(m => (
+        <button key={m.id} onClick={() => onOpen(m.waId)}
+                className="block w-full p-3 text-left hover:bg-accent">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="truncate text-xs font-medium">{m.name}</span>
+            <span className="shrink-0 text-[10px] text-muted-foreground">{timeAgo(m.at)}</span>
+          </div>
+          <p className="truncate text-xs text-muted-foreground">{m.dir === 'out' ? 'You: ' : ''}{m.text}</p>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function Inbox() {
   const { threads, loadInbox } = useApp();
   const [, full] = useRoute();
   const selected = full.split('/')[1] || null;
+  const [q, setQ] = useState('');
 
   useEffect(() => { loadInbox(); }, [loadInbox]);
 
-  const open = waId => go('inbox/' + waId);
+  const open = waId => { setQ(''); go('inbox/' + waId); };
+  const searching = q.trim().length >= 2;
 
   return (
     <div className="mx-auto max-w-6xl space-y-4">
@@ -274,7 +365,31 @@ function Inbox() {
       <Card className="overflow-hidden">
         <div className="grid md:grid-cols-[18rem_1fr] md:divide-x md:divide-border" style={{ minHeight: '32rem' }}>
           {/* Thread list — hidden on mobile once a conversation is open */}
-          <div className={cn('divide-y divide-border overflow-y-auto', selected && 'hidden md:block')} style={{ maxHeight: '36rem' }}>
+          <div className={cn('overflow-y-auto', selected && 'hidden md:block')} style={{ maxHeight: '36rem' }}>
+            <div className="sticky top-0 z-10 border-b border-border bg-card p-2">
+              <Input value={q} onChange={e => setQ(e.target.value)}
+                     placeholder="Search messages and people" className="h-8 text-xs" />
+            </div>
+            {searching
+              ? <SearchResults q={q} onOpen={open} />
+              : <ThreadList threads={threads} selected={selected} open={open} />}
+          </div>
+
+          {/* Transcript */}
+          <div className={cn(!selected && 'hidden md:block')}>
+            {selected
+              ? <Thread waId={selected} onBack={() => go('inbox')} />
+              : <Empty icon="←" title="Pick a conversation">Choose someone on the left to read the thread and reply.</Empty>}
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function ThreadList({ threads, selected, open }) {
+  return (
+    <div className="divide-y divide-border">
             {threads.length === 0 ? (
               <Empty icon="✉" title="No conversations yet">
                 When someone replies to a campaign message it appears here. Make sure the
@@ -295,16 +410,6 @@ function Inbox() {
                 {t.unread > 0 && <Badge variant="destructive">{t.unread}</Badge>}
               </button>
             ))}
-          </div>
-
-          {/* Transcript */}
-          <div className={cn(!selected && 'hidden md:block')}>
-            {selected
-              ? <Thread waId={selected} onBack={() => go('inbox')} />
-              : <Empty icon="←" title="Pick a conversation">Choose someone on the left to read the thread and reply.</Empty>}
-          </div>
-        </div>
-      </Card>
     </div>
   );
 }

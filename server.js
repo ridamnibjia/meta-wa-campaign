@@ -158,6 +158,8 @@ module.exports = {
   isWindowOpen:   require('./src/services/inbox').isWindowOpen,
   recordInbound:  require('./src/services/inbox').recordInbound,
   inboxSummary:   require('./src/services/inbox').summary,
+  inboxSearch:    require('./src/services/inbox').search,
+  INBOX_PAGE_SIZE: require('./src/services/inbox').PAGE_SIZE,
   describeInbound: require('./src/services/inbox').describe,
   markRead:    require('./src/services/inbox').markRead,
   inboxThread: require('./src/services/inbox').thread,
