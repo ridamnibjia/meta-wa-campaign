@@ -70,10 +70,36 @@ const PUBLIC_DIR = path.join(ROOT, 'public');
 // WA_MEDIA_DIR is the test escape hatch, exactly like WA_UPLOAD_DIR.
 const MEDIA_DIR = process.env.WA_MEDIA_DIR || path.join(ROOT, 'media');
 
+// ── ClamAV ─────────────────────────────────────────────────────────────────────
+// Empty means "no scanner", which is a supported deployment: most self-hosters
+// will not run clamd — it holds the whole signature database in RAM, about a
+// gigabyte — and the app has to work without it. Set it to a unix socket path
+// (/var/run/clamav/clamd.ctl) or host:port (127.0.0.1:3310) to turn scanning on.
+//
+// The distinction that matters: NOT CONFIGURED lets a save through, marked
+// "not scanned". CONFIGURED BUT BROKEN refuses the save. An operator who asked
+// for a scanner should never silently stop getting one.
+const CLAMAV = {
+  address:   process.env.CLAMAV_ADDRESS || '',
+  timeoutMs: Number(process.env.CLAMAV_TIMEOUT_MS) || 30_000,
+};
+
+// Inbound media limits. The byte cap is Meta's own document maximum — a bigger
+// response than that is a broken CDN, not a file. The free-space floor is what
+// stops a save filling the boot disk out from under SQLite, which handles a
+// full filesystem by refusing writes: an unbounded media save would take the
+// message store down with it, which is far worse than a refused Save.
+const MEDIA_LIMITS = {
+  maxBytes:      Number(process.env.WA_MEDIA_MAX_BYTES)      || 100 * 1024 * 1024,
+  minFreeBytes:  Number(process.env.WA_MEDIA_MIN_FREE_BYTES) || 2 * 1024 * 1024 * 1024,
+  retentionDays: Number(process.env.WA_MEDIA_RETENTION_DAYS) || 90,
+};
+
 // Files uploaded for use as a template header. Separate from MEDIA_DIR, which
 // holds INBOUND customer media — different provenance, different retention.
 // WA_UPLOAD_DIR exists so test.js can point at a temp directory before
 // requiring the app, exactly like WA_DB_PATH. It is not a deployment knob.
 const UPLOAD_DIR = process.env.WA_UPLOAD_DIR || path.join(ROOT, 'uploads');
 
-module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, FILES, PUBLIC_DIR, MEDIA_DIR, UPLOAD_DIR, ROOT };
+module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, FILES, PUBLIC_DIR, MEDIA_DIR, UPLOAD_DIR, ROOT,
+                   CLAMAV, MEDIA_LIMITS };

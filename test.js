@@ -2025,6 +2025,136 @@ console.log('\nfile risk classification');
   });
 }
 
+console.log('\nclamav scanning');
+{
+  const net = require('node:net');
+  const { scanBuffer, parseReply, scannerConfigured, EICAR } = require('./server');
+  const { CLAMAV } = require('./src/config');
+
+  test('parseReply reads the answers clamd actually gives', () => {
+    assert.deepEqual(parseReply('stream: OK\x00'), { status: 'clean', signature: null });
+    assert.deepEqual(parseReply('stream: Eicar-Test-Signature FOUND\x00'),
+      { status: 'infected', signature: 'Eicar-Test-Signature' });
+    assert.equal(parseReply('INSTREAM size limit exceeded. ERROR\x00').status, 'oversize');
+    assert.equal(parseReply('stream: Broken pipe ERROR\x00').status, 'error');
+    assert.equal(parseReply('').status, 'error');
+    assert.equal(parseReply('something clamd has never said').status, 'error');
+  });
+
+  test('no CLAMAV_ADDRESS means no scanner', () => {
+    const saved = CLAMAV.address;
+    CLAMAV.address = '';
+    try { assert.equal(scannerConfigured(), false); }
+    finally { CLAMAV.address = saved; }
+  });
+
+  // A fake clamd. It speaks the INSTREAM half of the protocol only, which is
+  // the entire surface this app uses: read zINSTREAM\0, read length-prefixed
+  // chunks until a zero length, answer one line. A null reply hangs the socket
+  // open on purpose, which is how the timeout path gets exercised.
+  const withClamd = async (reply, fn, { drop = false } = {}) => {
+    const chunks = [];
+    const srv = net.createServer(sock => {
+      if (drop) return sock.destroy();
+      // The header is consumed exactly once. Re-scanning for the NUL on every
+      // data event would find one inside the payload instead and reframe the
+      // whole stream.
+      let buf = Buffer.alloc(0), gotHeader = false;
+      sock.on('data', d => {
+        buf = Buffer.concat([buf, d]);
+        if (!gotHeader) {
+          const head = buf.indexOf(0);
+          if (head < 0) return;
+          buf = buf.subarray(head + 1);
+          gotHeader = true;
+        }
+        while (buf.length >= 4) {
+          const len = buf.readUInt32BE(0);
+          if (len === 0) { if (reply !== null) sock.end(reply); return; }
+          if (buf.length < 4 + len) return;
+          chunks.push(Buffer.from(buf.subarray(4, 4 + len)));
+          buf = buf.subarray(4 + len);
+        }
+      });
+    });
+    await new Promise(r => srv.listen(0, '127.0.0.1', r));
+    const saved = CLAMAV.address;
+    CLAMAV.address = `127.0.0.1:${srv.address().port}`;
+    try { return await fn(chunks); }
+    finally { CLAMAV.address = saved; await new Promise(r => srv.close(r)); }
+  };
+
+  testAsync('a clean file comes back clean', async () => {
+    await withClamd('stream: OK\x00', async () => {
+      assert.deepEqual(await scanBuffer(Buffer.from('harmless')), { status: 'clean', signature: null });
+    });
+  });
+
+  testAsync('the bytes actually reach the daemon', async () => {
+    await withClamd('stream: OK\x00', async chunks => {
+      await scanBuffer(Buffer.from('the payload'));
+      assert.equal(Buffer.concat(chunks).toString(), 'the payload');
+    });
+  });
+
+  testAsync('a file bigger than one chunk is framed correctly', async () => {
+    const big = Buffer.alloc(200_000, 0x41);
+    await withClamd('stream: OK\x00', async chunks => {
+      await scanBuffer(big);
+      assert.equal(Buffer.concat(chunks).length, big.length,
+        'a 100 MB video must not lose bytes to the 64 KiB chunk loop');
+    });
+  });
+
+  testAsync('a signature hit comes back infected, with the signature name', async () => {
+    await withClamd('stream: Eicar-Test-Signature FOUND\x00', async () => {
+      const r = await scanBuffer(Buffer.from(EICAR));
+      assert.equal(r.status, 'infected');
+      assert.equal(r.signature, 'Eicar-Test-Signature');
+    });
+  });
+
+  testAsync('a file past clamd StreamMaxLength comes back oversize, not clean', async () => {
+    await withClamd('INSTREAM size limit exceeded. ERROR\x00', async () => {
+      assert.equal((await scanBuffer(Buffer.from('big'))).status, 'oversize');
+    });
+  });
+
+  testAsync('a configured but unreachable daemon is an error, never a clean', async () => {
+    const saved = CLAMAV.address;
+    CLAMAV.address = '127.0.0.1:1';   // nothing listens on port 1
+    try {
+      const r = await scanBuffer(Buffer.from('x'));
+      assert.equal(r.status, 'error', 'a broken scanner must never read as clean');
+      assert.ok(r.signature, 'the failure text is what the operator gets shown');
+    } finally { CLAMAV.address = saved; }
+  });
+
+  testAsync('a daemon that hangs up mid-scan is an error', async () => {
+    await withClamd('', async () => {
+      assert.equal((await scanBuffer(Buffer.from('x'))).status, 'error');
+    }, { drop: true });
+  });
+
+  testAsync('no scanner configured means skipped, not error', async () => {
+    const saved = CLAMAV.address;
+    CLAMAV.address = '';
+    try { assert.deepEqual(await scanBuffer(Buffer.from('x')), { status: 'skipped', signature: null }); }
+    finally { CLAMAV.address = saved; }
+  });
+
+  testAsync('a daemon that never answers times out as an error', async () => {
+    const saved = CLAMAV.timeoutMs; CLAMAV.timeoutMs = 150;
+    try {
+      await withClamd(null, async () => {
+        const r = await scanBuffer(Buffer.from('x'));
+        assert.equal(r.status, 'error');
+        assert.match(r.signature, /timed out/i);
+      });
+    } finally { CLAMAV.timeoutMs = saved; }
+  });
+}
+
 Promise.all(pending).then(() => {
   console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);
 });

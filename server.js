@@ -139,6 +139,7 @@ module.exports = {
   ...require('./src/services/graph'),
   ...require('./src/services/media'),
   ...require('./src/lib/filerisk'),
+  ...require('./src/lib/clamav'),
   isWindowOpen:   require('./src/services/inbox').isWindowOpen,
   recordInbound:  require('./src/services/inbox').recordInbound,
   inboxSummary:   require('./src/services/inbox').summary,
