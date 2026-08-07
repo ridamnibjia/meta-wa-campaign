@@ -6,9 +6,10 @@ const { broadcast } = require('./status');
 const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
 const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
 const { recordOutbound, countsForRun, startRun, buildRun, nextPending,
-        recordRecipientSent, recordRecipientSkipped, progressForRun } = require('./messages');
+        recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
+        nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
-const { explainError } = require('../lib/errors');
+const { explainError, skipDisposition } = require('../lib/errors');
 const { graphHeaders } = require('./graph');
 const { headerComponent } = require('./media');
 
@@ -174,6 +175,88 @@ async function sendTemplate(contact) {
   }
 }
 
+// ── Retrying a failure that was about the moment ───────────────────────────────
+// One DNS blip while sending to contact #340 used to drop that person from the
+// run permanently, and the only way to reach them again was re-uploading the CSV
+// — which opens a new run and messages everyone a second time. That is the leak
+// this closes.
+//
+// Three waits, so four attempts in total: the original send, then one an hour
+// later, one two hours after that, one four hours after that. A contact still
+// failing at the end of that ladder is reported rather than retried again —
+// there is nothing left for another attempt to discover.
+//
+// WHICH failures come back here is lib/errors.js:skipDisposition, not a list
+// kept here. A code has to be named 'retry' there to get a second attempt.
+const RETRY_BACKOFF_MS = [3600000, 7200000, 14400000];   // 1h → 2h → 4h
+
+const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
+  { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+
+// True when the contact was put back in the queue; false when the caller should
+// record a terminal skip. `row.attempts` is how many retries this contact has
+// already had — the SQL increments it, so it cannot drift.
+function scheduleRetry(contact, row, result, n) {
+  if (skipDisposition(result.errorCode) !== 'retry') return false;
+  const made = row.attempts || 0;
+  if (made >= RETRY_BACKOFF_MS.length) {
+    log('warn', `${n} ${contact.name} — still failing after ${made + 1} attempts, reporting it [${result.errorCode}]`);
+    return false;
+  }
+  const at = Date.now() + RETRY_BACKOFF_MS[made];
+  recordRecipientRetry(S.currentRunId, contact.dialStr, result.errorCode, at);
+  log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
+  return true;
+}
+
+// Waits in slices rather than in one call, so Stop and Pause are answered in a
+// second instead of in hours. A four-hour `await sleep()` would leave the
+// operator holding a button that does nothing.
+//
+// One second, not fifteen: the slice length is also how long `flags.running`
+// stays true after a Stop, and that window is what /upload-csv and /start refuse
+// through campaignBlocker(). Fourteen thousand no-op timer wakeups over a
+// four-hour wait cost nothing measurable; fifteen seconds of "still stopping"
+// after clicking Stop reads as the button having failed.
+async function sleepUntil(at) {
+  while (Date.now() < at) {
+    if (flags.stopFlag || flags.pauseFlag) return;
+    await sleep(Math.min(1000, at - Date.now()));
+  }
+}
+
+// ── One campaign at a time ─────────────────────────────────────────────────────
+// stageRun REPLACES run_recipients for the run it is given and /upload-csv opens
+// a new run, so a CSV uploaded mid-flight would abandon a queue that is still
+// being walked — every wamid lost, every un-messaged contact orphaned in a run
+// nothing points at any more. The guard is here rather than in the routes so
+// both entry points cannot disagree about what "active" means.
+//
+// `flags.running` is in the test deliberately, and it is the half that matters:
+// a Stop sets the phase to idle immediately, but the loop is still inside an
+// await for up to a second afterwards. Trusting the phase alone let a Start in
+// that window spawn a SECOND loop over the same queue, and two loops walking one
+// run message whoever they both reach twice.
+const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
+const campaignActive = () => flags.running || ACTIVE_PHASES.includes(S.phase);
+
+// The sentence a route hands the operator, or null when nothing is in the way.
+function campaignBlocker() {
+  if (!campaignActive()) return null;
+  // Stopped, but the loop has not returned yet. Reporting progress here would
+  // read as nonsense — a reset has already cleared currentRunId, so the counts
+  // are zeroes — and the honest answer is that it takes a moment.
+  if (!ACTIVE_PHASES.includes(S.phase)) {
+    return 'The previous campaign is still stopping — try that again in a second.';
+  }
+  const p = progressForRun(S.currentRunId);
+  const what = S.phase === 'waiting'
+      ? `waiting to retry ${p.retrying} contact${p.retrying === 1 ? '' : 's'}`
+    : S.phase === 'paused' ? 'paused part-way through'
+    : 'still sending';
+  return `A campaign is ${what} — ${p.sent + p.skipped} of ${p.total} done, ${p.pending} left. Stop it, or let it finish, before starting another.`;
+}
+
 // ── Campaign loop ──────────────────────────────────────────────────────────────
 function startLoop() {
   if (flags.running) return;
@@ -184,12 +267,30 @@ function startLoop() {
 async function campaignLoop() {
   log('info', `Campaign started — ${progressForRun(S.currentRunId).pending} contacts queued`);
   while (true) {
-    if (flags.stopFlag)  { log('info', 'Stopped'); S.phase = 'done'; saveCampaignNow(); broadcast(); break; }
+    // The phase is only set here if nobody has already set it. /stop and /reset
+    // say 'idle' the moment they are called, and overwriting that with 'done' a
+    // second later told the operator "Finished" about a run they stopped.
+    if (flags.stopFlag)  { log('info', 'Stopped'); if (S.phase !== 'idle') S.phase = 'done'; saveCampaignNow(); broadcast(); break; }
     if (flags.pauseFlag) { await sleep(500); continue; }
     // The queue is asked, never counted. Nothing in this loop holds a cursor
     // that a crash could leave ahead of what was actually sent.
     const c = nextPending(S.currentRunId);
     if (!c) {
+      // Nothing sendable RIGHT NOW is not the same as nothing left. A run with
+      // contacts on the retry ladder stays open and sleeps to the earliest of
+      // them; declaring it done here is what used to lose those people.
+      const retry = nextRetryForRun(S.currentRunId);
+      if (retry) {
+        S.phase = 'waiting';
+        S.pauseReason = `Waiting to retry — ${retry.count} contact${retry.count === 1 ? '' : 's'}, next attempt ${clockIST(retry.at)}`;
+        log('info', S.pauseReason);
+        saveCampaignNow(); broadcast();
+        await sleepUntil(retry.at);
+        // Stop and Pause are handled at the top of the loop; falling through
+        // with the phase still 'waiting' would strand it there.
+        if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
+        continue;
+      }
       const counts = countsForRun(S.currentRunId);
       const p = progressForRun(S.currentRunId);
       log('info', `Done — accepted:${counts.accepted} failed:${S.failed} skipped:${p.skipped}`);
@@ -213,8 +314,14 @@ async function campaignLoop() {
         ? `Warm-up ceiling for day ${W.days.length}` : 'Daily cap';
       log('info', `${why} ${S.dailyCount}/${cap} — resuming in ${h}h ${m}m`);
       S.phase = 'paused'; S.pauseReason = `${why} reached (${cap}/day). Resumes in ${h}h ${m}m.`; broadcast();
-      await sleep(wait);
-      S.phase = 'running'; S.pauseReason = null; broadcast(); continue;
+      // sleepUntil, not sleep: this wait is up to a full day. A bare sleep here
+      // meant a Stop set stopFlag that nothing read until tomorrow — and since
+      // `flags.running` stays true until the loop exits, campaignBlocker()
+      // refused every Start and every CSV upload for those hours with "still
+      // stopping, try again in a second".
+      await sleepUntil(nextIstMidnight);
+      if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
+      continue;
     }
     // A contact is { name, dialStr } to everything below; run_recipients stores
     // the same two fields under SQL names.
@@ -260,20 +367,30 @@ async function campaignLoop() {
       if (result.errorCode === 131026 && disable(contact.dialStr, 'failed_hard', contact.name)) {
         log('warn', `${n} ${contact.name} disabled — Meta reports this number as undeliverable, so later runs will not retry it`);
       }
-      recordRecipientSkipped(S.currentRunId, contact.dialStr, 'skipped', result.errorCode);
-      log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
+      // 131049 lands here: the per-person marketing cap is about the moment, so
+      // it goes back on the queue rather than out of the run.
+      if (!scheduleRetry(contact, c, result, n)) {
+        recordRecipientSkipped(S.currentRunId, contact.dialStr, 'skipped', result.errorCode);
+        log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
+      }
     } else if (result.rateLimit) {
       log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s. ${result.hint || result.error} [${result.errorCode}]`);
       S.phase = 'paused'; S.pauseReason = 'Rate limit — auto-resuming'; broadcast();
-      await sleep(result.retryAfter);
-      S.phase = 'running'; S.pauseReason = null; broadcast();
+      // Same reason as the daily cap above: Meta's retry-after is minutes, not
+      // seconds, and a Stop must not wait it out.
+      await sleepUntil(Date.now() + result.retryAfter);
+      if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue; // retry same contact
-    } else {
+    } else if (!scheduleRetry(contact, c, result, n)) {
+      // Only counted as failed once the ladder is exhausted or the code was
+      // never retryable. A network blip that is about to be retried is not a
+      // failed send, and counting it as one would put a number on the dashboard
+      // that the queue disagrees with.
       S.failed++;
       // Recorded on the queue row too, so this person appears in the skip
       // report rather than only in a 50-entry ring buffer that /api/start wipes.
       recordRecipientSkipped(S.currentRunId, contact.dialStr, 'failed', result.errorCode);
-      S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: contact.dialStr, name: contact.name, error: result.error, code: result.errorCode, hint: result.hint });
+      S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: contact.dialStr, name: contact.name, error: result.error, code: result.errorCode, hint: result.hint, attempts: (c.attempts || 0) + 1 });
       if (S.failLog.length > 50) S.failLog.shift();
       log('error', `${n} failed [${result.errorCode}] ${result.error}`);
       if (result.hint) log('error', `   ↳ ${result.hint}`);
@@ -303,7 +420,10 @@ function resumeIfInterrupted() {
   const saved = loadCampaign();
   if (!saved) return;
   const p = progressForRun(S.currentRunId);
-  if (saved.phase !== 'running' || p.pending <= 0) {
+  // 'waiting' resumes exactly like 'running': the backoff deadline is a column
+  // on the queue row, so the wait carries on across the restart by itself — the
+  // loop simply re-derives how long is left.
+  if (!['running', 'waiting'].includes(saved.phase) || p.pending <= 0) {
     log('info', `Campaign restored — ${p.sent + p.skipped}/${p.total} done, phase ${S.phase}`);
     return;
   }
@@ -331,4 +451,5 @@ function stageRun(contacts, label = S.config.templateName) {
 module.exports = {
   CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
+  campaignActive, campaignBlocker, scheduleRetry, RETRY_BACKOFF_MS,
 };

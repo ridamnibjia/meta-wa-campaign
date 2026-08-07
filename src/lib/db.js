@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS run_recipients (
   name           TEXT,
   seq            INTEGER NOT NULL,   -- send order, fixed when the run is built
   wamid          TEXT,               -- set on accept; NULL = not yet attempted
-  skipped_reason TEXT,               -- 'disabled' | 'failed' | 'skipped'
+  skipped_reason TEXT,               -- 'disabled' | 'failed' | 'skipped' | 'retry'
   error_code     INTEGER,            -- Meta's code, for the skip report
   attempted_at   INTEGER,
   PRIMARY KEY (run_id, phone)
@@ -216,6 +216,19 @@ function openDb(file) {
   addColumn(d, 'media', 'scan_status',    'TEXT');
   addColumn(d, 'media', 'scan_signature', 'TEXT');
   addColumn(d, 'media', 'scan_at',        'INTEGER');
+  // A failure that was about the MOMENT rather than about the number gets
+  // rescheduled instead of dropped: skipped_reason = 'retry' plus the wall-clock
+  // time it becomes pending again. Both live on the queue row rather than in the
+  // loop, because a timer in memory does not survive the restart the retry is
+  // most likely to be waiting through.
+  addColumn(d, 'run_recipients', 'attempts',    'INTEGER NOT NULL DEFAULT 0');
+  addColumn(d, 'run_recipients', 'retry_after', 'INTEGER');
+  // After addColumn, not in SCHEMA: SCHEMA runs first on every boot, so an index
+  // naming retry_after would throw "no such column" on any database created
+  // before this change — the exact upgrade this file exists to make painless.
+  d.exec(`CREATE INDEX IF NOT EXISTS idx_run_recipients_retry
+            ON run_recipients(run_id, retry_after)
+            WHERE skipped_reason = 'retry' AND wamid IS NULL`);
   return d;
 }
 

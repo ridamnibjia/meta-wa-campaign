@@ -9,9 +9,10 @@ const { recordOutbound, progressForRun, skippedForRun } = require('../services/m
 const { normalizePhone } = require('../lib/phone');
 const { validateTemplate, adoptTemplate, renderBody } = require('../services/templates');
 const { fetchAccountInfo } = require('../services/graph');
-const { skipDisposition, explainError, SKIP_DISPOSITIONS } = require('../lib/errors');
+const { skipDisposition, explainError } = require('../lib/errors');
 const {
   sendTemplate, missingParams, startLoop, saveCampaignNow, clearCampaignFile,
+  campaignBlocker, campaignActive,
 } = require('../services/campaign');
 
 const router = express.Router();
@@ -66,6 +67,16 @@ router.post('/test-send', async (req, res) => {
 });
 
 router.post('/start', async (req, res) => {
+  // One campaign at a time, checked before anything else. On the server rather
+  // than only in the UI: a second tab, a stale page or a curl is otherwise
+  // enough to start a second walk over the same queue, and two loops sharing
+  // one run means duplicate sends to whoever they both reach.
+  //
+  // First, ahead of the credential checks, because it is the more useful answer
+  // when both are true — "your campaign is still going" is what the operator
+  // needs to hear, not a config note about a server that is evidently sending.
+  const blocked = campaignBlocker();
+  if (blocked) return res.json({ ok: false, error: blocked });
   if (!CFG.phoneNumberId) return res.json({ ok: false, error: 'Phone Number ID not configured' });
   if (!CFG.accessToken)   return res.json({ ok: false, error: 'Access Token not configured' });
   const staged = progressForRun(S.currentRunId);
@@ -102,7 +113,10 @@ router.post('/start', async (req, res) => {
   // reset every wamid, and /start after a pause would re-send to everyone who
   // had already received the message.
   S.failed = 0; S.failLog = []; S.logs = [];
-  flags.stopFlag = false; flags.pauseFlag = false; flags.running = false;
+  // `running` is NOT cleared here. It means "a loop is executing" and only the
+  // loop may set it — clearing it from a route was what let startLoop() spawn a
+  // second walk over one queue while the first was still inside an await.
+  flags.stopFlag = false; flags.pauseFlag = false;
   S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast();
   if (W.enabled) log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${effectiveCap()} today`);
   startLoop();
@@ -111,10 +125,14 @@ router.post('/start', async (req, res) => {
 
 router.post('/pause',  (req, res) => { flags.pauseFlag = true;  S.phase = 'paused'; S.pauseReason = 'Paused by user'; saveCampaignNow(); broadcast(); log('info', 'Paused'); res.json({ ok: true }); });
 router.post('/resume', (req, res) => { flags.pauseFlag = false; S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast(); log('info', 'Resumed'); if (!flags.running) startLoop(); res.json({ ok: true }); });
-router.post('/stop',   (req, res) => { flags.stopFlag = true; flags.running = false; flags.pauseFlag = false; S.phase = 'idle'; S.pauseReason = null; saveCampaignNow(); broadcast(); log('info', 'Stopped'); res.json({ ok: true }); });
+// stopFlag is a request, not a fact: the loop reads it within a second and then
+// clears `running` itself. Setting `running = false` from here was a lie the loop
+// had not yet caught up with, and campaignBlocker() believed it — long enough for
+// a Start or a CSV upload to slip in beside a loop that was still sending.
+router.post('/stop',   (req, res) => { flags.stopFlag = true; flags.pauseFlag = false; S.phase = 'idle'; S.pauseReason = null; saveCampaignNow(); broadcast(); log('info', 'Stopped'); res.json({ ok: true }); });
 
 router.post('/reset',  (req, res) => {
-  flags.stopFlag = true; flags.running = false; flags.pauseFlag = false;
+  flags.stopFlag = true; flags.pauseFlag = false;
   // A reset abandons the current run rather than deleting it: campaign_runs and
   // run_recipients are history, and the counters were never the history.
   Object.assign(S, { failed: 0, dailyCount: 0, phase: 'idle', logs: [], failLog: [],
@@ -128,44 +146,81 @@ router.post('/reset',  (req, res) => {
 // about it. Two questions, and they have different answers, which is why this is
 // grouped by disposition rather than by error code.
 //
-// The grouping is lib/errors.js:skipDisposition. Until that function has a body
-// every failed send lands in `unclassified`, which the report says plainly
-// rather than guessing on the operator's behalf — a wrong "retry these" is a
-// list of people you message again for no reason, and a wrong "give up on
-// these" is customers you quietly stop talking to.
+// The grouping is lib/errors.js:skipDisposition. A code that function does not
+// name lands in `unclassified`, which the report says plainly rather than
+// guessing on the operator's behalf — a wrong "retry these" is a list of people
+// you message again for no reason, and a wrong "give up on these" is customers
+// you quietly stop talking to.
+const timeIST = ms => new Date(ms).toLocaleTimeString('en-IN',
+  { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+
+// One plain sentence per contact: how many times we tried, what came back, and
+// what it means. Composed here rather than in the browser so the log, the API
+// and the screen cannot end up telling three versions of the same story.
+// `active` matters: a row on the retry ladder is only going to be tried again if
+// a campaign is still walking the queue. After a Stop the same row is a person
+// left un-messaged, and telling the operator "next attempt 01:21" about a
+// campaign that ended an hour ago is the report lying to them.
+function detailFor(r, active) {
+  if (r.skipped_reason === 'disabled') {
+    return 'Switched off before this run was built — nothing was attempted, and nothing was billed.';
+  }
+  const meaning = explainError(r.error_code)
+    || `Meta returned code ${r.error_code ?? 'none'}, which this app has no description for. Look it up in Meta's error reference before deciding what to do.`;
+  const tried = r.skipped_reason !== 'retry' ? `Tried ${(r.attempts || 0) + 1}×`
+    : active ? `Tried ${r.attempts || 1}× so far, next attempt ${r.retry_after ? timeIST(r.retry_after) : 'shortly'}`
+    : `Tried ${r.attempts || 1}×, then the campaign was stopped before the next attempt`;
+  // A full stop, not a third dash: `meaning` already carries a "what — what to
+  // do" dash of its own, and three in one line stops being a sentence.
+  return `${tried}. ${meaning}`;
+}
+
 router.get('/campaign/skips', (req, res) => {
   const runId = req.query.run ? Number(req.query.run) : S.currentRunId;
   const rows  = skippedForRun(runId);
+  // Only meaningful for the CURRENT run: an old run's rows are never picked up
+  // again whatever the loop is doing now.
+  const active = campaignActive() && runId === S.currentRunId;
 
   const groups = {};
   for (const r of rows) {
-    // A contact who was switched off before the run started is not a failure
-    // and does not belong in either "try again" or "give up" — nobody attempted
-    // anything.
-    const key = r.skipped_reason === 'disabled' ? 'disabled' : skipDisposition(r.error_code);
+    // Three cases that are not a disposition at all:
+    // `disabled` — nobody attempted anything, so it belongs in neither "try
+    // again" nor "give up"; and `retry` — the contact is still queued, on the
+    // backoff ladder, and reporting them as not-messaged would be premature.
+    const key = r.skipped_reason === 'disabled' ? 'disabled'
+              : r.skipped_reason === 'retry'    ? 'waiting'
+              : skipDisposition(r.error_code);
     (groups[key] ||= []).push({
       phone: r.phone, name: r.name,
       reason: r.skipped_reason, code: r.error_code,
       explanation: explainError(r.error_code),
+      detail: detailFor(r, active),
+      // A disabled row was never sent to, so its attempt count is zero — not the
+      // "one attempt" every other row has had by the time it lands here.
+      attempts: r.skipped_reason === 'disabled' ? 0
+              : r.skipped_reason === 'retry'    ? (r.attempts || 0)
+              : (r.attempts || 0) + 1,
+      retryAt: r.skipped_reason === 'retry' ? r.retry_after : null,
       at: r.attempted_at,
     });
   }
 
   res.json({
     runId,
+    active,
     progress: progressForRun(runId),
     total: rows.length,
     // Named so the UI does not have to know the vocabulary, and so an empty
     // group is still a group the operator can see is empty.
     groups: {
+      waiting:      groups.waiting      || [],
       retry:        groups.retry        || [],
       fix:          groups.fix          || [],
       permanent:    groups.permanent    || [],
       disabled:     groups.disabled     || [],
       unclassified: groups.unclassified || [],
     },
-    classifierReady: SKIP_DISPOSITIONS.some(d => d !== 'unclassified' && (groups[d] || []).length > 0)
-      || rows.length === 0,
   });
 });
 

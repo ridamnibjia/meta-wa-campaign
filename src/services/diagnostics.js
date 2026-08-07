@@ -6,6 +6,7 @@
 // information — it is the difference between an operator who can answer "is
 // this thing working?" and one who has to guess.
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { FILES, MEDIA_DIR, UPLOAD_DIR, MEDIA_LIMITS, CFG, CLAMAV } = require('../config');
 const { db } = require('../lib/db');
@@ -14,6 +15,35 @@ const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap } = require('./warmu
 const { scannerConfigured } = require('../lib/clamav');
 
 const one = sql => db.prepare(sql);
+
+// ── Can this machine actually run the scanner it was told to use? ──────────────
+// clamd mmaps the whole signature database, about 1.2 GB, and freshclam briefly
+// holds TWO copies while it swaps a new one in. Add node and one 100 MB media
+// buffer and a scanning deployment wants ~2 GB before the OS gets a page of
+// cache — so on a 2 GB box the reload is what kills something, at 3am, days
+// after the deploy looked fine.
+//
+// It is a warning and not a refusal on purpose: which process the kernel picks
+// is not ours to decide, and an operator who has tuned clamd's own limits down
+// may genuinely be fine. But the failure it produces — clamd gone, therefore
+// "configured but broken", therefore every media save refused — reads as an app
+// bug rather than as an out-of-memory kill, so it is worth saying up front.
+// Two numbers, deliberately different: the floor below which this warns, and
+// what to actually buy. Recommending the floor would put the machine one
+// signature update away from the same warning.
+const CLAMD_WANTS_BYTES   = 3 * 1024 * 1024 * 1024;
+const CLAMD_COMFORT_BYTES = 4 * 1024 * 1024 * 1024;
+const gb = b => `${(b / 1024 ** 3).toFixed(1)} GB`;
+
+function memoryWarning(totalBytes = os.totalmem()) {
+  if (!scannerConfigured() || totalBytes >= CLAMD_WANTS_BYTES) return null;
+  return `CLAMAV_ADDRESS is set but this machine has ${gb(totalBytes)} of RAM. `
+       + `clamd holds its signature database in memory (~1.2 GB) and freshclam briefly `
+       + `holds two copies while it swaps a new one in, so the kernel may kill clamd or `
+       + `this app during an update — and a clamd that is configured but unreachable `
+       + `refuses every media save by design. Either give the VM ${gb(CLAMD_COMFORT_BYTES)}, `
+       + `or unset CLAMAV_ADDRESS and rely on the file-risk tiers, which need no daemon.`;
+}
 
 const webhookStats = one(`
   SELECT count(*)                                                  AS total,
@@ -134,6 +164,11 @@ function snapshot({ now = Date.now() } = {}) {
       configured: scannerConfigured(),
       address:    CLAMAV.address ? 'set' : null,   // never the path itself
       timeoutMs:  CLAMAV.timeoutMs,
+      // Total RAM, and the sentence to act on if there is not enough of it for
+      // the scanner this deployment asked for. Null when the machine is fine or
+      // no scanner is configured.
+      totalMemBytes: os.totalmem(),
+      memoryWarning: memoryWarning(),
     },
 
     storage: {
@@ -155,4 +190,4 @@ function snapshot({ now = Date.now() } = {}) {
   };
 }
 
-module.exports = { snapshot };
+module.exports = { snapshot, memoryWarning, CLAMD_WANTS_BYTES, CLAMD_COMFORT_BYTES };

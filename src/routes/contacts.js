@@ -5,16 +5,38 @@ const { S, log, todayKey } = require('../state');
 const { parseCSV, normalizePhone } = require('../lib/phone');
 const contacts = require('../services/contacts');
 const { recipientsForRun, progressForRun } = require('../services/messages');
-const { saveCampaignNow, stageRun } = require('../services/campaign');
+const { saveCampaignNow, stageRun, campaignBlocker } = require('../services/campaign');
 const { broadcast } = require('../services/status');
 const { rateFor, billableCount, estimateCost } = require('../lib/pricing');
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+// memoryStorage with no ceiling is an unbounded allocation on a 2 GB VM that
+// also holds the message store. 25 MB is roughly a 400k-row contact export —
+// far past any list this app is built for, and small enough that a mistyped
+// upload cannot take SQLite down with it.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-router.post('/upload-csv', upload.single('csv'), (req, res) => {
+// Same shape as routes/media.js: multer's own errors are translated here rather
+// than left to Express's default handler, which answers a rejected upload with
+// an HTML 500 the browser cannot turn into a sentence.
+router.post('/upload-csv', (req, res, next) => {
+  upload.single('csv')(req, res, err => {
+    if (err) {
+      return res.json({ ok: false, error: err.code === 'LIMIT_FILE_SIZE'
+        ? 'That CSV is over 25 MB. Split it, or remove the columns this app does not read.'
+        : err.message });
+    }
+    next();
+  });
+}, (req, res) => {
   try {
     if (!req.file) return res.json({ ok: false, error: 'No file received' });
+    // stageRun replaces the queue for a new run, so uploading over a live
+    // campaign would orphan whoever it had not reached yet — including everyone
+    // parked on the retry ladder. Writing a new template is fine; swapping the
+    // list out from under a running send is not.
+    const blocked = campaignBlocker();
+    if (blocked) return res.json({ ok: false, error: blocked });
     const { contacts: parsed, skipped } = parseCSV(req.file.buffer);
     // The durable list is updated before the send queue, and the upsert
     // deliberately does not touch `enabled`: re-uploading a CSV must never

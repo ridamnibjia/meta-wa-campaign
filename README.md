@@ -287,13 +287,37 @@ you stopped messaging them.
 
 ### The skip report
 
-After a run, **Not messaged** on the Campaign page lists everyone who did not get
-it, grouped by what you can do about it: worth trying again, fix something first,
-or Meta will never deliver these. The grouping comes from `skipDisposition()` in
-`src/lib/errors.js`. Until that function is given a body, every failed send is
-shown under **Not yet classified** rather than sorted — a wrong "retry these" is
-a list of people you message again for no reason, and a wrong "give up on these"
-is customers you quietly stop talking to.
+After a run, **Not messaged yet** on the Campaign page lists everyone who did not
+get it, grouped by what you can do about it: waiting to retry, worth trying again
+another day, fix something first, or Meta will never deliver these. Each row says
+how many times it was attempted and what Meta answered.
+
+The grouping comes from `skipDisposition()` in `src/lib/errors.js`, which is a
+whitelist in both directions: a code has to be named to be retried, and a code
+has to be named to be given up on. Anything Meta sends that is not in the table
+shows under **Not yet classified** with its raw code — a wrong "retry these" is a
+list of people you message again for no reason, and a wrong "give up on these" is
+customers you quietly stop talking to.
+
+### The retry ladder
+
+A send that fails for a reason about the **moment** rather than about the
+**number** goes back on the queue instead of out of the run: a network throw, a
+Meta fault, or `131049` (the per-person marketing cap, which is counted across
+every business messaging that person and has nothing to do with your settings).
+
+Four attempts in all — the original, then one an hour later, one two hours after
+that, one four hours after that. The deadline is a column on the queue row
+(`run_recipients.retry_after`), not a timer in memory, so it survives a restart
+and the campaign resumes its own wait. While any contact is on the ladder the run
+is **not finished**: the phase is `waiting`, the contact still counts as pending
+and as billable, and starting another campaign or uploading a new list is refused
+until this one finishes or you stop it. Stopping leaves those contacts
+un-messaged and says so.
+
+Before this, one DNS blip at contact #340 dropped that person from the run
+permanently, and the only way to reach them was re-uploading the CSV — which
+opens a new run and messages everyone a second time.
 
 ### Search
 
@@ -550,7 +574,10 @@ the next unsent contact rather than restarting the list.
 
 ### Option C: DigitalOcean Droplet (everything)
 
-Recommended for reliable multi-day campaigns. The existing `$8/mo` 1GB droplet works perfectly — this app uses ~50MB RAM (no Chrome).
+Recommended for reliable multi-day campaigns. The existing `$8/mo` 1 GB droplet
+works perfectly — this app uses ~50 MB RAM (no Chrome). **Unless you want
+ClamAV**, which needs ~1 GB to itself and about 4 GB on the box; see the virus
+scanning section.
 
 ```bash
 ssh root@YOUR_DROPLET_IP
@@ -703,13 +730,21 @@ querying `messages`, not incremented by hand.
 **Campaign loop:** A `while` loop inside an async function. Uses `await sleep(ms)` to pause between sends — this yields the event loop so Express can still handle HTTP requests (pause, stop) while the campaign runs. No background threads. No workers. Just async/await.
 
 ```
-while contacts remain:
+while true:
   if stopFlag → exit
   if pauseFlag → sleep 500ms, continue
-  if daily cap reached → sleep until midnight, continue
+  ask the queue for the next contact (SQL, never a counter)
+  if none right now:
+      if any contact is on the retry ladder → phase = waiting,
+          sleep in 1s slices until the earliest deadline, continue
+      else → phase = done, exit
+  if daily cap reached → sleep until midnight IST, continue
+  if contact was disabled since the queue was built → record 'disabled', continue
   POST to Meta API with template name + recipient phone
   if 429 rate limit → sleep retry-after seconds, retry same contact
-  if skip code (opted out / ecosystem health) → increment skipped, continue
+  if the error code is retryable and attempts remain
+      → stamp retry_after on the row (1h → 2h → 4h), continue
+  if skip code (opted out / undeliverable) → record 'skipped', continue
   if other error → increment failed, log it, continue
   increment accepted, sleep delaySec seconds
   broadcast updated state to all connected browsers via Socket.io
@@ -817,7 +852,7 @@ See [Inbound customer media](#inbound-customer-media) for what these actually do
 
 | Variable | Default | Description |
 |---|---|---|
-| `CLAMAV_ADDRESS` | unset | Unix socket path (`/var/run/clamav/clamd.ctl`) or `host:port` for `clamd`. Unset disables scanning and files are labelled "not virus-scanned". Set but unreachable **refuses saves** rather than silently passing them. Budget ~1 GB RAM for `clamd`. |
+| `CLAMAV_ADDRESS` | unset | Unix socket path (`/var/run/clamav/clamd.ctl`) or `host:port` for `clamd`. Unset disables scanning and files are labelled "not virus-scanned". Set but unreachable **refuses saves** rather than silently passing them. Budget ~1 GB RAM for `clamd` and ~4 GB on the machine; under 3 GB the app warns at boot. |
 | `CLAMAV_TIMEOUT_MS` | `30000` | How long to wait for a scan verdict before refusing the save. |
 | `WA_MEDIA_RETENTION_DAYS` | `90` | How long a saved inbound file stays on this server. The row survives the sweep; only the bytes go. |
 | `WA_MEDIA_MAX_BYTES` | `104857600` | Largest inbound file this server will download (100 MB — Meta's own document maximum). |
@@ -841,17 +876,26 @@ estimate.** Set these to your own country's rates from
 
 ## 13. Meta Error Codes
 
+The **App behavior** column is `skipDisposition()` in `src/lib/errors.js`, and it
+is the same table the skip report groups by. `retry` puts the contact back on the
+queue (1h → 2h → 4h, four attempts); `fix` means retrying unchanged just
+reproduces the failure once per contact.
+
 | Code | Meaning | App behavior |
 |---|---|---|
-| `131026` | Recipient opted out of marketing | Skipped (not counted as failure) |
-| `131049` | Ecosystem health — Meta throttle | Skipped |
-| `131047` | Re-engagement window expired | Skipped |
-| `130429` | Rate limit hit | Auto-retry with backoff |
-| `132000` | Template not found | Failed — check template name spelling |
-| `132001` | Template not approved | Failed — approve in Meta dashboard |
-| `131005` | Access denied | Failed — check token has correct permissions |
-| `100` | Invalid parameter | Failed — check Phone Number ID format |
-| `-1` | Network error (no response from Meta) | Failed — check server connectivity |
+| `131026` | Not on WhatsApp, or blocked by Meta on quality grounds | `permanent` — contact disabled `failed_hard`, never retried |
+| `131049` | Per-person marketing cap, counted across every business | `retry` — nothing on your side caused it or fixes it |
+| `131000`, `131016` | Meta fault it tells you is transient | `retry` |
+| `130429`, `80007`, `4` | Rate limit | Slept off in the loop; `retry` if one survives that |
+| `-1` | Network error (no response from Meta) | `retry` — the blip that used to drop one contact from a run forever |
+| `131047` | Re-engagement window expired | `fix` — we sent the wrong kind of message |
+| `132000`, `132001` | Template not found / not approved | `fix` — check the name, or approve it in the dashboard |
+| `132015`, `132016` | Template paused or disabled by Meta | `fix` — every remaining send fails identically |
+| `131042` | Billing not set up | `fix` |
+| `131031` | Account locked on policy grounds | `fix` |
+| `190`, `10`, `200` | Bad token / missing permission | `fix` — 400 identical failures otherwise |
+| `100` | Invalid parameter | `fix` — check Phone Number ID format |
+| anything else | Meta sent a code this app has no entry for | `unclassified` — shown raw, never guessed |
 
 ---
 
@@ -960,9 +1004,22 @@ CLAMAV_ADDRESS=/var/run/clamav/clamd.ctl
 CLAMAV_TIMEOUT_MS=30000
 ```
 
-**Budget about 1 GB of RAM.** `clamd` holds the entire signature database in
-memory, and that number — not CPU, not disk — is what decides whether you can
-run it. On a 1 GB VM, leave `CLAMAV_ADDRESS` unset.
+**Budget about 1 GB of RAM for `clamd` alone, and 4 GB on the machine.** `clamd`
+holds the entire signature database in memory, and that number — not CPU, not
+disk — is what decides whether you can run it. Worse, `freshclam` briefly holds
+**two** copies while it swaps a new database in, which is why the crash tends to
+arrive days after a deploy that looked fine.
+
+The app checks this at boot and on the Diagnostics page: with `CLAMAV_ADDRESS` set
+on a machine under 3 GB you get a warning naming both ways out. It is a warning
+and not a refusal — which process the kernel kills is not ours to decide, and an
+operator who has tuned `clamd`'s own limits may be fine. But know the failure
+mode: if `clamd` is the one killed, it is then *configured but unreachable*, and
+every media save is refused (by design — see the fail-closed rule above), which
+reads like an app bug rather than an out-of-memory kill.
+
+On 1–2 GB, leave `CLAMAV_ADDRESS` unset. The three-signal file-risk classifier
+still runs and still labels every file; it needs no daemon.
 
 Prove it actually works before you trust it. EICAR is a harmless standard test
 string every scanner is required to flag:

@@ -3,7 +3,8 @@ const { CFG, LIMITS, OPT_OUT_LABEL, PRICES } = require('../config');
 const { S, emit, todayKey } = require('../state');
 const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap } = require('./warmup');
 const { counts: contactCounts } = require('./contacts');
-const { countsForRun, progressForRun, nextPending, billableForRun } = require('./messages');
+const { countsForRun, progressForRun, nextPending, billableForRun,
+        nextRetryForRun, lastRunSummary } = require('./messages');
 const { rateFor, estimateCost, spentCost } = require('../lib/pricing');
 const inbox = require('./inbox');
 
@@ -34,6 +35,15 @@ function buildState() {
     // The operator wants "did not arrive", which is both.
     failed:         S.failed + c.failed,
     skipped:        p.skipped,
+    // Contacts a moment-based failure put back on the queue. They are neither
+    // sent nor skipped, and a run is not finished while any remain — which is
+    // why this is its own number rather than folded into either.
+    retrying:       p.retrying,
+    nextRetry:      nextRetryForRun(S.currentRunId),
+    // What the last send actually did, read from campaign_runs rather than from
+    // the current run — so it still answers the question after a Reset, which
+    // is exactly when it gets asked.
+    lastRun:        lastRunSummary(),
     dailyCount:     S.dailyCount,
     dailyCap:       effectiveCap(),
     quality:        S.quality,

@@ -6,6 +6,12 @@
 // about where to click. Only codes reachable from this app's flows are listed;
 // anything unlisted falls through to Meta's own message.
 const META_ERRORS = {
+  // -1 is OURS, not Meta's: fetch threw, so there is no Meta response to have a
+  // code in. It is listed here because everything downstream — the skip report,
+  // the failure list — looks a code up in this table, and without an entry the
+  // report told the operator to look -1 up in Meta's error reference, which does
+  // not mention it and never will.
+  '-1':   ['Could not reach Meta from this server',   'A network problem on the machine running this server — DNS, TLS, no outbound access, or credentials that are not set. Nothing is wrong with the contact, and a running campaign retries the send on its own.'],
   4:      ['App hit its hourly API call limit',        'The loop backs off on its own. If it repeats, raise "Delay between sends".'],
   10:     ['Permission denied for this action',        'The token is missing whatsapp_business_messaging or whatsapp_business_management. Regenerate it with both.'],
   33:     ['Phone Number ID not found',                'PHONE_NUMBER_ID is wrong, or the token belongs to a different app. Recheck WhatsApp → API Setup.'],
@@ -68,14 +74,47 @@ function explainError(code) {
 //   Meta faults · 132000 / 132001 / 131008 template mismatches · 132015 /
 //   132016 template paused or disabled · 131042 billing · 131031 policy lock
 //
-// TODO(you): write the body. Everything downstream is wired and tested against
-// whatever you decide — services/campaign.js records the code on the recipient
-// row, and routes/campaign.js groups the report by this return value. Until it
-// returns something, every skip lands in the 'unclassified' bucket, which the
-// report renders honestly rather than guessing on your behalf.
+// The table below is the policy. It is deliberately a whitelist in both
+// directions: a code has to be named to be retried, and a code has to be named
+// to be given up on. Anything unlisted is 'unclassified', which the loop treats
+// as "do not retry" and the report renders with the raw code rather than a
+// guess — a Meta code we have never seen must not silently cost re-sends, and
+// must not silently write someone off either.
 const SKIP_DISPOSITIONS = ['retry', 'permanent', 'fix', 'unclassified'];
 
-function skipDisposition(code) {   // eslint-disable-line no-unused-vars
+// About the MOMENT. Trying the same number again later is reasonable.
+//   -1     is ours, not Meta's: fetch threw. DNS, TLS, no outbound network, or
+//          the header asset failed to upload. The single most common reason a
+//          contact used to be dropped from a run forever — one blip at #340.
+//   131049 is the per-user marketing cap, counted across every business
+//          messaging that person. Nothing on our side caused it or fixes it.
+//   131000 / 131016 are Meta faults it tells you are transient.
+//   130429 / 80007 / 4 are rate limits. The loop already sleeps and re-sends
+//          these without touching the queue; they are listed so that one which
+//          survives the in-loop backoff still lands in "try again" rather than
+//          in a bucket that reads as final.
+const RETRY = new Set([-1, 4, 80007, 130429, 131000, 131016, 131049]);
+
+// About the NUMBER. No amount of retrying changes the answer, and the contact
+// has already been disabled with 'failed_hard' by the campaign loop.
+const PERMANENT = new Set([131026]);
+
+// About US. A human can correct the cause, and doing so makes the whole
+// remaining list sendable — which is why these are not 'retry': retrying
+// unchanged just reproduces the failure once per contact.
+const FIX = new Set([
+  10, 33, 100, 190, 200,            // token / permissions / wrong id
+  131008, 131009, 131021, 131047,   // bad variable, own number, wrong message type for the window
+  131031, 131042, 133010,           // policy lock, billing, number not registered
+  131051, 132000, 132001, 132005,   // template drifted from what was approved
+  132007, 132012, 132015, 132016, 2388023,
+]);
+
+function skipDisposition(code) {
+  const n = Number(code);
+  if (RETRY.has(n))     return 'retry';
+  if (PERMANENT.has(n)) return 'permanent';
+  if (FIX.has(n))       return 'fix';
   return 'unclassified';
 }
 

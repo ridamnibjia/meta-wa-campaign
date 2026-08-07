@@ -1,5 +1,8 @@
 node_modules/
-.env
+# .env* rather than .env: deploys leave .env.bak-<timestamp> beside it, and a
+# bare `.env` rule does not match those — one `git add -A` on a box that has
+# them is a token in a public repo.
+.env*
 *.log
 .DS_Store
 Thumbs.db

@@ -8,7 +8,10 @@ const { CFG } = require('./config');
 // run, and the resume point is derived from it — see services/messages.js. What
 // is left is pacing state a database row has no opinion about.
 const S = {
-  phase:      'idle',   // idle | running | paused | done
+  // 'waiting' is running-but-idle: every contact left is on the retry ladder and
+  // the loop is asleep until the earliest of them comes due. It is deliberately
+  // not 'paused' — nobody paused it, and it resumes itself.
+  phase:      'idle',   // idle | running | waiting | paused | done
   failed:     0,        // Graph API rejected the send — no wamid exists, so no row
   dailyCount: 0,
   dailyDate:  null,

@@ -164,7 +164,19 @@ function Diagnostics() {
           <Row label="Virus scanner" value={d.scanner.configured
             ? `on (${Math.round(d.scanner.timeoutMs / 1000)}s timeout)`
             : 'off — saved files are marked "not scanned"'} tone={d.scanner.configured ? 'good' : undefined} />
+          <Row label="Machine RAM" value={bytes(d.scanner.totalMemBytes)}
+               tone={d.scanner.memoryWarning ? 'bad' : undefined} />
         </CardContent>
+        {/* Only when there is something to do about it. The failure it predicts —
+            clamd killed for memory, therefore every media save refused — reads
+            like an app bug rather than an out-of-memory kill. */}
+        {d.scanner.memoryWarning && (
+          <CardContent className="pt-0">
+            <Alert variant="warning" title="Not enough RAM for the scanner this server was told to use">
+              {d.scanner.memoryWarning}
+            </Alert>
+          </CardContent>
+        )}
       </Card>
 
       {/* Sending */}

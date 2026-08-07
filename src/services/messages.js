@@ -203,26 +203,72 @@ const insertRecipient = db.prepare(`
 
 // LIMIT 1, ORDER BY seq, on the partial index. The loop asks this once per
 // message rather than holding the list in memory.
+//
+// A 'retry' row whose retry_after has passed is pending again — that is the
+// whole retry feature, expressed as a widening of this WHERE rather than as a
+// second queue the loop would have to merge. `attempts` comes back with it so
+// the caller can decide whether this is the last go.
+//
+// The two `?` for the clock are the same value bound twice: node:sqlite binds
+// anonymous placeholders strictly by position and throws if you mix in ?2.
 const nextPendingQ = db.prepare(`
-  SELECT phone, name, seq FROM run_recipients
-   WHERE run_id = ? AND wamid IS NULL AND skipped_reason IS NULL
+  SELECT phone, name, seq, attempts, retry_after FROM run_recipients
+   WHERE run_id = ? AND wamid IS NULL
+     AND (skipped_reason IS NULL OR (skipped_reason = 'retry' AND retry_after <= ?))
    ORDER BY seq LIMIT 1
 `);
 
-const markSent = db.prepare(
-  'UPDATE run_recipients SET wamid = ?, attempted_at = ? WHERE run_id = ? AND phone = ?');
-const markSkipped = db.prepare(
-  'UPDATE run_recipients SET skipped_reason = ?, error_code = ?, attempted_at = ? WHERE run_id = ? AND phone = ?');
+// The soonest a row waiting on backoff becomes sendable, or null when none are.
+// This is what tells a drained-but-not-finished run to wait rather than declare
+// itself done.
+const nextRetryAtQ = db.prepare(`
+  SELECT min(retry_after) AS at, count(*) AS n FROM run_recipients
+   WHERE run_id = ? AND wamid IS NULL AND skipped_reason = 'retry'
+`);
+
+// skipped_reason and retry_after are cleared on success: a row that failed
+// once, waited, and then went out is a SENT row, not a sent-and-also-retrying
+// one. Leaving them set would double-count it in every progress query below.
+const markSent = db.prepare(`
+  UPDATE run_recipients
+     SET wamid = ?, attempted_at = ?, skipped_reason = NULL, error_code = NULL, retry_after = NULL
+   WHERE run_id = ? AND phone = ?
+`);
+// retry_after is cleared here too — a permanently skipped row must never look
+// pending again, whatever it was waiting for before.
+const markSkipped = db.prepare(`
+  UPDATE run_recipients
+     SET skipped_reason = ?, error_code = ?, attempted_at = ?, retry_after = NULL
+   WHERE run_id = ? AND phone = ?
+`);
+// attempts is incremented in SQL rather than read-modify-written in JS: the row
+// is the only place the count lives, and a crash between the read and the write
+// would otherwise hand the contact a free extra attempt on every restart.
+const markRetry = db.prepare(`
+  UPDATE run_recipients
+     SET skipped_reason = 'retry', error_code = ?, attempted_at = ?,
+         retry_after = ?, attempts = attempts + 1
+   WHERE run_id = ? AND phone = ?
+`);
 
 // `disabled` is broken out from `skipped` because it is the only skip that
 // costs nothing and was known in advance: pricing subtracts it to get the
 // billable count, and the operator reads it as "these people are on your list
 // but switched off" rather than "these sends failed".
+//
+// 'retry' is counted apart from every other skipped_reason and NOT as skipped:
+// a row waiting on backoff has not been given up on, it is queued for later.
+// Folding it into `skipped` would make a run with people still to message
+// report itself as finished — which is exactly the leak the retry ladder exists
+// to close.
 const progressQ = db.prepare(`
   SELECT count(*)                                                    AS total,
          sum(CASE WHEN wamid IS NOT NULL THEN 1 ELSE 0 END)          AS sent,
-         sum(CASE WHEN skipped_reason IS NOT NULL THEN 1 ELSE 0 END) AS skipped,
-         sum(CASE WHEN skipped_reason = 'disabled' THEN 1 ELSE 0 END) AS disabled
+         sum(CASE WHEN skipped_reason IS NOT NULL
+                   AND skipped_reason <> 'retry' THEN 1 ELSE 0 END)  AS skipped,
+         sum(CASE WHEN skipped_reason = 'disabled' THEN 1 ELSE 0 END) AS disabled,
+         sum(CASE WHEN wamid IS NULL
+                   AND skipped_reason = 'retry' THEN 1 ELSE 0 END)   AS retrying
     FROM run_recipients WHERE run_id = ?
 `);
 
@@ -235,25 +281,31 @@ const progressQ = db.prepare(`
 //
 // A row that already went out is counted whatever happened to the contact
 // afterwards: that message was sent and will be billed. A row skipped for any
-// reason cost nothing and is not.
+// reason cost nothing and is not — but a row waiting on a retry is still going
+// to be attempted, so it is billable exactly like an untouched one.
 const billableQ = db.prepare(`
   SELECT count(*) AS n
     FROM run_recipients r
     LEFT JOIN contacts c ON c.phone = r.phone
    WHERE r.run_id = ?
      AND ( r.wamid IS NOT NULL
-        OR (r.skipped_reason IS NULL AND COALESCE(c.enabled, 1) = 1) )
+        OR ((r.skipped_reason IS NULL OR r.skipped_reason = 'retry')
+             AND COALESCE(c.enabled, 1) = 1) )
 `);
 
+// attempts and retry_after travel with the report: "we tried this person three
+// times and Meta said the same thing each time" is a different sentence to "we
+// tried once", and the operator is the one who has to act on the difference.
 const skippedQ = db.prepare(`
-  SELECT phone, name, skipped_reason, error_code, attempted_at
+  SELECT phone, name, skipped_reason, error_code, attempted_at, attempts, retry_after
     FROM run_recipients
    WHERE run_id = ? AND skipped_reason IS NOT NULL
    ORDER BY seq
 `);
 
 const recipientsQ = db.prepare(
-  'SELECT phone, name, seq, wamid, skipped_reason, error_code FROM run_recipients WHERE run_id = ? ORDER BY seq');
+  `SELECT phone, name, seq, wamid, skipped_reason, error_code, attempts, retry_after
+     FROM run_recipients WHERE run_id = ? ORDER BY seq`);
 
 // Building a run twice for the same id replaces it: /upload-csv opens a fresh
 // run for every upload, so this only ever fires if a caller reuses one.
@@ -281,7 +333,10 @@ function buildRun(runId, contacts, disabledFor = () => null) {
   return progressForRun(runId);
 }
 
-const nextPending = runId => (runId == null ? null : nextPendingQ.get(runId) || null);
+// `now` is a parameter rather than a Date.now() inside the query so a test can
+// ask "what is pending at 9pm" without waiting until 9pm.
+const nextPending = (runId, now = Date.now()) =>
+  (runId == null ? null : nextPendingQ.get(runId, now) || null);
 
 const recordRecipientSent = (runId, phone, wamid) =>
   markSent.run(wamid, Date.now(), runId, phone);
@@ -289,21 +344,57 @@ const recordRecipientSent = (runId, phone, wamid) =>
 const recordRecipientSkipped = (runId, phone, reason, errorCode = null) =>
   markSkipped.run(reason, errorCode, Date.now(), runId, phone);
 
+// Puts a contact back in the queue at a stated time instead of dropping them.
+const recordRecipientRetry = (runId, phone, errorCode, retryAfter) =>
+  markRetry.run(errorCode, Date.now(), retryAfter, runId, phone);
+
+// { at, count } for the rows waiting on backoff, or null when there are none.
+function nextRetryForRun(runId) {
+  if (runId == null) return null;
+  const r = nextRetryAtQ.get(runId);
+  return r && r.n ? { at: r.at, count: r.n } : null;
+}
+
 function progressForRun(runId) {
-  if (runId == null) return { total: 0, sent: 0, skipped: 0, disabled: 0, pending: 0 };
+  if (runId == null) return { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0 };
   const r = progressQ.get(runId);
   const total = r.total || 0, sent = r.sent || 0, skipped = r.skipped || 0;
-  return { total, sent, skipped, disabled: r.disabled || 0, pending: total - sent - skipped };
+  // `pending` therefore includes the rows waiting on backoff. That is the point:
+  // the run is not finished while any of them are outstanding.
+  return { total, sent, skipped, disabled: r.disabled || 0, retrying: r.retrying || 0,
+           pending: total - sent - skipped };
 }
 
 const billableForRun  = runId => (runId == null ? 0 : billableQ.get(runId).n || 0);
 const skippedForRun   = runId => (runId == null ? [] : skippedQ.all(runId));
 const recipientsForRun = runId => (runId == null ? [] : recipientsQ.all(runId));
 
+// ── The last campaign ──────────────────────────────────────────────────────────
+// Read from campaign_runs rather than from S.currentRunId, so it still answers
+// "what did the last send do" after a Reset has dropped the current run — which
+// is precisely when an operator asks. Everything in it is derived; there is no
+// stored summary that can disagree with the rows.
+const lastRunQ = db.prepare(
+  'SELECT id, started_at, label, template_lang FROM campaign_runs ORDER BY id DESC LIMIT 1');
+
+function lastRunSummary() {
+  const r = lastRunQ.get();
+  if (!r) return null;
+  const progress = progressForRun(r.id);
+  return {
+    id: r.id, label: r.label, startedAt: r.started_at, language: r.template_lang,
+    progress, counts: countsForRun(r.id), nextRetry: nextRetryForRun(r.id),
+    // "Unfinished" is a property of the queue, not of S.phase: a run with rows
+    // still pending is unfinished even if the process died and forgot it.
+    unfinished: progress.pending > 0,
+  };
+}
+
 module.exports = {
   applyStatus, STATUS_RANK, countsForRun,
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
+  recordRecipientRetry, nextRetryForRun, lastRunSummary,
   progressForRun, skippedForRun, recipientsForRun, billableForRun,
 };

@@ -85,10 +85,43 @@ it is the bucket inbox replies and migrated legacy rows deliberately land in.
 Querying it for a null run reports every reply as campaign traffic.
 
 **The resume point is a query, not a counter.** `run_recipients` is walked with
-`WHERE wamid IS NULL AND skipped_reason IS NULL ORDER BY seq LIMIT 1`. The
-recipient row is stamped *before* the message row, so the residual risk is one
-duplicate message — never an omission. The previous design saved an index, and
-an index a crash leaves ahead of reality silently skips people.
+`WHERE wamid IS NULL AND (skipped_reason IS NULL OR (skipped_reason = 'retry' AND
+retry_after <= ?)) ORDER BY seq LIMIT 1`. The recipient row is stamped *before*
+the message row, so the residual risk is one duplicate message — never an
+omission. The previous design saved an index, and an index a crash leaves ahead
+of reality silently skips people.
+
+**The retry deadline is a column, not a timer.** A failure `skipDisposition()`
+calls `retry` gets `skipped_reason = 'retry'` plus `retry_after`, and becomes
+pending again by widening the query above — not by a second queue the loop has to
+merge, and not by a `setTimeout` that a restart forgets. `attempts` is
+incremented in SQL for the same reason: read-modify-write in JS hands the contact
+a free extra attempt on every crash. Three waits, 1h → 2h → 4h, so four attempts.
+`retrying` is counted apart from `skipped` — folding it in would report a run
+finished with people still owed a message, which is the leak the ladder exists to
+close.
+
+**`flags.running` is owned by the loop.** It means "a loop is executing", and only
+`startLoop()` and the loop's own exit may write it. Routes set `stopFlag` /
+`pauseFlag`, which are *requests*. Three routes used to set `running = false`
+themselves, which made `campaignBlocker()` believe a loop that was still inside an
+`await` had finished — long enough for a Start to put a second loop on the same
+queue and message people twice. A `waiting` phase made that window hours long.
+
+**One campaign at a time, enforced server-side.** `campaignBlocker()` guards both
+`/api/start` and `/api/upload-csv`, because `stageRun` *replaces* `run_recipients`
+and an upload opens a new run: uploading mid-flight orphans everyone the live run
+had not reached, including everyone parked on the retry ladder. The UI says so
+too, but the server is the one that counts — a second tab or a curl is otherwise
+enough.
+
+**`skipDisposition` is a whitelist in both directions.** A code has to be named
+to be retried, and named to be given up on; anything unlisted is `unclassified`,
+which never retries and is reported with its raw code. A new Meta code must not
+silently cost re-sends, nor silently write a customer off. `-1` is ours, not
+Meta's — fetch threw, so there is no Meta response to carry a code — and it sits
+in `META_ERRORS` only so the report stops telling operators to look it up in
+Meta's reference, which will never list it.
 
 **The CSV upsert does not touch `enabled`.** Re-uploading a file must never
 resurrect someone who opted out. The requirement is an *absence* in the
@@ -146,6 +179,14 @@ exist. Do not add a non-idempotent write to `processEnvelope`.
 - **Frontend scripts share one global scope** and load in the order listed in
   `index.html`. A `const` used by two views belongs in `ui.jsx`, which loads
   first.
+- **React, Babel and Tailwind are vendored in `public/vendor/`, not on a CDN.**
+  This dashboard holds a session cookie and a Meta token that can spend money, so
+  a compromised unpkg would own both. Committing the prebuilt files keeps the
+  no-build-step property *and* removes the supply chain — do not "tidy" them back
+  into `<script src="https://…">`. Versions are pinned in the filenames' own
+  provenance: React 18.3.1, Babel standalone 7.28.4, Tailwind CDN 3.4.16. Babel
+  must stay on 7 — 8 defaults JSX to the automatic runtime, which emits an ESM
+  `import` that Babel standalone cannot execute as a classic script.
 
 ## Conventions
 
@@ -175,9 +216,10 @@ rewritten once with `git filter-repo` to purge real data.
 
 ## Known open items
 
-- `skipDisposition()` in `src/lib/errors.js` has no body. It is a policy call
-  reserved for the maintainer. Until it returns something, the skip report shows
-  every failed send under "Not yet classified" rather than guessing.
+- `skipDisposition()` is written, but its tables are a policy call, not a
+  reference: adding a code to `RETRY` costs re-sends if it was wrong, and adding
+  one to `PERMANENT` quietly writes a customer off. Unlisted codes stay
+  `unclassified` on purpose.
 - `scanBuffer` holds the whole file in memory. Backpressure is handled, so the
   cost is one copy rather than two, but true streaming to clamd is still future
   work.

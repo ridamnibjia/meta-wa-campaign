@@ -414,6 +414,13 @@ console.log('\nexplainError');
 test('explains a known send failure', () => assert.match(explainError(131042), /Billing not set up/));
 test('includes an action, not just a label', () => assert.match(explainError(190), /Generate a fresh System User token/));
 test('returns null for an unknown code', () => assert.equal(explainError(999999), null));
+// -1 is this app's own code for "fetch threw", not one of Meta's. Without an
+// entry the skip report told the operator to look it up in Meta's error
+// reference, which does not list it.
+test('explains our own network code rather than blaming Meta', () => {
+  assert.match(explainError(-1), /Could not reach Meta from this server/);
+  assert.doesNotMatch(explainError(-1), /error reference/);
+});
 test('returns null for a missing code', () => assert.equal(explainError(undefined), null));
 test('every entry has both a cause and an action', () => {
   for (const [code, v] of Object.entries(META_ERRORS)) {
@@ -972,7 +979,7 @@ test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
   assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_run', 'idx_messages_thread',
-                           'idx_run_recipients_pending']);
+                           'idx_run_recipients_pending', 'idx_run_recipients_retry']);
 });
 test('opening twice does not throw', () => {
   const d = openDb(':memory:');
@@ -1546,7 +1553,7 @@ console.log('\nrun_recipients — the send queue');
 
     recordRecipientSent(run, p[2].dialStr, 'wamid.c');
     assert.equal(nextPending(run), null, 'an exhausted queue is null, not an index past the end');
-    assert.deepEqual(progressForRun(run), { total: 3, sent: 2, skipped: 1, disabled: 0, pending: 0 });
+    assert.deepEqual(progressForRun(run), { total: 3, sent: 2, skipped: 1, disabled: 0, retrying: 0, pending: 0 });
   });
 
   // The whole reason this table exists. The old design saved an integer, and an
@@ -1641,7 +1648,7 @@ console.log('\nrun_recipients — the send queue');
   });
 
   test('progress for no run at all is zeroes, never a throw', () => {
-    assert.deepEqual(progressForRun(null), { total: 0, sent: 0, skipped: 0, disabled: 0, pending: 0 });
+    assert.deepEqual(progressForRun(null), { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0 });
     assert.equal(nextPending(null), null);
     assert.deepEqual(skippedForRun(null), []);
   });
@@ -1667,6 +1674,319 @@ console.log('\nskipDisposition — the classifier the report groups by');
     for (const junk of ['', 'abc', {}, [], NaN, Infinity, -1]) {
       assert.doesNotThrow(() => skipDisposition(junk));
     }
+  });
+
+  // The policy itself, asserted per code. These four are the ones the loop
+  // branches on, so a change here changes who gets messaged again.
+  test('it sorts by whether another attempt could possibly work', () => {
+    assert.equal(skipDisposition(131049), 'retry',
+      'the per-person marketing cap is about the moment — nothing on our side caused it');
+    assert.equal(skipDisposition(-1), 'retry',
+      'a network throw is the blip that used to drop contact #340 from a run forever');
+    assert.equal(skipDisposition(131026), 'permanent',
+      'undeliverable is a property of the number; retrying it is never right');
+    assert.equal(skipDisposition(132015), 'fix',
+      'a paused template fails identically on every retry until a human fixes it');
+    assert.equal(skipDisposition(131047), 'fix',
+      'outside the 24h window is our bug — we sent the wrong kind of message');
+  });
+
+  test('a code the table has never seen is unclassified, not guessed', () => {
+    assert.equal(skipDisposition(999999), 'unclassified',
+      'a new Meta code must not silently cost re-sends, nor silently write someone off');
+  });
+}
+
+// ── The retry ladder ──────────────────────────────────────────────────────────
+// A failure that was about the MOMENT goes back on the queue with a deadline
+// instead of being dropped. Everything below asserts that the deadline lives in
+// SQL and that a row waiting on one is counted as pending, never as finished.
+console.log('\nrun_recipients — retrying a moment-based failure');
+{
+  const M = require('./server');
+  const { buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
+          recordRecipientRetry, nextRetryForRun, progressForRun, billableForRun,
+          skippedForRun, lastRunSummary, campaignActive, campaignBlocker,
+          scheduleRetry, RETRY_BACKOFF_MS } = M;
+
+  let runSeq = 0;
+  const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
+    .run(Date.now(), `r${++runSeq}`).lastInsertRowid);
+  let pseq = 0;
+  const people = n => Array.from({ length: n }, (_, i) => ({
+    name: `R${i}`, dialStr: `9198900${String(++pseq).padStart(5, '0')}` }));
+  const rowFor = (run, phone) => db
+    .prepare('SELECT attempts, retry_after, skipped_reason FROM run_recipients WHERE run_id = ? AND phone = ?')
+    .get(run, phone);
+
+  const HOUR_MS = 3600000;
+
+  test('a contact on the ladder is invisible until its deadline, then pending again', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    const due = Date.now() + HOUR_MS;
+    recordRecipientRetry(run, p[0].dialStr, 131049, due);
+
+    assert.equal(nextPending(run).phone, p[1].dialStr,
+      'the run carries on with everyone else rather than stalling on one contact');
+    recordRecipientSent(run, p[1].dialStr, 'wamid.r1');
+    assert.equal(nextPending(run), null, 'nothing is sendable while the backoff is running');
+    assert.equal(nextPending(run, due).phone, p[0].dialStr,
+      'and the same query hands them back the moment the deadline passes');
+  });
+
+  test('a waiting contact counts as pending, never as skipped or finished', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r2');
+    recordRecipientRetry(run, p[1].dialStr, -1, Date.now() + HOUR_MS);
+
+    const prog = progressForRun(run);
+    assert.equal(prog.retrying, 1);
+    assert.equal(prog.skipped, 0, 'nobody has been given up on');
+    assert.equal(prog.pending, 2,
+      'folding a waiting contact into skipped would report the run finished with people still queued');
+  });
+
+  test('a waiting contact is still billable — that message is still going out', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientRetry(run, p[0].dialStr, 131049, Date.now() + HOUR_MS);
+    assert.equal(billableForRun(run), 2,
+      'the estimate must not drop just because one send was deferred');
+  });
+
+  test('the earliest deadline is what the loop sleeps to', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+    const soon = Date.now() + HOUR_MS;
+    recordRecipientRetry(run, p[0].dialStr, 131049, soon + 2 * HOUR_MS);
+    recordRecipientRetry(run, p[1].dialStr, 131049, soon);
+
+    const next = nextRetryForRun(run);
+    assert.equal(next.at, soon, 'min(), so the loop wakes for whoever is due first');
+    assert.equal(next.count, 2);
+    recordRecipientSent(run, p[2].dialStr, 'wamid.r3');
+    assert.equal(progressForRun(run).pending, 2, 'and the run stays open for both of them');
+  });
+
+  test('a send that succeeds after waiting is a sent row, not a retrying one', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    recordRecipientRetry(run, p[0].dialStr, -1, Date.now() - 1);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r4');
+
+    const prog = progressForRun(run);
+    assert.deepEqual([prog.sent, prog.retrying, prog.pending], [1, 0, 0],
+      'leaving skipped_reason set would count one person in two buckets at once');
+    assert.deepEqual(skippedForRun(run), [], 'and they do not appear in the skip report');
+  });
+
+  test('the ladder is three waits, then the failure is reported rather than retried', () => {
+    const run = newRun();
+    const p = people(1);
+    const saved = S.currentRunId;
+    S.currentRunId = run;
+    try {
+      buildRun(run, p);
+      const contact = { name: p[0].name, dialStr: p[0].dialStr };
+      const fail    = { errorCode: 131049, error: 'cap', hint: null };
+
+      for (let i = 0; i < RETRY_BACKOFF_MS.length; i++) {
+        const row = nextPending(run, Date.now() + 99 * HOUR_MS);
+        assert.equal(row.attempts, i, 'attempts is read off the row, never off a counter in the loop');
+        assert.equal(scheduleRetry(contact, row, fail, '[t]'), true);
+        const after = rowFor(run, p[0].dialStr);
+        assert.equal(after.attempts, i + 1);
+        assert.ok(after.retry_after - Date.now() > RETRY_BACKOFF_MS[i] - 5000,
+          `wait ${i + 1} is about ${RETRY_BACKOFF_MS[i] / HOUR_MS}h`);
+      }
+
+      const exhausted = nextPending(run, Date.now() + 99 * HOUR_MS);
+      assert.equal(scheduleRetry(contact, exhausted, fail, '[t]'), false,
+        'four attempts is the whole ladder — a fifth would discover nothing new');
+    } finally { S.currentRunId = saved; }
+  });
+
+  test('a code that is not retryable never goes on the ladder at all', () => {
+    const run = newRun();
+    const p = people(1);
+    const saved = S.currentRunId;
+    S.currentRunId = run;
+    try {
+      buildRun(run, p);
+      const row = nextPending(run);
+      assert.equal(scheduleRetry({ name: p[0].name, dialStr: p[0].dialStr }, row,
+        { errorCode: 131026, error: 'undeliverable' }, '[t]'), false,
+        'retrying a number Meta calls undeliverable burns a send slot on every run, forever');
+      assert.equal(rowFor(run, p[0].dialStr).attempts, 0);
+    } finally { S.currentRunId = saved; }
+  });
+
+  // The second half of the ask: one campaign at a time. stageRun REPLACES the
+  // queue, so an upload over a live run orphans everyone it had not reached.
+  test('an unfinished campaign blocks starting or staging another', () => {
+    const savedPhase = S.phase, savedRun = S.currentRunId;
+    try {
+      const run = newRun();
+      buildRun(run, people(4));
+      S.currentRunId = run;
+
+      for (const phase of ['running', 'waiting', 'paused']) {
+        S.phase = phase;
+        assert.equal(campaignActive(), true, `${phase} is an active campaign`);
+        assert.match(campaignBlocker(), /before starting another/,
+          'and the operator is told what is in the way, not just refused');
+      }
+      S.phase = 'waiting';
+      assert.match(campaignBlocker(), /waiting to retry/,
+        'the reason names the retry ladder rather than saying "running"');
+
+      S.phase = 'idle';
+      assert.equal(campaignActive(), false);
+      assert.equal(campaignBlocker(), null, 'a stopped run is replaceable — that is the escape hatch');
+    } finally { S.phase = savedPhase; S.currentRunId = savedRun; }
+  });
+
+  // The duplicate-send hazard the retry ladder made worse. /stop sets the phase
+  // to idle at once, but the loop is still inside an await for up to a second
+  // after that. If the guard trusted the phase alone, a Start in that window
+  // would put a SECOND loop on the same queue.
+  test('a campaign that is still stopping blocks a new one, even though the phase says idle', () => {
+    const { flags } = M;
+    const savedPhase = S.phase, savedRun = S.currentRunId, savedRunning = flags.running;
+    try {
+      S.currentRunId = null;            // exactly what /api/reset leaves behind
+      S.phase = 'idle';                 // what /stop and /reset set immediately
+      flags.running = true;             // the loop has not returned yet
+
+      assert.equal(campaignActive(), true,
+        'a live loop is an active campaign whatever the phase claims');
+      assert.match(campaignBlocker(), /still stopping/,
+        'and the refusal says so rather than reporting the zeroes a cleared run would give');
+
+      flags.running = false;            // the loop returned and cleared it itself
+      assert.equal(campaignBlocker(), null, 'once the loop is gone, the queue is replaceable');
+    } finally { S.phase = savedPhase; S.currentRunId = savedRun; flags.running = savedRunning; }
+  });
+
+  // The daily-cap wait is up to a full day, and `flags.running` stays true for
+  // every second of it. A bare `await sleep(wait)` here meant a Stop set a flag
+  // nothing read until tomorrow — so campaignBlocker() refused every Start and
+  // every CSV upload overnight with "still stopping, try again in a second".
+  // This drives the real loop into that branch and asserts Stop is answered.
+  testAsync('a Stop is answered while the loop is parked on the daily cap', async () => {
+    const { flags, startLoop, stageRun } = M;
+    const saved = { phase: S.phase, run: S.currentRunId, cap: S.config.dailyCap,
+                    count: S.dailyCount, date: S.dailyDate, warmup: W.enabled };
+    // The loop calls saveCampaignNow() on its way out, and FILES.campaign is the
+    // repo's own campaign.json. Snapshot it so `npm test` leaves it as it found it.
+    const fsc = require('node:fs');
+    const cfile = require('./src/config').FILES.campaign;
+    const hadFile = fsc.existsSync(cfile);
+    const fileWas = hadFile ? fsc.readFileSync(cfile, 'utf8') : null;
+    try {
+      W.enabled = false;                  // effectiveCap() is then S.config.dailyCap
+      S.config.dailyCap = 1;
+      S.dailyDate  = todayKey();          // so checkDaily() does not reset the count
+      S.dailyCount = 5;                   // already over the cap
+      stageRun(people(1), 'cap-stop-test');
+      S.phase = 'running';
+      flags.stopFlag = false; flags.pauseFlag = false;
+      startLoop();
+
+      // Long enough for the loop to reach the cap branch and park.
+      await new Promise(r => setTimeout(r, 100));
+      assert.equal(S.phase, 'paused', 'the loop should be parked on the daily cap');
+      assert.equal(flags.running, true, 'and still holding the run');
+
+      flags.stopFlag = true;
+      const deadline = Date.now() + 3000;
+      while (flags.running && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+
+      assert.equal(flags.running, false,
+        'the loop must notice a Stop within seconds, not at the next IST midnight — '
+        + 'while it is true, campaignBlocker() refuses every Start and CSV upload');
+    } finally {
+      flags.stopFlag = false;
+      Object.assign(S, { phase: saved.phase, currentRunId: saved.run,
+                         dailyCount: saved.count, dailyDate: saved.date });
+      S.config.dailyCap = saved.cap;
+      W.enabled = saved.warmup;
+      if (hadFile) fsc.writeFileSync(cfile, fileWas);
+      else if (fsc.existsSync(cfile)) fsc.unlinkSync(cfile);
+    }
+  });
+
+  test('the last campaign is still readable after a reset drops the current run', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r5');
+    recordRecipientSkipped(run, p[1].dialStr, 'failed', 131047);
+
+    const saved = S.currentRunId;
+    S.currentRunId = null;                       // exactly what /api/reset does
+    try {
+      const last = lastRunSummary();
+      assert.equal(last.id, run, 'read from campaign_runs, not from the state a reset just cleared');
+      assert.equal(last.progress.sent, 1);
+      assert.equal(last.progress.skipped, 1);
+      assert.equal(last.unfinished, false, 'every row is resolved, so it really did finish');
+    } finally { S.currentRunId = saved; }
+  });
+
+  test('a run with contacts still on the ladder reports itself unfinished', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r6');
+    recordRecipientRetry(run, p[1].dialStr, 131049, Date.now() + HOUR_MS);
+
+    const last = lastRunSummary();
+    assert.equal(last.id, run);
+    assert.equal(last.unfinished, true,
+      'unfinished is derived from the queue, so it survives the process forgetting the run');
+    assert.equal(last.nextRetry.count, 1);
+  });
+}
+
+// ── Can this box run the scanner it was configured with? ──────────────────────
+// The warning exists because the failure it predicts does not look like itself:
+// clamd gets OOM-killed during a signature reload, and the app then refuses every
+// media save because "configured but unreachable" is fail-closed by design.
+console.log('\nclamd memory headroom');
+{
+  const { memoryWarning } = require('./server');
+  const { CLAMAV } = require('./src/config');
+  const GB = 1024 ** 3;
+
+  const withScanner = (addr, fn) => {
+    const saved = CLAMAV.address;
+    CLAMAV.address = addr;
+    try { return fn(); } finally { CLAMAV.address = saved; }
+  };
+
+  test('a 2 GB box running clamd is warned, and told both ways out', () => {
+    const w = withScanner('127.0.0.1:3310', () => memoryWarning(2 * GB));
+    assert.ok(w, 'clamd plus this app does not fit in 2 GB once freshclam reloads');
+    assert.match(w, /2\.0 GB/, 'the warning states what the machine actually has');
+    assert.match(w, /CLAMAV_ADDRESS/,
+      'and names the setting to unset, because "buy more RAM" is not always an option');
+  });
+
+  test('enough RAM is silence, not a softer warning', () => {
+    assert.equal(withScanner('127.0.0.1:3310', () => memoryWarning(8 * GB)), null);
+  });
+
+  test('no scanner configured is never warned about', () => {
+    assert.equal(withScanner('', () => memoryWarning(512 * 1024 * 1024)), null,
+      'running without a scanner is a supported deployment — the RAM is then nobody\'s problem');
   });
 }
 

@@ -6,7 +6,13 @@
 <meta name="robots" content="noindex, nofollow" />
 <title>WA Campaign</title>
 
-<script src="https://cdn.tailwindcss.com"></script>
+<!-- Vendored into public/vendor/, not loaded from a CDN. This dashboard holds a
+     session cookie and a Meta token that can spend money and message customers,
+     so a compromised unpkg or a compromised cdn.tailwindcss.com would own both.
+     There is still no build step — these are the same prebuilt files the CDN
+     served, committed at a fixed version. It also means the app works on a box
+     with no route to the public internet, which the CDN version did not. -->
+<script src="/vendor/tailwind.js"></script>
 <script>
   // shadcn/ui's token names and scale, without shadcn's build step. Components
   // in ui.jsx use these semantic classes (bg-card, text-muted-foreground) so a
@@ -66,13 +72,15 @@
   ::-webkit-scrollbar-track { background: transparent; }
 </style>
 
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<!-- Pinned to 7: Babel 8 flipped the JSX runtime default from classic to
+<script src="/vendor/react.production.min.js"></script>
+<script src="/vendor/react-dom.production.min.js"></script>
+<!-- Babel 7, not 8: Babel 8 flipped the JSX runtime default from classic to
      automatic, so the compiled output starts with an ESM import of
      react/jsx-runtime. Babel standalone injects that as a classic script, which
-     cannot parse `import` — every view died and the page rendered blank. -->
-<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+     cannot parse `import` — every view died and the page rendered blank.
+     Vendored at 7.28.4, so that pin is now a fact rather than a hope about what
+     the `@7` tag resolves to today. -->
+<script src="/vendor/babel.min.js"></script>
 <script src="/socket.io/socket.io.js"></script>
 </head>
 

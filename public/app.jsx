@@ -293,7 +293,10 @@ function App() {
   const uploadCSV = useCallback(async file => {
     const fd = new FormData(); fd.append('csv', file);
     const r = await api.upload('/api/upload-csv', fd).catch(() => ({ ok: false, error: 'Upload failed' }));
-    if (!r.ok) return alert('Could not read that CSV: ' + (r.error || 'unknown error'));
+    // The server's error is already a sentence — a parse failure names the row,
+    // and a refusal because a campaign is still running names the campaign.
+    // Prefixing it with "Could not read that CSV" made the second one a lie.
+    if (!r.ok) return alert(r.error || 'Could not read that CSV');
     setContacts({ count: r.count, sample: r.sample, file: file.name });
     setFailLog([]);
   }, []);

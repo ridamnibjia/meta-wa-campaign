@@ -19,6 +19,7 @@ const { startRetention } = require('./src/services/retention');
 const { migrateJsonToSql } = require('./src/services/migrate');
 const { migrateOptOuts }   = require('./src/services/contacts');
 const { unprocessedWebhookCount } = require('./src/services/messages');
+const { memoryWarning } = require('./src/services/diagnostics');
 
 const app    = express();
 const server = http.createServer(app);
@@ -116,6 +117,12 @@ if (!CFG.appPassword)   console.warn('[WARN] APP_PASSWORD not set — the API is
   const pending = unprocessedWebhookCount();
   if (pending > 0) console.warn(`[WARN] ${pending} webhook event(s) recorded but never processed — check the logs around when they arrived`);
 }
+// Said at boot as well as on the Diagnostics page: the symptom it predicts is an
+// OOM kill days later, and nobody opens Diagnostics before the thing breaks.
+{
+  const m = memoryWarning();
+  if (m) console.warn(`[WARN] ${m}`);
+}
 
 // Only listen when run directly, so test.js can require the pure helpers. This
 // also guards migrateJsonToSql(): it defaults to the real FILES paths, and
@@ -171,6 +178,10 @@ module.exports = {
   buildState,
   todayKey: require('./src/state').todayKey,
   S,
+  // The loop's control flags, so a test can assert what a Stop does and does not
+  // touch. `running` is owned by the loop; a route only ever sets a *Flag.
+  flags: require('./src/state').flags,
+  memoryWarning,
   W: require('./src/services/warmup').W,
   // Namespaced rather than spread: `list`, `counts`, `enable` and `disable` are
   // too generic to sit at the top of a module that already re-exports thirteen
