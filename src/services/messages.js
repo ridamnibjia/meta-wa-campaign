@@ -226,6 +226,25 @@ const progressQ = db.prepare(`
     FROM run_recipients WHERE run_id = ?
 `);
 
+// What this run will actually cost, asked against the CURRENT enabled flags
+// rather than against the snapshot taken when the queue was staged. Disabling
+// someone mid-run stops them being messaged — the loop re-checks — but without
+// this join the estimate went on including them until the loop got that far,
+// and an operator who has just disabled a contact reasonably expects the number
+// to move.
+//
+// A row that already went out is counted whatever happened to the contact
+// afterwards: that message was sent and will be billed. A row skipped for any
+// reason cost nothing and is not.
+const billableQ = db.prepare(`
+  SELECT count(*) AS n
+    FROM run_recipients r
+    LEFT JOIN contacts c ON c.phone = r.phone
+   WHERE r.run_id = ?
+     AND ( r.wamid IS NOT NULL
+        OR (r.skipped_reason IS NULL AND COALESCE(c.enabled, 1) = 1) )
+`);
+
 const skippedQ = db.prepare(`
   SELECT phone, name, skipped_reason, error_code, attempted_at
     FROM run_recipients
@@ -277,6 +296,7 @@ function progressForRun(runId) {
   return { total, sent, skipped, disabled: r.disabled || 0, pending: total - sent - skipped };
 }
 
+const billableForRun  = runId => (runId == null ? 0 : billableQ.get(runId).n || 0);
 const skippedForRun   = runId => (runId == null ? [] : skippedQ.all(runId));
 const recipientsForRun = runId => (runId == null ? [] : recipientsQ.all(runId));
 
@@ -285,5 +305,5 @@ module.exports = {
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
-  progressForRun, skippedForRun, recipientsForRun,
+  progressForRun, skippedForRun, recipientsForRun, billableForRun,
 };

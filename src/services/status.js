@@ -3,7 +3,7 @@ const { CFG, LIMITS, OPT_OUT_LABEL, PRICES } = require('../config');
 const { S, emit, todayKey } = require('../state');
 const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap } = require('./warmup');
 const { counts: contactCounts } = require('./contacts');
-const { countsForRun, progressForRun, nextPending } = require('./messages');
+const { countsForRun, progressForRun, nextPending, billableForRun } = require('./messages');
 const { rateFor, estimateCost, spentCost } = require('../lib/pricing');
 const inbox = require('./inbox');
 
@@ -16,10 +16,11 @@ function buildState() {
   const known    = contactCounts();
   const c        = countsForRun(S.currentRunId);
   // The queue is the source of truth for every progress number now. `billable`
-  // is what is left to attempt plus what already went out — a disabled row is
-  // staged but never charged.
+  // is asked against the CURRENT enabled flags rather than the snapshot taken
+  // when the queue was staged, so disabling someone moves the estimate straight
+  // away instead of only once the loop reaches them.
   const p        = progressForRun(S.currentRunId);
-  const billable = p.total - p.disabled;
+  const billable = billableForRun(S.currentRunId);
   const next     = nextPending(S.currentRunId);
   return {
     phase:          S.phase,

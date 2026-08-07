@@ -1604,6 +1604,42 @@ console.log('\nrun_recipients — the send queue');
     assert.equal(again.total, 2, 'a primary key on (run_id, phone) is not enough on its own');
   });
 
+  test('billable follows a disable made after the queue was staged', () => {
+    const run = newRun();
+    const p = people(3);
+    C.upsertFromCsv(p, {});
+    buildRun(run, p, phone => (C.isDisabled(phone) ? 'disabled' : null));
+    assert.equal(M.billableForRun(run), 3);
+
+    // The loop re-checks and will skip them, so no money is spent either way —
+    // but an operator who has just disabled someone expects the number to move.
+    C.disable(p[1].dialStr, 'manual');
+    assert.equal(M.billableForRun(run), 2, 'the estimate must not go on counting them');
+  });
+
+  test('a message already sent stays billable even if the contact is disabled after', () => {
+    const run = newRun();
+    const p = people(2);
+    C.upsertFromCsv(p, {});
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'w-billed');
+    C.disable(p[0].dialStr, 'opt_out');
+    assert.equal(M.billableForRun(run), 2,
+      'that message went out and Meta will bill for it regardless of what happened next');
+  });
+
+  test('a skipped row costs nothing and is not billable', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+    recordRecipientSkipped(run, p[0].dialStr, 'failed', 132001);
+    assert.equal(M.billableForRun(run), 2);
+  });
+
+  test('billable for no run is zero, never a throw', () => {
+    assert.equal(M.billableForRun(null), 0);
+  });
+
   test('progress for no run at all is zeroes, never a throw', () => {
     assert.deepEqual(progressForRun(null), { total: 0, sent: 0, skipped: 0, disabled: 0, pending: 0 });
     assert.equal(nextPending(null), null);
