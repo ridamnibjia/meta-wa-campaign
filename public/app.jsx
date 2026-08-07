@@ -32,6 +32,7 @@ const ROUTES = [
   { path: 'campaign', label: 'Campaign',  icon: '➤' },
   { path: 'inbox',    label: 'Inbox',     icon: '✉' },
   { path: 'settings', label: 'Settings',  icon: '⚙' },
+  { path: 'diagnostics', label: 'Diagnostics', icon: '⚕' },
 ];
 
 function useRoute() {
@@ -311,7 +312,8 @@ function App() {
     return <LoginScreen setupRequired={session.setupRequired} onIn={checkSession} />;
   }
 
-  const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, settings: SettingsView }[tab] || Dashboard;
+  const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, settings: SettingsView,
+                 diagnostics: Diagnostics }[tab] || Dashboard;
 
   return (
     <AppContext.Provider value={ctx}>

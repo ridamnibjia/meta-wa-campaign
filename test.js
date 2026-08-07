@@ -1634,6 +1634,182 @@ console.log('\nskipDisposition — the classifier the report groups by');
   });
 }
 
+// ── P5: diagnostics and replay ────────────────────────────────────────────────
+console.log('\nwebhook replay');
+{
+  const { replayUnprocessed } = require('./src/services/ingest');
+  const store = (body, processed = null) => Number(testDb
+    .prepare('INSERT INTO webhook_events (received_at, body, processed_at) VALUES (?, ?, ?)')
+    .run(Date.now(), typeof body === 'string' ? body : JSON.stringify(body), processed).lastInsertRowid);
+  const isProcessed = id =>
+    testDb.prepare('SELECT processed_at FROM webhook_events WHERE id = ?').get(id).processed_at !== null;
+
+  const envelope = (waId, wamid, text) => ({
+    object: 'whatsapp_business_account',
+    entry: [{ id: 'waba-1', changes: [{ field: 'messages', value: {
+      contacts: [{ profile: { name: 'Replay Tester' } }],
+      messages: [{ id: wamid, from: waId, timestamp: '1700000000', type: 'text', text: { body: text } }],
+    } }] }],
+  });
+
+  test('a stored envelope that never processed can be replayed into the inbox', () => {
+    const id = store(envelope('910000005551', 'replay-1', 'hello from replay'));
+    const r = replayUnprocessed();
+    assert.ok(r.replayed >= 1);
+    assert.equal(isProcessed(id), true);
+    assert.ok(inboxThread('910000005551').messages.some(m => m.text === 'hello from replay'),
+      'the message must actually land, not just get stamped done');
+  });
+
+  // The property that makes the button safe to put in front of a human.
+  test('replaying the same envelope twice does not duplicate anything', () => {
+    const id = store(envelope('910000005552', 'replay-2', 'only once'));
+    replayUnprocessed();
+    const after = inboxThread('910000005552').messages.length;
+    const unreadAfter = inboxSummary({ all: true }).threads
+      .find(t => t.waId === '910000005552').unread;
+
+    // Force it back to unprocessed and run it again, as a double-click would.
+    testDb.prepare('UPDATE webhook_events SET processed_at = NULL WHERE id = ?').run(id);
+    replayUnprocessed();
+
+    assert.equal(inboxThread('910000005552').messages.length, after,
+      'messages dedupes on the wamid primary key');
+    assert.equal(inboxSummary({ all: true }).threads.find(t => t.waId === '910000005552').unread,
+      unreadAfter, 'and the unread badge must not climb on a redelivery');
+  });
+
+  test('an envelope that still cannot be parsed stays unprocessed', () => {
+    const id = store('{ not json at all');
+    const r = replayUnprocessed();
+    assert.ok(r.failed >= 1);
+    assert.equal(isProcessed(id), false,
+      'marking it done would throw away the only copy of what Meta sent');
+    assert.ok(r.errors.some(e => e.id === id));
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(id);
+  });
+
+  test('one bad envelope does not stop the good ones after it', () => {
+    const bad  = store('{ broken');
+    const good = store(envelope('910000005553', 'replay-3', 'after the bad one'));
+    const r = replayUnprocessed();
+    assert.ok(r.replayed >= 1 && r.failed >= 1);
+    assert.equal(isProcessed(good), true);
+    assert.equal(isProcessed(bad), false);
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(bad);
+  });
+
+  test('replaying with nothing pending is a no-op, not an error', () => {
+    const r = replayUnprocessed();
+    assert.equal(r.attempted, 0);
+    assert.equal(r.replayed, 0);
+    assert.equal(r.failed, 0);
+  });
+
+  test('an already-processed envelope is never picked up again', () => {
+    const id = store(envelope('910000005554', 'replay-4', 'done already'), Date.now());
+    replayUnprocessed();
+    assert.equal(inboxThread('910000005554'), null,
+      'a processed row must not be reprocessed just because it is still on disk');
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(id);
+  });
+}
+
+console.log('\ndiagnostics');
+{
+  const diag = require('./src/services/diagnostics');
+
+  test('the snapshot renders without reaching Meta or the network', () => {
+    const saved = global.fetch;
+    global.fetch = () => { throw new Error('diagnostics must not call out'); };
+    try { assert.ok(diag.snapshot().at > 0); } finally { global.fetch = saved; }
+  });
+
+  test('it reports every table this app has, so a missing one is visible', () => {
+    const rows = diag.snapshot().rows;
+    for (const t of ['messages', 'threads', 'contacts', 'media', 'media_assets',
+                     'templates', 'campaign_runs', 'run_recipients', 'webhook_events']) {
+      assert.equal(typeof rows[t], 'number', `row count missing for ${t}`);
+    }
+  });
+
+  test('it counts unprocessed webhooks and samples what is stuck', () => {
+    const id = Number(testDb.prepare('INSERT INTO webhook_events (received_at, body) VALUES (?, ?)')
+      .run(Date.now(), '{ unparseable').lastInsertRowid);
+    const d = diag.snapshot();
+    assert.ok(d.webhooks.unprocessed >= 1);
+    assert.ok(d.webhooks.stuck.some(s => s.id === id), 'a count alone does not say WHAT is stuck');
+    assert.ok(d.webhooks.stuck[0].preview.length > 0);
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(id);
+  });
+
+  test('it reports credential presence but never a credential', () => {
+    const json = JSON.stringify(diag.snapshot());
+    for (const secret of [CFG.accessToken, CFG.appSecret, CFG.appPassword, CFG.webhookVerifyToken]) {
+      if (secret) assert.ok(!json.includes(secret), 'a diagnostics page must not leak what it is diagnosing');
+    }
+    assert.equal(typeof diag.snapshot().account.accessToken, 'boolean');
+  });
+
+  test('the scanner address is reported as set or not, never as a path', () => {
+    const { CLAMAV } = require('./src/config');
+    const saved = CLAMAV.address;
+    CLAMAV.address = '/var/run/clamav/clamd.ctl';
+    try {
+      const d = diag.snapshot();
+      assert.equal(d.scanner.configured, true);
+      assert.equal(d.scanner.address, 'set');
+      assert.ok(!JSON.stringify(d).includes('clamd.ctl'));
+    } finally { CLAMAV.address = saved; }
+  });
+
+  test('it flags the free-space floor that would silently refuse every save', () => {
+    const { MEDIA_LIMITS } = require('./src/config');
+    const saved = MEDIA_LIMITS.minFreeBytes;
+    MEDIA_LIMITS.minFreeBytes = Number.MAX_SAFE_INTEGER;
+    try { assert.equal(diag.snapshot().storage.belowFloor, true); }
+    finally { MEDIA_LIMITS.minFreeBytes = saved; }
+  });
+
+  test('a media directory that does not exist yet is zero, not a throw', () => {
+    const s = diag.snapshot().storage;
+    assert.equal(typeof s.mediaDir.bytes, 'number');
+    assert.equal(typeof s.uploadDir.files, 'number');
+  });
+}
+
+console.log('\ninline error badges');
+{
+  test('a failed outbound message carries its code, title and what to do', () => {
+    seedThread('910000006661', 'Failed Send', 0, 1700000000000);
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status, error_code, error_title)
+                    VALUES (?, ?, 'out', 'template', ?, ?, 'failed', ?, ?)`)
+      .run('fail-1', '910000006661', 'the message', 1700000000000, 131047, 'Re-engagement message');
+    const m = inboxThread('910000006661').messages.find(x => x.id === 'fail-1');
+    assert.equal(m.status, 'failed');
+    assert.equal(m.error.code, 131047);
+    assert.equal(m.error.title, 'Re-engagement message');
+    assert.match(m.error.hint, /24-hour/, 'the number alone tells an operator nothing');
+  });
+
+  test('a delivered message carries no error object at all', () => {
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status)
+                    VALUES (?, ?, 'out', 'template', ?, ?, 'delivered')`)
+      .run('fine-1', '910000006661', 'fine', 1700000000001);
+    const m = inboxThread('910000006661').messages.find(x => x.id === 'fine-1');
+    assert.equal(m.error, null, 'an empty error object would render an empty badge');
+  });
+
+  test('a failure Meta sent no code for still renders rather than breaking', () => {
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status)
+                    VALUES (?, ?, 'out', 'template', ?, ?, 'failed')`)
+      .run('fail-2', '910000006661', 'no code', 1700000000002);
+    const m = inboxThread('910000006661').messages.find(x => x.id === 'fail-2');
+    assert.equal(m.error.code, null);
+    assert.equal(m.error.hint, null);
+  });
+}
+
 console.log('\nmigration');
 
 // Never point these at src/config's real FILES. The migration RENAMES its

@@ -258,6 +258,17 @@ function Thread({ waId, onBack }) {
               {m.text && m.text !== `[${m.type}]` && (
                 <p className="whitespace-pre-wrap break-words">{m.text}</p>
               )}
+              {/* On the message itself, not only in a fail log that /api/start
+                  wipes. The code is Meta's; the sentence after it is ours. */}
+              {m.error && (
+                <div className="mt-1 rounded border border-destructive/40 bg-destructive/10 px-2 py-1">
+                  <p className="text-[11px] font-medium text-destructive">
+                    Not delivered{m.error.code ? ` · ${m.error.code}` : ''}
+                    {m.error.title ? ` — ${m.error.title}` : ''}
+                  </p>
+                  {m.error.hint && <p className="mt-0.5 text-[10px] text-destructive/80">{m.error.hint}</p>}
+                </div>
+              )}
               <p className={cn('mt-0.5 text-right text-[10px]', m.dir === 'out' ? 'text-primary-foreground/70' : 'text-muted-foreground')}>
                 {clockTime(m.at)}
               </p>
