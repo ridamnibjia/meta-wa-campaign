@@ -10,7 +10,7 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 - **Bulk send** from a CSV, at a configurable pace, with live per-message state over WebSocket.
 - **Survives restarts.** The send queue and cursor are written to disk, so a crash or deploy resumes where it stopped instead of re-sending.
 - **Warm-up ladder.** A brand-new number climbs `20 → 50 → 100 → 250 → 500 → 1000` per sending day, and holds its rung if quality drops to YELLOW or RED.
-- **One-tap opt-out.** A "Stop promotions" button on every template; taps arrive by webhook and that number is skipped forever after.
+- **One-tap opt-out.** A "Stop promotions" button on every template; taps arrive by webhook and disable that contact for campaigns — while leaving them replyable in the inbox.
 - **Two-way inbox.** Inbound replies are threaded, and you can reply free-form inside Meta's 24-hour customer-service window.
 - **Cost estimates** before you start and a running spend figure while you send, per Meta's per-message pricing.
 - **Password gate.** The whole API and the socket sit behind one password. Without `APP_PASSWORD` set, the app refuses to serve anything rather than opening up.
@@ -25,7 +25,7 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 3. [Getting Your Credentials](#3-getting-your-credentials)
 4. [Templates — How Approval Works](#4-templates--how-approval-works)
 5. [Rate Limits, Tiers and the Warm-up Ladder](#5-rate-limits-tiers-and-the-warm-up-ladder)
-6. [Contacts, CSV and Opt-outs](#6-contacts-csv-and-opt-outs)
+6. [Contacts, CSV, Skips and Search](#6-contacts-csv-skips-and-search)
 7. [Project Structure](#7-project-structure)
 8. [Running Locally](#8-running-locally)
 9. [Deployment](#9-deployment)
@@ -163,7 +163,7 @@ Use the **Compose Message** card in the left column. You do not need to leave th
 1. Give the template a name. It is lowercased and underscored for you (`Diwali Offer 2026` → `diwali_offer_2026`).
 2. Write the body. Insert `{{1}}` where the contact's name should go, and supply a sample value — Meta will not review a template with variables unless you give it an example.
 3. Optionally add a footer (max 60 chars, no variables).
-4. Leave **Stop promotions** checked. Taps on that button are captured by the webhook, written to `opt-outs.json`, and skipped on every future run.
+4. Leave **Stop promotions** checked. Taps on that button are captured by the webhook and disable that contact for every future campaign.
 5. **Submit for Approval.** The app polls Meta every 15 seconds; the badge moves `PENDING` → `APPROVED` or `REJECTED` with the reason.
 
 The app validates the body before submitting — variable numbering gaps, a body starting or ending with a variable, an over-length footer, missing samples. These are the documented rejection causes, and catching them locally saves a review cycle.
@@ -228,7 +228,7 @@ So the app enforces its own ceiling on top of the tier cap:
 
 ---
 
-## 6. Contacts, CSV and Opt-outs
+## 6. Contacts, CSV, Skips and Search
 
 ### The CSV
 
@@ -248,26 +248,73 @@ and de-duplicated. Toll-free prefixes are dropped.
 
 **[Full format rules, edge cases and gotchas → CSV-FORMAT.md](CSV-FORMAT.md)**
 
+Fields are parsed per RFC 4180, so a quoted name like `"Doe, John"` does not
+shift the phone column. Any row with no usable number is reported back with its
+line number instead of being dropped in silence.
+
 After uploading, **View all** shows every parsed row exactly as it will be sent —
-name, `+number`, and whether it is already opted out or already sent. Check it
-before you spend money.
+name, `+number`, and whether it is disabled or already sent. Check it before you
+spend money.
 
-### Opt-outs
+### Contacts, and the one switch
 
-Every template the app composes carries a **Stop promotions** quick-reply button.
-When someone taps it:
+Every contact this server has seen lives in one `contacts` row with one
+`enabled` flag. Three things turn it off:
 
-1. Meta delivers a `button` webhook to `POST /webhook`.
-2. The signature is verified, then the number is appended to `opt-outs.json`.
-3. Every future campaign skips it — including re-uploads of the same old list.
+| Trigger | Reason recorded |
+|---|---|
+| Customer taps **Stop promotions** | `opt_out` |
+| You click Disable in Settings | `manual` |
+| Meta returns `131026` on a send | `failed_hard` |
 
-Opt-outs are also editable by hand, because people ask to be removed by phone or
-in person and ask to be put back later. `GET /api/optouts/download` exports the
-list as JSON so you can keep it when you move servers.
+**A disabled contact is skipped by campaigns and stays fully replyable in the
+inbox.** Someone who opted out of promotions and then writes in with a question
+still deserves an answer, and answering them is not a marketing message.
 
-Meta *also* enforces its own opt-out signal: error `131026` means the recipient
-blocked marketing at the WhatsApp level. Those are counted as **skipped**, not
-failed — nothing was wrong with your send.
+`131026` means the number is not on WhatsApp, or Meta blocked it on quality
+grounds. That is a property of the number rather than of the attempt, so it is
+disabled automatically — otherwise it burns a send slot on every future run,
+forever.
+
+**Re-uploading a CSV never re-enables anybody.** The upsert updates the name and
+the extra columns and deliberately does not touch `enabled`. Turning someone back
+on is always a manual, confirmed action, because every automatic path into
+`disabled` is a reason to stay there.
+
+`GET /api/contacts/directory/download` exports the disabled list with names,
+reasons and timestamps — the file you hand over when someone asks you to prove
+you stopped messaging them.
+
+### The skip report
+
+After a run, **Not messaged** on the Campaign page lists everyone who did not get
+it, grouped by what you can do about it: worth trying again, fix something first,
+or Meta will never deliver these. The grouping comes from `skipDisposition()` in
+`src/lib/errors.js`. Until that function is given a body, every failed send is
+shown under **Not yet classified** rather than sorted — a wrong "retry these" is
+a list of people you message again for no reason, and a wrong "give up on these"
+is customers you quietly stop talking to.
+
+### Search
+
+The Inbox search box runs `LIKE '%…%'` over message bodies and thread names,
+across every conversation or inside the open one. Measured at 40ms over 200k
+rows, so there is no FTS index to drift out of step with the messages table.
+`%` and `_` are escaped, so searching `50%` finds the discount rather than
+everything.
+
+### Diagnostics
+
+The **Diagnostics** page answers "is this thing working": stored webhooks and
+how many were never processed, when the last one arrived, which credentials are
+present (never their values), the warm-up rung and today's cap, database and
+media sizes against the free-space floor, and row counts per table.
+
+If envelopes are stuck, **Replay** re-runs them through the same code path the
+live webhook uses. It is safe to press twice — messages are keyed on their
+WhatsApp id, a status only ever moves forward, and an already-recorded opt-out
+is not recorded again. An envelope that still cannot be parsed is kept rather
+than marked done, because it is the only copy of what Meta sent.
 
 ---
 
@@ -283,7 +330,8 @@ meta-wa-campaign/
 │   ├── state.js         Campaign state, log(), socket registry
 │   ├── lib/             Pure helpers: phone, errors, signature, pricing, store
 │   ├── services/        Graph client, templates, campaign loop, inbox,
-│   │                    opt-outs, warm-up, message index, state snapshot
+│   │                    contacts, media, retention, ingest, diagnostics,
+│   │                    warm-up, messages, state snapshot
 │   ├── middleware/
 │   │   └── auth.js      Password gate, sessions, login rate limit
 │   └── routes/          One router per resource; index.js mounts them and
@@ -293,7 +341,7 @@ meta-wa-campaign/
 │   ├── index.html       Shell — Tailwind CDN, design tokens, script tags
 │   ├── ui.jsx           shadcn-shaped primitives (Card, Button, Dialog, …)
 │   ├── app.jsx          API client, session gate, socket, hash router
-│   └── views/           dashboard, campaign, inbox, settings
+│   └── views/           dashboard, campaign, inbox, settings, diagnostics
 │
 ├── test.js              Self-check for the pure functions — `node test.js`
 │                        No framework. Covers template validation, payload
@@ -303,14 +351,15 @@ meta-wa-campaign/
 ├── CSV-FORMAT.md        What the contact CSV parser accepts
 ├── contacts-template.csv  Sample contact list to fill in
 │
-├── opt-outs.json        Numbers that tapped "Stop promotions"
 ├── wa.db                SQLite message store — threads, messages, raw webhook
 │                        events and campaign runs. Opened in WAL mode, so
 │                        `wa.db-wal` and `wa.db-shm` sit alongside it; back up
 │                        all three together, not just wa.db, or a backup can
 │                        miss writes that were committed to the WAL sidecar
 │                        but not yet checkpointed into the main file.
-├── campaign.json        Send queue + cursor, so a restart resumes
+├── campaign.json        Pacing state and which run is current. The send queue
+│                        itself is the run_recipients TABLE — a crash resumes
+│                        from what was actually sent, never from a counter
 ├── warmup.json          Which sending days have happened
 │                        (all created at runtime and gitignored)
 │
@@ -320,12 +369,13 @@ meta-wa-campaign/
 └── README.md
 ```
 
-`inbox.json` and `msg-index.json` no longer exist in a fresh install — both moved
-into `wa.db` (§ below). A server that still has them from before this change
+`inbox.json`, `msg-index.json` and `opt-outs.json` no longer exist in a fresh
+install — all three moved into `wa.db`. A server that still has them from before
 migrates them into SQLite once, automatically, on its next boot, then renames
 each to `<name>.migrated` so a later boot has nothing left to do. The `.migrated`
 files are not read again; delete them once you have confirmed the data is in
-`wa.db`.
+`wa.db`. A file that could not be read is left exactly where it is and logged
+loudly rather than renamed away behind a "0 migrated" success line.
 
 Dependencies run one way only: `routes → services → lib → config`. Nothing in
 `lib/` knows about Express, and nothing in `services/` knows about HTTP.
@@ -607,9 +657,14 @@ GET    /api/faillog             per-contact failure detail
 
 POST   /api/upload-csv          parse CSV → contacts + cost estimate
 GET    /api/contacts            the full parsed list with sent / opted-out flags
-GET    /api/optouts             current opt-out list
-POST   /api/optouts             add or remove numbers by hand
-GET    /api/optouts/download    export opt-outs as JSON
+GET    /api/contacts/directory           every known contact (?disabled=1 to filter)
+POST   /api/contacts/directory           { disable: [...], enable: [...] }
+GET    /api/contacts/directory/download  export the disabled list as JSON
+GET    /api/campaign/skips               who was not messaged, grouped by what to do
+GET    /api/inbox/search?q=              search messages, threads and numbers
+GET    /api/inbox/:waId?before=          one page of transcript, newest first
+GET    /api/diagnostics                  system state
+POST   /api/diagnostics/replay           reprocess stored webhooks
 
 GET    /api/templates           list templates from Meta
 GET    /api/validate-template   status, category, language, body, variable count
