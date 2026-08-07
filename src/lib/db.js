@@ -146,6 +146,17 @@ function openDb(file) {
   addColumn(d, 'campaign_runs', 'template_body', 'TEXT');
   addColumn(d, 'campaign_runs', 'template_lang', 'TEXT');
   addColumn(d, 'campaign_runs', 'header_asset',  'INTEGER REFERENCES media_assets(id)');
+  // Inbound media carries a verdict, not just bytes. `risk` is the
+  // worst-of-three-signals tier from lib/filerisk; `scan_status` is ClamAV's
+  // answer. Two columns because they answer different questions — "what kind
+  // of file is this" and "do these exact bytes match a malware signature" —
+  // and a row can be entirely ordinary on one and infected on the other.
+  addColumn(d, 'media', 'risk',           'TEXT');
+  addColumn(d, 'media', 'risk_reason',    'TEXT');
+  addColumn(d, 'media', 'sniffed_mime',   'TEXT');
+  addColumn(d, 'media', 'scan_status',    'TEXT');
+  addColumn(d, 'media', 'scan_signature', 'TEXT');
+  addColumn(d, 'media', 'scan_at',        'INTEGER');
   return d;
 }
 

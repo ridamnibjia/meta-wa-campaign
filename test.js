@@ -35,7 +35,9 @@ const {
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
-  saveInbound, inboundPath, getInbound, INBOUND_TTL_MS,
+  saveInbound, inboundPath, getInbound, INBOUND_TTL_MS, rescanIfNeeded,
+  classify, sniff, extOf, worst, TIERS,
+  scanBuffer, parseReply, scannerConfigured, EICAR,
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
 } = require('./server');
@@ -1665,6 +1667,53 @@ console.log('\nsend path — header component');
   });
 }
 
+// A fake clamd, shared by every section below that needs one. It speaks the
+// INSTREAM half of the protocol only, which is the entire surface this app
+// uses: read zINSTREAM\0, read length-prefixed chunks until a zero length,
+// answer one line. A null reply leaves the socket open on purpose, which is how
+// the timeout path gets exercised.
+const withClamd = async (reply, fn, { drop = false } = {}) => {
+  const net = require('node:net');
+  const { CLAMAV } = require('./src/config');
+  const chunks = [];
+  const srv = net.createServer(sock => {
+    if (drop) return sock.destroy();
+    // The header is consumed exactly once. Re-scanning for the NUL on every
+    // data event would find one inside the payload instead and reframe the
+    // whole stream.
+    let buf = Buffer.alloc(0), gotHeader = false;
+    sock.on('data', d => {
+      buf = Buffer.concat([buf, d]);
+      if (!gotHeader) {
+        const head = buf.indexOf(0);
+        if (head < 0) return;
+        buf = buf.subarray(head + 1);
+        gotHeader = true;
+      }
+      while (buf.length >= 4) {
+        const len = buf.readUInt32BE(0);
+        if (len === 0) { if (reply !== null) sock.end(reply); return; }
+        if (buf.length < 4 + len) return;
+        chunks.push(Buffer.from(buf.subarray(4, 4 + len)));
+        buf = buf.subarray(4 + len);
+      }
+    });
+  });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  const saved = CLAMAV.address;
+  CLAMAV.address = `127.0.0.1:${srv.address().port}`;
+  try { return await fn(chunks); }
+  finally { CLAMAV.address = saved; await new Promise(r => srv.close(r)); }
+};
+
+// Most sections want a save to succeed without a scanner in the way. Scanning
+// is exercised deliberately, in the section that is about scanning.
+const withoutScanner = async fn => {
+  const { CLAMAV } = require('./src/config');
+  const saved = CLAMAV.address; CLAMAV.address = '';
+  try { return await fn(); } finally { CLAMAV.address = saved; }
+};
+
 console.log('\ninbound media — save, serve, expire');
 {
   const fsm    = require('fs');
@@ -1903,6 +1952,184 @@ console.log('\ninbound media — save, serve, expire');
         'a voice note must still play in the thread');
     } finally { s.close(); }
   });
+
+  // ── Hardening: what has to be true before customer bytes reach this disk ─────
+  console.log('\ninbound media — save hardening');
+  {
+    const { CLAMAV, MEDIA_LIMITS } = require('./src/config');
+
+    testAsync('a saved file records its risk tier and what the bytes looked like', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(`p${Date.now()}`)]);
+      const id = seedInbound({ bytes, filename: 'holiday.jpg' });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      const row = getInbound(id);
+      assert.equal(row.risk, 'safe');
+      assert.equal(row.sniffed_mime, 'jpeg');
+      assert.ok(row.risk_reason);
+    });
+
+    testAsync('an executable claiming to be a pdf is stored as block, not ok', async () => {
+      const bytes = Buffer.concat([Buffer.from('MZ\x90\x00'), Buffer.from(`x${Date.now()}`)]);
+      const id = seedInbound({ bytes, mime: 'application/pdf', type: 'document', filename: 'invoice.pdf' });
+      const r = await withoutScanner(() => withToken(() =>
+        withMeta(metaOk(bytes, 'application/pdf'), () => saveInbound(id))));
+      assert.equal(r.ok, true, 'the operator asked for it, so it is fetched and stored');
+      const row = getInbound(id);
+      assert.equal(row.risk, 'block');
+      assert.equal(row.sniffed_mime, 'exe');
+      assert.ok(row.path, 'stored — the refusal happens at serve time, not save time');
+    });
+
+    testAsync('the sanitized extension is what reaches the filesystem path', async () => {
+      const bytes = Buffer.from(`t${Date.now()}`);
+      const id = seedInbound({ bytes, mime: 'text/plain', type: 'document', filename: 'notes.../../../etc/passwd' });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes, 'text/plain'), () => saveInbound(id))));
+      const row = getInbound(id);
+      assert.ok(!row.path.includes('/'), `stored filename must be a bare name, got ${row.path}`);
+      assert.ok(!row.path.includes('..'));
+      assert.ok(fsm.existsSync(inboundPath(row)));
+    });
+
+    testAsync('a saved file is readable only by this process', async () => {
+      const bytes = Buffer.from(`m${Date.now()}`);
+      const id = seedInbound({ bytes });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      const mode = fsm.statSync(inboundPath(getInbound(id))).mode & 0o777;
+      assert.equal(mode, 0o600, 'customer media must not be world-readable on a shared host');
+    });
+
+    testAsync('a response bigger than the cap is refused before it is written', async () => {
+      const saved = MEDIA_LIMITS.maxBytes;
+      MEDIA_LIMITS.maxBytes = 16;
+      try {
+        const bytes = Buffer.alloc(64, 7);
+        const id = seedInbound({ bytes });
+        const r = await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+        assert.equal(r.ok, false);
+        assert.match(r.error, /limit/i);
+        assert.equal(getInbound(id).path, null);
+      } finally { MEDIA_LIMITS.maxBytes = saved; }
+    });
+
+    testAsync('a save is refused when the disk is nearly full', async () => {
+      const saved = MEDIA_LIMITS.minFreeBytes;
+      MEDIA_LIMITS.minFreeBytes = Number.MAX_SAFE_INTEGER;
+      try {
+        const bytes = Buffer.from(`d${Date.now()}`);
+        const id = seedInbound({ bytes });
+        const r = await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+        assert.equal(r.ok, false);
+        assert.match(r.error, /disk space/i);
+        assert.equal(getInbound(id).path, null);
+      } finally { MEDIA_LIMITS.minFreeBytes = saved; }
+    });
+
+    testAsync('with no scanner configured a save succeeds and says so', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`n${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      const r = await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      assert.equal(r.ok, true);
+      assert.equal(getInbound(id).scan_status, 'skipped');
+    });
+
+    testAsync('a clean scan is recorded on the row', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`c${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      await withClamd('stream: OK\x00', () =>
+        withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      const row = getInbound(id);
+      assert.equal(row.scan_status, 'clean');
+      assert.ok(row.scan_at > 0);
+      assert.ok(row.path);
+    });
+
+    testAsync('an infected file is refused and its bytes never touch disk', async () => {
+      const bytes = Buffer.from(`${EICAR}`);
+      const id = seedInbound({ bytes, mime: 'text/plain', type: 'document', filename: 'eicar.txt' });
+      const r = await withClamd('stream: Eicar-Test-Signature FOUND\x00', () =>
+        withToken(() => withMeta(metaOk(bytes, 'text/plain'), () => saveInbound(id))));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /malware/i);
+      assert.match(r.error, /Eicar-Test-Signature/);
+      const row = getInbound(id);
+      assert.equal(row.path, null, 'nothing must be written for a signature hit');
+      assert.equal(row.scan_status, 'infected');
+      assert.equal(row.scan_signature, 'Eicar-Test-Signature');
+    });
+
+    testAsync('an infected row is never re-fetched, however often Save is clicked', async () => {
+      const bytes = Buffer.from(`${EICAR}-again`);
+      const id = seedInbound({ bytes, mime: 'text/plain', type: 'document', filename: 'eicar2.txt' });
+      await withClamd('stream: Eicar-Test-Signature FOUND\x00', () =>
+        withToken(() => withMeta(metaOk(bytes, 'text/plain'), () => saveInbound(id))));
+
+      // No fetch stub at all: if saveInbound tried to reach Meta this would
+      // throw or hang rather than returning the recorded refusal.
+      const again = await saveInbound(id);
+      assert.equal(again.ok, false);
+      assert.equal(again.scan, 'infected');
+    });
+
+    testAsync('a configured scanner that is down refuses the save — it never reads as clean', async () => {
+      const savedAddr = CLAMAV.address;
+      CLAMAV.address = '127.0.0.1:1';
+      try {
+        const bytes = Buffer.from(`u${Date.now()}`);
+        const id = seedInbound({ bytes });
+        const r = await withToken(() => withMeta(metaOk(bytes), () => saveInbound(id)));
+        assert.equal(r.ok, false);
+        assert.match(r.error, /scanner/i);
+        assert.equal(getInbound(id).path, null);
+      } finally { CLAMAV.address = savedAddr; }
+    });
+
+    testAsync('a file past clamd size limit still saves, marked oversize', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`o${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      const r = await withClamd('INSTREAM size limit exceeded. ERROR\x00', () =>
+        withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      assert.equal(r.ok, true, 'a legitimate large video must not be unsavable');
+      assert.equal(getInbound(id).scan_status, 'oversize');
+    });
+
+    testAsync('rescanIfNeeded scans a skipped row once a scanner appears', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`r${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      assert.equal(getInbound(id).scan_status, 'skipped');
+
+      const after = await withClamd('stream: OK\x00', () => rescanIfNeeded(getInbound(id)));
+      assert.equal(after.scan_status, 'clean');
+      assert.equal(getInbound(id).scan_status, 'clean');
+    });
+
+    testAsync('rescanIfNeeded deletes the file when a late scan finds malware', async () => {
+      const bytes = Buffer.from(`${EICAR}-late`);
+      const id = seedInbound({ bytes, mime: 'text/plain', type: 'document', filename: 'late.txt' });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes, 'text/plain'), () => saveInbound(id))));
+      const file = inboundPath(getInbound(id));
+      assert.ok(fsm.existsSync(file));
+
+      const after = await withClamd('stream: Eicar-Test-Signature FOUND\x00', () => rescanIfNeeded(getInbound(id)));
+      assert.equal(after.scan_status, 'infected');
+      assert.equal(after.path, null);
+      assert.ok(!fsm.existsSync(file), 'a late signature hit must remove the bytes, not just relabel them');
+    });
+
+    testAsync('rescanIfNeeded leaves an already-clean row alone', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`q${Date.now()}`)]);
+      const id = seedInbound({ bytes });
+      await withClamd('stream: OK\x00', () =>
+        withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      const before = getInbound(id).scan_at;
+
+      // A daemon that would report malware — but the row is already clean, so
+      // it must never be asked.
+      const after = await withClamd('stream: Would-Have-Failed FOUND\x00', () => rescanIfNeeded(getInbound(id)));
+      assert.equal(after.scan_status, 'clean');
+      assert.equal(after.scan_at, before, 'a clean row is not rescanned on every request');
+    });
+  }
 }
 
 console.log('\nfile risk classification');
@@ -2047,42 +2274,6 @@ console.log('\nclamav scanning');
     try { assert.equal(scannerConfigured(), false); }
     finally { CLAMAV.address = saved; }
   });
-
-  // A fake clamd. It speaks the INSTREAM half of the protocol only, which is
-  // the entire surface this app uses: read zINSTREAM\0, read length-prefixed
-  // chunks until a zero length, answer one line. A null reply hangs the socket
-  // open on purpose, which is how the timeout path gets exercised.
-  const withClamd = async (reply, fn, { drop = false } = {}) => {
-    const chunks = [];
-    const srv = net.createServer(sock => {
-      if (drop) return sock.destroy();
-      // The header is consumed exactly once. Re-scanning for the NUL on every
-      // data event would find one inside the payload instead and reframe the
-      // whole stream.
-      let buf = Buffer.alloc(0), gotHeader = false;
-      sock.on('data', d => {
-        buf = Buffer.concat([buf, d]);
-        if (!gotHeader) {
-          const head = buf.indexOf(0);
-          if (head < 0) return;
-          buf = buf.subarray(head + 1);
-          gotHeader = true;
-        }
-        while (buf.length >= 4) {
-          const len = buf.readUInt32BE(0);
-          if (len === 0) { if (reply !== null) sock.end(reply); return; }
-          if (buf.length < 4 + len) return;
-          chunks.push(Buffer.from(buf.subarray(4, 4 + len)));
-          buf = buf.subarray(4 + len);
-        }
-      });
-    });
-    await new Promise(r => srv.listen(0, '127.0.0.1', r));
-    const saved = CLAMAV.address;
-    CLAMAV.address = `127.0.0.1:${srv.address().port}`;
-    try { return await fn(chunks); }
-    finally { CLAMAV.address = saved; await new Promise(r => srv.close(r)); }
-  };
 
   testAsync('a clean file comes back clean', async () => {
     await withClamd('stream: OK\x00', async () => {

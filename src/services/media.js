@@ -6,9 +6,11 @@
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('node:crypto');
-const { CFG, UPLOAD_DIR, MEDIA_DIR } = require('../config');
+const { CFG, UPLOAD_DIR, MEDIA_DIR, MEDIA_LIMITS } = require('../config');
 const { db }  = require('../lib/db');
 const { log } = require('../state');
+const { classify, extOf } = require('../lib/filerisk');
+const { scanBuffer, scannerConfigured } = require('../lib/clamav');
 
 // Meta's documented maxima for template header media. Enforced on our side
 // because the alternative is pushing 100 MB over the wire for Meta to reject
@@ -235,8 +237,14 @@ const inboundRow = db.prepare(`
     FROM media md JOIN messages m ON m.wamid = md.wamid
    WHERE md.media_id = ?
 `);
-const setInboundFile = db.prepare(
-  'UPDATE media SET path = ?, downloaded_at = ? WHERE media_id = ?');
+const setInboundFile = db.prepare(`
+  UPDATE media SET path = ?, downloaded_at = ?,
+                   risk = ?, risk_reason = ?, sniffed_mime = ?,
+                   scan_status = ?, scan_signature = ?, scan_at = ?
+   WHERE media_id = ?`);
+const setInboundVerdict = db.prepare(
+  'UPDATE media SET scan_status = ?, scan_signature = ?, scan_at = ? WHERE media_id = ?');
+const clearInboundFile = db.prepare('UPDATE media SET path = NULL WHERE media_id = ?');
 
 const getInbound = mediaId => inboundRow.get(String(mediaId));
 
@@ -250,13 +258,42 @@ const inboundPath = row => path.join(MEDIA_DIR, row.path);
 const inboundExpired = (row, now = Date.now()) =>
   !row.path && (now - row.message_at) > INBOUND_TTL_MS;
 
+// statfsSync is Node 18.15+, well inside this app's 22.5 floor. The guard is
+// not about tidiness: this disk also holds wa.db, and SQLite handles a full
+// filesystem by refusing writes — so an unbounded media save can take the
+// message store down with it, which is a far worse outcome than a refused Save.
+function freeBytes(dir) {
+  try {
+    const st = fs.statfsSync(fs.existsSync(dir) ? dir : path.dirname(dir));
+    return st.bavail * st.bsize;
+  } catch {
+    // ponytail: an unreadable statfs means "no opinion", not "no space". A
+    // filesystem that cannot answer should not block every save on a host
+    // where the call happens to be unimplemented.
+    return Infinity;
+  }
+}
+
 // Two hops, both authenticated: GET /{media_id} returns a short-lived CDN url,
 // and that url still 401s without the same bearer token. This is why the
 // browser can never fetch customer media itself and the server has to proxy.
+//
+// This function is the single choke point for customer bytes entering this
+// machine. Everything that has to be true before they land on disk is checked
+// here, in this order, because each step costs more than the one before it:
+// size cap → free-space guard → download → checksum → virus scan →
+// classification → write.
 async function saveInbound(mediaId) {
   const row = getInbound(mediaId);
   if (!row) return { ok: false, error: `No inbound media found for ${mediaId}` };
   if (row.path) return { ok: true, media: row, already: true };
+  // Terminal, and deliberately checked before the expiry and token checks: a
+  // file we have already identified as malware must not be re-fetched just
+  // because someone clicked Save twice.
+  if (row.scan_status === 'infected') {
+    return { ok: false, scan: 'infected', signature: row.scan_signature,
+      error: `This file matched a malware signature (${row.scan_signature}) and will not be downloaded again.` };
+  }
   if (inboundExpired(row)) {
     return { ok: false, error: 'Meta no longer has this file — it deletes inbound media 30 days after the message.' };
   }
@@ -270,9 +307,25 @@ async function saveInbound(mediaId) {
       return { ok: false, error: meta.error?.message || 'Meta returned no download url for this media' };
     }
 
+    // Refuse on the advertised length before pulling the body. Repeated on the
+    // real buffer below, because a declared size is a claim like any other.
+    const claimed = Number(meta.file_size || row.file_size || 0);
+    if (claimed > MEDIA_LIMITS.maxBytes) {
+      return { ok: false, error: `That file is ${mb(claimed)} — over this server's ${mb(MEDIA_LIMITS.maxBytes)} limit, so it was not downloaded.` };
+    }
+
+    const free = freeBytes(MEDIA_DIR);
+    if (free < MEDIA_LIMITS.minFreeBytes) {
+      return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Nothing was saved.` };
+    }
+
     const dl = await fetch(meta.url, { headers: { Authorization: `Bearer ${CFG.accessToken}` } });
     if (!dl.ok) return { ok: false, error: `Download failed with HTTP ${dl.status}` };
     const buf = Buffer.from(await dl.arrayBuffer());
+
+    if (buf.length > MEDIA_LIMITS.maxBytes) {
+      return { ok: false, error: `That file is ${mb(buf.length)} — over this server's ${mb(MEDIA_LIMITS.maxBytes)} limit, so nothing was saved.` };
+    }
 
     // Verify before writing, not after. A truncated CDN response otherwise
     // lands on disk as a perfectly valid-looking file that nothing downstream
@@ -284,21 +337,74 @@ async function saveInbound(mediaId) {
       return { ok: false, error: 'Checksum mismatch — the download did not match the sha256 WhatsApp reported, so nothing was saved.' };
     }
 
-    const ext  = (path.extname(row.filename || '') || '').slice(0, 10).toLowerCase();
-    const name = `${actual}${ext}`;
-    fs.mkdirSync(MEDIA_DIR, { recursive: true });
-    fs.writeFileSync(path.join(MEDIA_DIR, name), buf);
-    setInboundFile.run(name, Date.now(), row.media_id);
+    // Scanned in memory, before a single byte reaches the filesystem. Writing
+    // first and unlinking on a hit would leave a window in which malware is on
+    // disk, and on a host running its own on-access scanner that window is
+    // enough to become an incident.
+    const scan = await scanBuffer(buf);
+    if (scan.status === 'infected') {
+      setInboundVerdict.run('infected', scan.signature, Date.now(), row.media_id);
+      log('warn', `Refused inbound media ${row.media_id} — ClamAV matched ${scan.signature}`);
+      return { ok: false, scan: 'infected', signature: scan.signature,
+        error: `This file matched a malware signature (${scan.signature}) and was not saved.` };
+    }
+    // Fail closed, and only here. An operator who configured a scanner and
+    // whose daemon is down gets a refusal; one who never configured a scanner
+    // gets 'skipped' and a working app.
+    if (scan.status === 'error') {
+      setInboundVerdict.run('error', scan.signature, Date.now(), row.media_id);
+      return { ok: false, scan: 'error',
+        error: `The virus scanner is configured but did not answer, so nothing was saved: ${scan.signature}` };
+    }
 
-    log('info', `Saved inbound ${row.mime_type || 'file'} from message ${row.wamid}`);
-    return { ok: true, media: getInbound(mediaId) };
+    const verdict = classify({ mime: row.mime_type, filename: row.filename, bytes: buf });
+
+    // extOf, not path.extname: the filename is a customer-supplied string and
+    // this is the only one of them that reaches a filesystem path. Anything
+    // outside [a-z0-9] is dropped rather than escaped.
+    const name = `${actual}${extOf(row.filename)}`;
+    fs.mkdirSync(MEDIA_DIR, { recursive: true, mode: 0o700 });
+    // 0600, because customer media on a shared host has no business being
+    // readable by every other account on it.
+    fs.writeFileSync(path.join(MEDIA_DIR, name), buf, { mode: 0o600 });
+    setInboundFile.run(name, Date.now(), verdict.tier, verdict.reason, verdict.sniffed,
+      scan.status, scan.signature, Date.now(), row.media_id);
+
+    log('info', `Saved inbound ${row.mime_type || 'file'} from message ${row.wamid} — risk ${verdict.tier}, scan ${scan.status}`);
+    return { ok: true, media: getInbound(mediaId), risk: verdict.tier };
   } catch (e) {
     return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
   }
 }
 
+// A file saved before ClamAV was installed is marked `skipped` forever, which
+// would make "install the scanner later" useless for everything already on
+// disk. One branch on the serve path closes that: scan it the first time
+// somebody actually asks for it.
+//
+// ponytail: no periodic rescan of already-clean rows against updated signature
+// databases. That is a cron job, and it earns its place the day this app starts
+// accepting files from people it has no relationship with.
+async function rescanIfNeeded(row) {
+  if (!row || !row.path || row.scan_status !== 'skipped' || !scannerConfigured()) return row;
+
+  const file = inboundPath(row);
+  if (!fs.existsSync(file)) return row;
+
+  const scan = await scanBuffer(fs.readFileSync(file));
+  if (scan.status === 'skipped') return row;
+
+  setInboundVerdict.run(scan.status, scan.signature, Date.now(), row.media_id);
+  if (scan.status === 'infected') {
+    fs.rmSync(file, { force: true });
+    clearInboundFile.run(row.media_id);
+    log('warn', `Removed already-saved media ${row.media_id} — a later scan matched ${scan.signature}`);
+  }
+  return getInbound(row.media_id);
+}
+
 module.exports = {
   MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, headerComponent,
-  INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound,
+  INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound, rescanIfNeeded,
 };
