@@ -78,11 +78,12 @@ function ContactListDialog({ open, onClose }) {
       {shown?.length === 0 && <Empty icon="⌕" title={rows.length ? 'No contact matches that' : 'No contacts loaded'} />}
       <div className="divide-y divide-border">
         {(shown || []).map(c => (
-          <div key={c.dialStr} className={cn('flex items-center justify-between gap-3 py-2 text-sm', c.optedOut && 'opacity-50')}>
-            <span className={cn('font-medium', c.optedOut && 'line-through')}>{c.name}</span>
+          <div key={c.dialStr} className={cn('flex items-center justify-between gap-3 py-2 text-sm', c.disabled && 'opacity-50')}>
+            <span className={cn('font-medium', c.disabled && 'line-through')}>{c.name}</span>
             <span className="flex items-center gap-2">
-              <span className={cn('font-mono text-xs text-muted-foreground', c.optedOut && 'line-through')}>+{c.dialStr}</span>
-              {c.optedOut ? <Badge variant="outline">opted out</Badge> : c.sent ? <Badge variant="secondary">sent</Badge> : null}
+              <span className={cn('font-mono text-xs text-muted-foreground', c.disabled && 'line-through')}>+{c.dialStr}</span>
+              {c.disabled ? <Badge variant="outline">{REASON_LABEL[c.disabledReason] || 'disabled'}</Badge>
+                : c.sent ? <Badge variant="secondary">sent</Badge> : null}
             </span>
           </div>
         ))}
@@ -201,6 +202,100 @@ function ButtonEditor({ buttons, onChange }) {
 // component gets a fresh function identity on every render, so React sees a
 // different component type, throws the old subtree away and mounts a new one —
 // which destroys the focused <input> after every single keystroke.
+// ── Who did not get the message, and what you can do about it ─────────────────
+// Grouped by disposition rather than by error code: "try these again" and "give
+// up on these" are different actions, and an operator reading a list of numeric
+// codes has to make that call themselves every time.
+const SKIP_GROUPS = [
+  // The only group whose meaning depends on whether the campaign is still going:
+  // the same rows are "queued for another go" during a run and "left un-messaged"
+  // after a Stop. Same data, opposite thing for the operator to do about it.
+  { key: 'waiting',   title: 'Waiting to retry',
+    blurb: 'Still in this campaign. A failure that was about the moment put them back in the queue — the run picks them up again at the time shown and does not finish until it has.',
+    stoppedTitle: 'Left un-messaged when you stopped',
+    stoppedBlurb: 'These were queued for another attempt when the campaign was stopped, so it never came. They are still on the queue: pressing Resume picks them up at their scheduled time. Starting a fresh run from a new CSV messages everyone on it, including the people already reached by this one.' },
+  { key: 'retry',     title: 'Worth trying again another day',
+    blurb: 'These used up all four attempts and still failed for a reason nothing on your side controls — usually the per-person marketing cap, which resets on a scale of days. Re-upload and run again later, or send it as a UTILITY template, which the cap does not apply to.' },
+  { key: 'fix',       title: 'Fix something first',
+    blurb: 'These failed because of a setting on your side. Retrying unchanged repeats the failure; correcting the cause makes the whole list sendable.' },
+  { key: 'permanent', title: 'Meta will not deliver these',
+    blurb: 'A property of the number, not of the attempt. They have been disabled so later runs skip them automatically.' },
+  { key: 'disabled',  title: 'Switched off before the run',
+    blurb: 'Nobody attempted these — they were already disabled when the queue was built.' },
+  { key: 'unclassified', title: 'Not yet classified',
+    blurb: 'Meta returned a code this app has no entry for, so it is shown raw rather than sorted for you — guessing "retry" costs you re-sends, and guessing "give up" quietly drops a customer. Look the code up in Meta\'s error reference, then add it to META_ERRORS in src/lib/errors.js.' },
+];
+
+const clockOf = ms => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+function SkipReport({ phase, retrying = 0 }) {
+  const [data, setData] = useState(null);
+  const [open, setOpen] = useState(null);
+
+  // Reloads when the run finishes or is stopped, which is when the report is
+  // worth reading. Polling it mid-run would be a lot of noise for a list that
+  // is still growing. `retrying` is a dependency too: a contact going onto or
+  // coming off the retry ladder changes this list without changing the phase.
+  useEffect(() => {
+    api.get('/api/campaign/skips').then(setData).catch(() => setData(null));
+  }, [phase, retrying]);
+
+  if (!data || !data.total) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Not messaged yet — {num(data.total)} of {num(data.progress?.total || 0)}</CardTitle>
+        <CardDescription>
+          Nothing here has been billed. Every contact says how many times it was
+          attempted, what Meta answered, and what that means.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2 p-5 pt-0">
+        {SKIP_GROUPS.filter(g => (data.groups[g.key] || []).length).map(g => {
+          const rows  = data.groups[g.key];
+          const title = !data.active && g.stoppedTitle ? g.stoppedTitle : g.title;
+          const blurb = !data.active && g.stoppedBlurb ? g.stoppedBlurb : g.blurb;
+          return (
+            <div key={g.key} className="rounded-md border border-border">
+              <button className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left"
+                      onClick={() => setOpen(open === g.key ? null : g.key)}>
+                <span className="text-sm font-medium">{title}</span>
+                <span className="flex items-center gap-2">
+                  <Badge variant="secondary">{num(rows.length)}</Badge>
+                  <span className="text-xs text-muted-foreground">{open === g.key ? '▾' : '▸'}</span>
+                </span>
+              </button>
+              {open === g.key && (
+                <div className="border-t border-border">
+                  <p className="px-3 py-2 text-xs text-muted-foreground">{blurb}</p>
+                  <div className="max-h-56 divide-y divide-border overflow-y-auto">
+                    {rows.map(r => (
+                      <div key={r.phone} className="px-3 py-1.5 text-xs">
+                        <p className="flex items-center gap-2 font-medium">
+                          <span>{r.name}</span>
+                          <span className="font-mono text-muted-foreground">+{r.phone}</span>
+                          {r.code ? <Badge variant="outline">code {r.code}</Badge> : null}
+                          {/* Only while a campaign is actually walking the queue.
+                              After a Stop there is no next attempt to name. */}
+                          {r.retryAt && data.active ? <Badge variant="secondary">next {clockOf(r.retryAt)}</Badge> : null}
+                        </p>
+                        {/* The server composes this sentence so the log, the API
+                            and this list cannot tell three versions of it. */}
+                        <p className="text-muted-foreground">{r.detail}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </CardContent>
+    </Card>
+  );
+}
+
 const Step = ({ n, title, state, right, children }) => (
   <Card>
     <CardHeader row className="gap-3">
@@ -221,7 +316,7 @@ function Campaign() {
   const {
     ss, contacts, setContacts, templates, picked, setPicked, params, setParams,
     tmplErr, active, vars, flushParams, loadTemplates, uploadCSV, logs, setLogs,
-    failLog, setFailLog, optOuts,
+    failLog, setFailLog,
   } = useApp();
 
   const [showAll,  setShowAll]  = useState(false);
@@ -258,8 +353,14 @@ function Campaign() {
   const sampleName = contacts.sample?.[0]?.name || compose.sampleValues[0] || 'Rahul';
   const composeVars = templateVarsIn(compose.bodyText);
   const approved  = active?.status === 'APPROVED';
-  const isRunning = phase === 'running';
+  // 'waiting' is the loop asleep between retry attempts. It is running as far as
+  // every control here is concerned — Pause and Stop apply, Send does not — but
+  // it gets its own wording, because "Sending" over a four-hour sleep reads as a
+  // hang rather than as the ladder doing its job.
+  const isWaiting = phase === 'waiting';
+  const isRunning = phase === 'running' || isWaiting;
   const isPaused  = phase === 'paused';
+  const isActive  = isRunning || isPaused;
 
   // Unfilled fixed slots stay visible as {{n}} in the preview rather than
   // borrowing the sample name — otherwise a blank price reads as a real one.
@@ -280,7 +381,11 @@ function Campaign() {
     !approved          ? `That template is ${active.status} — pick an approved one or write a new one` :
     unfilled.length    ? `Fill in ${unfilled.map(n => `{{${n}}}`).join(', ')} above` :
     needsAttachment    ? 'This template has a media header — choose the file to send' :
-    phase !== 'idle'   ? 'A campaign is already running — stop it first' : null;
+    // The same rule the server enforces in campaignBlocker(), said earlier. The
+    // server is the one that counts: a second tab could otherwise start a
+    // parallel walk over one queue and message people twice.
+    isWaiting          ? `Still finishing — ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'} waiting to retry${ss.nextRetry ? `, next at ${clockOf(ss.nextRetry.at)}` : ''}. Stop it, or let it finish, before starting another.` :
+    isActive           ? 'A campaign is already running — stop it, or let it finish, first' : null;
 
   // ── Actions ─────────────────────────────────────────────────────
   const submitTemplate = async () => {
@@ -328,7 +433,9 @@ function Campaign() {
   };
   const doPause  = () => api.post('/api/pause');
   const doResume = () => api.post('/api/resume');
-  const doStop   = () => confirm('Stop the campaign? It stays where it is — Resume picks up from the same contact.') && api.post('/api/stop');
+  const doStop   = () => confirm(isWaiting
+    ? `Stop the campaign? ${num(ss.retrying || 0)} contact(s) are waiting on a retry — stopping leaves them un-messaged, listed in the report below.`
+    : 'Stop the campaign? It stays where it is — Resume picks up from the same contact.') && api.post('/api/stop');
   const doReset  = () => {
     if (!confirm('Clear contacts, stats and logs? This cannot be undone.')) return;
     api.post('/api/reset');
@@ -344,12 +451,23 @@ function Campaign() {
         {/* ── 1. Contacts ──────────────────────────────────────── */}
         <Step n={1} title="Upload contacts" state={contacts.count ? 'done' : 'now'}
               right={contacts.count ? <Badge variant="secondary">{num(contacts.count)} numbers</Badge> : null}>
+          {/* A new upload opens a new run and REPLACES the queue, so it is
+              refused while one is in flight — the server refuses it too. The
+              dropzone says so up front rather than letting the click fail. */}
+          {isActive && (
+            <Alert variant="warning" title="A campaign is still running">
+              Uploading a list now would abandon the queue it is walking. Let it finish, or stop it first.
+              Writing and submitting a new template is fine meanwhile.
+            </Alert>
+          )}
           <label htmlFor="csv"
-            onDragOver={e => { e.preventDefault(); setDragging(true); }}
+            onDragOver={e => { e.preventDefault(); if (!isActive) setDragging(true); }}
             onDragLeave={() => setDragging(false)}
-            onDrop={e => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f?.name.endsWith('.csv')) uploadCSV(f); }}
-            className={cn('flex min-h-[104px] cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border border-dashed p-4 text-center transition-colors',
-              dragging ? 'border-primary bg-primary/5' : 'border-input hover:border-primary hover:bg-primary/5')}>
+            onDrop={e => { e.preventDefault(); setDragging(false); if (isActive) return; const f = e.dataTransfer.files[0]; if (f?.name.endsWith('.csv')) uploadCSV(f); }}
+            className={cn('flex min-h-[104px] flex-col items-center justify-center gap-1 rounded-lg border border-dashed p-4 text-center transition-colors',
+              isActive ? 'pointer-events-none border-input opacity-50'
+                : dragging ? 'cursor-pointer border-primary bg-primary/5'
+                : 'cursor-pointer border-input hover:border-primary hover:bg-primary/5')}>
             {contacts.count ? <>
               <span className="text-3xl font-bold tracking-tight text-success">{num(contacts.count)}</span>
               <span className="text-xs text-muted-foreground">
@@ -360,7 +478,8 @@ function Campaign() {
               <span className="text-xs text-muted-foreground">or click to choose · Google Contacts export works as-is</span>
             </>}
           </label>
-          <input id="csv" type="file" accept=".csv" hidden onChange={e => e.target.files[0] && uploadCSV(e.target.files[0])} />
+          <input id="csv" type="file" accept=".csv" hidden disabled={isActive}
+                 onChange={e => e.target.files[0] && uploadCSV(e.target.files[0])} />
 
           {/* Format guidance, shown before the first upload — after one, the
               parsed list below is the better answer to "did it work?".
@@ -414,7 +533,7 @@ function Campaign() {
                 </div>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   {num(pricing.billable)} billable × {money(pricing.rate, cur)} per delivered {String(pricing.category || '').toLowerCase() || 'marketing'} message
-                  {optOuts.length > 0 && <> · {num(contacts.count - pricing.billable)} skipped for opt-outs</>}
+                  {contacts.count > pricing.billable && <> · {num(contacts.count - pricing.billable)} skipped as disabled</>}
                 </p>
               </div>
             </>
@@ -610,6 +729,15 @@ function Campaign() {
               {starting ? 'Starting…' : ready ? `Send to ${num(pricing.billable)} contacts · ≈ ${money(pricing.estimate, cur)}` : 'Send'}
             </Button>
           )}
+          {isWaiting && (
+            <Alert variant="warning" title={`Waiting to retry — ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'}`}>
+              {ss.nextRetry ? `Next attempt at ${clockOf(ss.nextRetry.at)}. ` : ''}
+              These failed for a reason that may pass — a network blip, a Meta hiccup, or the
+              per-person marketing cap. Each gets up to three more tries, an hour, two and four
+              hours apart, before it is reported. The campaign is not finished until then, and it
+              carries on by itself across a restart.
+            </Alert>
+          )}
           {isRunning && <div className="flex gap-2">
             <Button variant="outline" className="flex-1" onClick={doPause}>Pause</Button>
             <Button variant="destructive" className="flex-1" onClick={doStop}>Stop</Button>
@@ -618,7 +746,7 @@ function Campaign() {
             <Button className="flex-1" onClick={doResume}>Resume</Button>
             <Button variant="destructive" className="flex-1" onClick={doStop}>Stop</Button>
           </div>}
-          {blockedBy && !isRunning && !isPaused && <p className="text-center text-xs text-muted-foreground">{blockedBy}</p>}
+          {blockedBy && !isActive && <p className="text-center text-xs text-muted-foreground">{blockedBy}</p>}
           <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={doReset}>Reset everything</Button>
         </Step>
       </div>
@@ -655,6 +783,8 @@ function Campaign() {
               )}
           </CardContent>
         </Card>
+
+        <SkipReport phase={ss.phase} retrying={ss.retrying} />
 
         {failLog.length > 0 && (
           <Card>

@@ -32,6 +32,7 @@ const ROUTES = [
   { path: 'campaign', label: 'Campaign',  icon: '➤' },
   { path: 'inbox',    label: 'Inbox',     icon: '✉' },
   { path: 'settings', label: 'Settings',  icon: '⚙' },
+  { path: 'diagnostics', label: 'Diagnostics', icon: '⚕' },
 ];
 
 function useRoute() {
@@ -169,7 +170,6 @@ function App() {
   const [tmplErr,  setTmplErr]  = useState(null);
   const [logs,     setLogs]     = useState([]);
   const [failLog,  setFailLog]  = useState([]);
-  const [optOuts,  setOptOuts]  = useState([]);
   const [threads,  setThreads]  = useState([]);
   const reloadTmpl = useRef(() => {});
 
@@ -273,7 +273,6 @@ function App() {
     }).catch(() => loadTemplates());
 
     api.get('/api/faillog').then(d => setFailLog(d || [])).catch(() => {});
-    api.get('/api/optouts').then(d => setOptOuts(d.numbers || [])).catch(() => {});
     api.get('/api/account-info').then(a => { if (!a.error) setAccount(a); }).catch(() => {});
     loadInbox();
   }, [session.authed, loadTemplates, loadInbox]);
@@ -294,7 +293,10 @@ function App() {
   const uploadCSV = useCallback(async file => {
     const fd = new FormData(); fd.append('csv', file);
     const r = await api.upload('/api/upload-csv', fd).catch(() => ({ ok: false, error: 'Upload failed' }));
-    if (!r.ok) return alert('Could not read that CSV: ' + (r.error || 'unknown error'));
+    // The server's error is already a sentence — a parse failure names the row,
+    // and a refusal because a campaign is still running names the campaign.
+    // Prefixing it with "Could not read that CSV" made the second one a lie.
+    if (!r.ok) return alert(r.error || 'Could not read that CSV');
     setContacts({ count: r.count, sample: r.sample, file: file.name });
     setFailLog([]);
   }, []);
@@ -302,7 +304,7 @@ function App() {
   const ctx = {
     api, session, signOut, dark, setDark, connected,
     ss, account, contacts, setContacts, templates, setTemplates, picked, setPicked,
-    params, setParams, tmplErr, logs, setLogs, failLog, setFailLog, optOuts, setOptOuts,
+    params, setParams, tmplErr, logs, setLogs, failLog, setFailLog,
     threads, setThreads, active, vars, flushParams, loadTemplates, loadInbox, uploadCSV,
   };
 
@@ -313,7 +315,8 @@ function App() {
     return <LoginScreen setupRequired={session.setupRequired} onIn={checkSession} />;
   }
 
-  const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, settings: SettingsView }[tab] || Dashboard;
+  const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, settings: SettingsView,
+                 diagnostics: Diagnostics }[tab] || Dashboard;
 
   return (
     <AppContext.Provider value={ctx}>

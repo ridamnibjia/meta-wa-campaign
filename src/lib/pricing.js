@@ -10,12 +10,22 @@ function rateFor(category) {
   return Number.isFinite(r) && r >= 0 ? r : PRICES.MARKETING;
 }
 
-// Opted-out contacts are skipped before a send is attempted, so they never cost
+// Disabled contacts are skipped before a send is attempted, so they never cost
 // anything and must not appear in the estimate.
-function billableCount(contacts, optOuts) {
+//
+// `isDisabled` is a predicate rather than the Set it used to be, because the
+// answer now lives in SQL and lib/ must not import the database — nothing in
+// here knows about Express or a schema, which is what lets test.js call it with
+// no server and no fixtures. services/contacts.js supplies the real one.
+//
+// ponytail: one indexed primary-key lookup per contact, per broadcast. Cheap at
+// a few thousand rows. P2b replaces the in-memory contacts array with
+// run_recipients, at which point this whole count becomes a single SQL
+// aggregate and the predicate goes away.
+function billableCount(contacts, isDisabled) {
   if (!Array.isArray(contacts)) return 0;
-  if (!optOuts || typeof optOuts.has !== 'function') return contacts.length;
-  return contacts.reduce((n, c) => n + (optOuts.has(c.dialStr) ? 0 : 1), 0);
+  if (typeof isDisabled !== 'function') return contacts.length;
+  return contacts.reduce((n, c) => n + (isDisabled(c.dialStr) ? 0 : 1), 0);
 }
 
 // Rounded to paise. Floating-point money is fine here because this is a display

@@ -3,11 +3,13 @@ const { CFG, FILES } = require('../config');
 const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
 const { S, flags, log, sleep, todayKey, checkDaily } = require('../state');
 const { broadcast } = require('./status');
-const { optOuts } = require('./optouts');
+const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
 const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
-const { recordOutbound, countsForRun, startRun } = require('./messages');
+const { recordOutbound, countsForRun, startRun, buildRun, nextPending,
+        recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
+        nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
-const { explainError } = require('../lib/errors');
+const { explainError, skipDisposition } = require('../lib/errors');
 const { graphHeaders } = require('./graph');
 const { headerComponent } = require('./media');
 
@@ -17,13 +19,14 @@ const { headerComponent } = require('./media');
 // operator has no way to resume without risking a full re-send.
 const writer = debouncedWriter(FILES.campaign, 2000);
 
+// The contacts array and currentIdx are deliberately gone from this file. The
+// queue lives in run_recipients and the resume point is derived from it, so all
+// that is left here is the pacing state a database row has no opinion about:
+// which run is current, and how much of today's cap is spent.
 const snapshot = () => ({
-  contacts:     S.contacts,
-  currentIdx:   S.currentIdx,
   phase:        S.phase,
   dailyCount:   S.dailyCount,
   dailyDate:    S.dailyDate,
-  skipped:      S.skipped,
   config:       S.config,
   // Without this a restart forgets which run is current, applyStatus/recordOutbound
   // fall back to run_id NULL, and a resumed send merges into the inbox-reply /
@@ -38,15 +41,22 @@ const clearCampaignFile = () => writeJSON(FILES.campaign, {});
 
 function loadCampaign() {
   const d = readJSON(FILES.campaign, {});
-  if (!Array.isArray(d.contacts) || !d.contacts.length) return null;
+  if (d.currentRunId == null) {
+    // A campaign.json written before run_recipients existed carried the queue
+    // as an array in this file. There is no queue to rebuild from it — the
+    // contacts are in SQL now but the ORDER and the already-sent marks are not
+    // — so resuming would either re-send to everyone or to nobody. Say so
+    // loudly: an operator whose run stopped at a deploy needs to know it did.
+    if (Array.isArray(d.contacts) && d.contacts.length) {
+      log('warn', `campaign.json is from before the durable send queue — its ${d.contacts.length} contacts were NOT resumed. Re-upload the CSV to start a run; anyone already messaged is in the thread list.`);
+    }
+    return null;
+  }
   Object.assign(S, {
-    contacts:     d.contacts,
-    currentIdx:   d.currentIdx   || 0,
     phase:        d.phase        || 'idle',
     dailyCount:   d.dailyCount   || 0,
     dailyDate:    d.dailyDate    || null,
-    skipped:      d.skipped      || 0,
-    currentRunId: d.currentRunId ?? null,
+    currentRunId: d.currentRunId,
   });
   if (d.config) Object.assign(S.config, d.config);
   return d;
@@ -165,6 +175,88 @@ async function sendTemplate(contact) {
   }
 }
 
+// ── Retrying a failure that was about the moment ───────────────────────────────
+// One DNS blip while sending to contact #340 used to drop that person from the
+// run permanently, and the only way to reach them again was re-uploading the CSV
+// — which opens a new run and messages everyone a second time. That is the leak
+// this closes.
+//
+// Three waits, so four attempts in total: the original send, then one an hour
+// later, one two hours after that, one four hours after that. A contact still
+// failing at the end of that ladder is reported rather than retried again —
+// there is nothing left for another attempt to discover.
+//
+// WHICH failures come back here is lib/errors.js:skipDisposition, not a list
+// kept here. A code has to be named 'retry' there to get a second attempt.
+const RETRY_BACKOFF_MS = [3600000, 7200000, 14400000];   // 1h → 2h → 4h
+
+const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
+  { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+
+// True when the contact was put back in the queue; false when the caller should
+// record a terminal skip. `row.attempts` is how many retries this contact has
+// already had — the SQL increments it, so it cannot drift.
+function scheduleRetry(contact, row, result, n) {
+  if (skipDisposition(result.errorCode) !== 'retry') return false;
+  const made = row.attempts || 0;
+  if (made >= RETRY_BACKOFF_MS.length) {
+    log('warn', `${n} ${contact.name} — still failing after ${made + 1} attempts, reporting it [${result.errorCode}]`);
+    return false;
+  }
+  const at = Date.now() + RETRY_BACKOFF_MS[made];
+  recordRecipientRetry(S.currentRunId, contact.dialStr, result.errorCode, at);
+  log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
+  return true;
+}
+
+// Waits in slices rather than in one call, so Stop and Pause are answered in a
+// second instead of in hours. A four-hour `await sleep()` would leave the
+// operator holding a button that does nothing.
+//
+// One second, not fifteen: the slice length is also how long `flags.running`
+// stays true after a Stop, and that window is what /upload-csv and /start refuse
+// through campaignBlocker(). Fourteen thousand no-op timer wakeups over a
+// four-hour wait cost nothing measurable; fifteen seconds of "still stopping"
+// after clicking Stop reads as the button having failed.
+async function sleepUntil(at) {
+  while (Date.now() < at) {
+    if (flags.stopFlag || flags.pauseFlag) return;
+    await sleep(Math.min(1000, at - Date.now()));
+  }
+}
+
+// ── One campaign at a time ─────────────────────────────────────────────────────
+// stageRun REPLACES run_recipients for the run it is given and /upload-csv opens
+// a new run, so a CSV uploaded mid-flight would abandon a queue that is still
+// being walked — every wamid lost, every un-messaged contact orphaned in a run
+// nothing points at any more. The guard is here rather than in the routes so
+// both entry points cannot disagree about what "active" means.
+//
+// `flags.running` is in the test deliberately, and it is the half that matters:
+// a Stop sets the phase to idle immediately, but the loop is still inside an
+// await for up to a second afterwards. Trusting the phase alone let a Start in
+// that window spawn a SECOND loop over the same queue, and two loops walking one
+// run message whoever they both reach twice.
+const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
+const campaignActive = () => flags.running || ACTIVE_PHASES.includes(S.phase);
+
+// The sentence a route hands the operator, or null when nothing is in the way.
+function campaignBlocker() {
+  if (!campaignActive()) return null;
+  // Stopped, but the loop has not returned yet. Reporting progress here would
+  // read as nonsense — a reset has already cleared currentRunId, so the counts
+  // are zeroes — and the honest answer is that it takes a moment.
+  if (!ACTIVE_PHASES.includes(S.phase)) {
+    return 'The previous campaign is still stopping — try that again in a second.';
+  }
+  const p = progressForRun(S.currentRunId);
+  const what = S.phase === 'waiting'
+      ? `waiting to retry ${p.retrying} contact${p.retrying === 1 ? '' : 's'}`
+    : S.phase === 'paused' ? 'paused part-way through'
+    : 'still sending';
+  return `A campaign is ${what} — ${p.sent + p.skipped} of ${p.total} done, ${p.pending} left. Stop it, or let it finish, before starting another.`;
+}
+
 // ── Campaign loop ──────────────────────────────────────────────────────────────
 function startLoop() {
   if (flags.running) return;
@@ -173,13 +265,35 @@ function startLoop() {
 }
 
 async function campaignLoop() {
-  log('info', `Campaign started — ${S.contacts.length - S.currentIdx} contacts queued`);
+  log('info', `Campaign started — ${progressForRun(S.currentRunId).pending} contacts queued`);
   while (true) {
-    if (flags.stopFlag)  { log('info', 'Stopped'); S.phase = 'done'; saveCampaignNow(); broadcast(); break; }
+    // The phase is only set here if nobody has already set it. /stop and /reset
+    // say 'idle' the moment they are called, and overwriting that with 'done' a
+    // second later told the operator "Finished" about a run they stopped.
+    if (flags.stopFlag)  { log('info', 'Stopped'); if (S.phase !== 'idle') S.phase = 'done'; saveCampaignNow(); broadcast(); break; }
     if (flags.pauseFlag) { await sleep(500); continue; }
-    if (S.currentIdx >= S.contacts.length) {
-      const c = countsForRun(S.currentRunId);
-      log('info', `Done — accepted:${c.accepted} failed:${S.failed} skipped:${S.skipped}`);
+    // The queue is asked, never counted. Nothing in this loop holds a cursor
+    // that a crash could leave ahead of what was actually sent.
+    const c = nextPending(S.currentRunId);
+    if (!c) {
+      // Nothing sendable RIGHT NOW is not the same as nothing left. A run with
+      // contacts on the retry ladder stays open and sleeps to the earliest of
+      // them; declaring it done here is what used to lose those people.
+      const retry = nextRetryForRun(S.currentRunId);
+      if (retry) {
+        S.phase = 'waiting';
+        S.pauseReason = `Waiting to retry — ${retry.count} contact${retry.count === 1 ? '' : 's'}, next attempt ${clockIST(retry.at)}`;
+        log('info', S.pauseReason);
+        saveCampaignNow(); broadcast();
+        await sleepUntil(retry.at);
+        // Stop and Pause are handled at the top of the loop; falling through
+        // with the phase still 'waiting' would strand it there.
+        if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
+        continue;
+      }
+      const counts = countsForRun(S.currentRunId);
+      const p = progressForRun(S.currentRunId);
+      log('info', `Done — accepted:${counts.accepted} failed:${S.failed} skipped:${p.skipped}`);
       S.phase = 'done'; saveCampaignNow(); broadcast(); break;
     }
     checkDaily();
@@ -200,48 +314,90 @@ async function campaignLoop() {
         ? `Warm-up ceiling for day ${W.days.length}` : 'Daily cap';
       log('info', `${why} ${S.dailyCount}/${cap} — resuming in ${h}h ${m}m`);
       S.phase = 'paused'; S.pauseReason = `${why} reached (${cap}/day). Resumes in ${h}h ${m}m.`; broadcast();
-      await sleep(wait);
-      S.phase = 'running'; S.pauseReason = null; broadcast(); continue;
+      // sleepUntil, not sleep: this wait is up to a full day. A bare sleep here
+      // meant a Stop set stopFlag that nothing read until tomorrow — and since
+      // `flags.running` stays true until the loop exits, campaignBlocker()
+      // refused every Start and every CSV upload for those hours with "still
+      // stopping, try again in a second".
+      await sleepUntil(nextIstMidnight);
+      if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
+      continue;
     }
-    const c = S.contacts[S.currentIdx];
-    const n = `[${S.currentIdx + 1}/${S.contacts.length}]`;
-    if (optOuts.has(c.dialStr)) {
-      S.skipped++; S.currentIdx++;
-      log('warn', `${n} skipped — ${c.name} opted out`);
+    // A contact is { name, dialStr } to everything below; run_recipients stores
+    // the same two fields under SQL names.
+    const contact = { name: c.name, dialStr: c.phone };
+    const p = progressForRun(S.currentRunId);
+    const n = `[${p.sent + p.skipped + 1}/${p.total}]`;
+
+    // Re-checked here, not only at run build: a customer can tap "Stop
+    // promotions" while the run this row belongs to is halfway through it.
+    if (isDisabled(contact.dialStr)) {
+      // The reason is worth saying out loud: "opted out" and "Meta says this
+      // number is undeliverable" are the same skip to the loop and completely
+      // different problems to the operator.
+      const why = getRow(contact.dialStr)?.disabled_reason || 'disabled';
+      recordRecipientSkipped(S.currentRunId, contact.dialStr, 'disabled', null);
+      log('warn', `${n} skipped — ${contact.name} is disabled (${why})`);
       saveCampaign();
       broadcast();
       continue;   // no delay: nothing was sent
     }
-    log('info', `${n} ${c.name} +${c.dialStr}`);
-    const result = await sendTemplate(c);
+    log('info', `${n} ${contact.name} +${contact.dialStr}`);
+    const result = await sendTemplate(contact);
     if (result.ok) {
       S.dailyCount++;
       markWarmupDay();
-      recordOutbound({ wamid: result.messageId, waId: c.dialStr, name: c.name,
+      markMessaged(contact.dialStr);
+      // The recipient row is stamped BEFORE the message row. If the process
+      // dies between them the worst case is a message with no queue entry —
+      // visible in the thread, counted by countsForRun. The other order would
+      // leave a sent message the queue still considers pending, and the resume
+      // would message that person twice.
+      recordRecipientSent(S.currentRunId, contact.dialStr, result.messageId);
+      recordOutbound({ wamid: result.messageId, waId: contact.dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, result.params)
                              ?? `[template: ${S.config.templateName}]`,
                        runId: S.currentRunId });
       log('success', `${n} accepted — today:${S.dailyCount}/${cap}`);
     } else if (result.skip) {
-      S.skipped++;
-      log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
+      // 131026 is a property of the NUMBER, not of the attempt: not on
+      // WhatsApp, or blocked by Meta on quality grounds. Retrying it is never
+      // right, and left enabled it burns a send slot on every run, forever.
+      // The other skippable codes are about the moment, so they change nothing.
+      if (result.errorCode === 131026 && disable(contact.dialStr, 'failed_hard', contact.name)) {
+        log('warn', `${n} ${contact.name} disabled — Meta reports this number as undeliverable, so later runs will not retry it`);
+      }
+      // 131049 lands here: the per-person marketing cap is about the moment, so
+      // it goes back on the queue rather than out of the run.
+      if (!scheduleRetry(contact, c, result, n)) {
+        recordRecipientSkipped(S.currentRunId, contact.dialStr, 'skipped', result.errorCode);
+        log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
+      }
     } else if (result.rateLimit) {
       log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s. ${result.hint || result.error} [${result.errorCode}]`);
       S.phase = 'paused'; S.pauseReason = 'Rate limit — auto-resuming'; broadcast();
-      await sleep(result.retryAfter);
-      S.phase = 'running'; S.pauseReason = null; broadcast();
+      // Same reason as the daily cap above: Meta's retry-after is minutes, not
+      // seconds, and a Stop must not wait it out.
+      await sleepUntil(Date.now() + result.retryAfter);
+      if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue; // retry same contact
-    } else {
+    } else if (!scheduleRetry(contact, c, result, n)) {
+      // Only counted as failed once the ladder is exhausted or the code was
+      // never retryable. A network blip that is about to be retried is not a
+      // failed send, and counting it as one would put a number on the dashboard
+      // that the queue disagrees with.
       S.failed++;
-      S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: c.dialStr, name: c.name, error: result.error, code: result.errorCode, hint: result.hint });
+      // Recorded on the queue row too, so this person appears in the skip
+      // report rather than only in a 50-entry ring buffer that /api/start wipes.
+      recordRecipientSkipped(S.currentRunId, contact.dialStr, 'failed', result.errorCode);
+      S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: contact.dialStr, name: contact.name, error: result.error, code: result.errorCode, hint: result.hint, attempts: (c.attempts || 0) + 1 });
       if (S.failLog.length > 50) S.failLog.shift();
       log('error', `${n} failed [${result.errorCode}] ${result.error}`);
       if (result.hint) log('error', `   ↳ ${result.hint}`);
     }
-    S.currentIdx++;
-    saveCampaign();   // debounced — the cursor is what a restart needs to resume
+    saveCampaign();   // debounced — only pacing state; the queue is already on disk
     broadcast();
-    if (!flags.pauseFlag && !flags.stopFlag && S.currentIdx < S.contacts.length) {
+    if (!flags.pauseFlag && !flags.stopFlag && nextPending(S.currentRunId)) {
       await sleep(S.config.delaySec * 1000);
     }
   }
@@ -249,43 +405,51 @@ async function campaignLoop() {
 }
 
 // ── Restart recovery ───────────────────────────────────────────────────────────
-// A campaign interrupted mid-flight resumes on its own. `currentIdx` only
-// advances after a send resolves, so the worst case is one duplicate message to
-// the contact that was in flight when the process died — much better than a
-// campaign that silently stops when the VM reboots and nobody notices for a day.
+// A campaign interrupted mid-flight resumes on its own, and the point it
+// resumes at is a QUERY over what was actually sent — not a counter that a
+// crash can leave ahead of reality. The recipient row is stamped before the
+// message row, so the worst case is a row still marked pending for a send that
+// did go out, which costs one duplicate message. The old failure mode was the
+// opposite and far worse: an index too high silently skipped people, and
+// nothing downstream could tell.
+//
 // The grace period gives the network and Meta's API time to come back first.
 const RESUME_GRACE_MS = 10000;
 
 function resumeIfInterrupted() {
   const saved = loadCampaign();
   if (!saved) return;
-  const left = S.contacts.length - S.currentIdx;
-  if (saved.phase !== 'running' || left <= 0) {
-    log('info', `Campaign restored — ${S.currentIdx}/${S.contacts.length} done, phase ${S.phase}`);
+  const p = progressForRun(S.currentRunId);
+  // 'waiting' resumes exactly like 'running': the backoff deadline is a column
+  // on the queue row, so the wait carries on across the restart by itself — the
+  // loop simply re-derives how long is left.
+  if (!['running', 'waiting'].includes(saved.phase) || p.pending <= 0) {
+    log('info', `Campaign restored — ${p.sent + p.skipped}/${p.total} done, phase ${S.phase}`);
     return;
   }
-  // A campaign.json saved before run ids existed, or one whose run was
-  // otherwise never opened, has no run id to restore. Resuming it silently
-  // would attribute every resumed send to run_id NULL — the same bucket
-  // inbox replies and migrated legacy messages live in — which merges the
-  // campaign's counters and spend into unrelated traffic (F1). Open a run
-  // rather than resume unattributed.
-  if (S.currentRunId == null) {
-    startRun(S.config.templateName);
-    log('warn', `Resumed campaign had no run id on file — opened run ${S.currentRunId} so resumed sends are attributed`);
-  }
   S.phase       = 'paused';
-  S.pauseReason = `Server restarted — resuming ${left} remaining contacts in ${RESUME_GRACE_MS / 1000}s`;
-  log('warn', `Campaign was interrupted at ${S.currentIdx}/${S.contacts.length} — auto-resuming in ${RESUME_GRACE_MS / 1000}s`);
+  S.pauseReason = `Server restarted — resuming ${p.pending} remaining contacts in ${RESUME_GRACE_MS / 1000}s`;
+  log('warn', `Campaign was interrupted at ${p.sent + p.skipped}/${p.total} — auto-resuming in ${RESUME_GRACE_MS / 1000}s`);
   setTimeout(() => {
     S.phase = 'running'; S.pauseReason = null;
-    log('info', `Auto-resumed — ${S.contacts.length - S.currentIdx} contacts left`);
+    log('info', `Auto-resumed — ${progressForRun(S.currentRunId).pending} contacts left`);
     broadcast();
     startLoop();
   }, RESUME_GRACE_MS).unref();
 }
 
+// Open a run and stage its queue in one step, so no caller can create one
+// without the other. `disabled` rows are written rather than omitted: the skip
+// report's whole job is saying who was not messaged and why, and a row that
+// was never inserted cannot say anything.
+function stageRun(contacts, label = S.config.templateName) {
+  const runId = startRun(label);
+  buildRun(runId, contacts, phone => (isDisabled(phone) ? 'disabled' : null));
+  return runId;
+}
+
 module.exports = {
-  CONTACT_FIELDS, buildParams, missingParams, sendTemplate,
+  CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
+  campaignActive, campaignBlocker, scheduleRetry, RETRY_BACKOFF_MS,
 };

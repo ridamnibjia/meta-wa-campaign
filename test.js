@@ -13,6 +13,11 @@ process.env.WA_UPLOAD_DIR = require('path').join(
 process.env.WA_MEDIA_DIR = require('path').join(
   require('os').tmpdir(), `wa-media-${process.pid}-${Date.now()}`);
 
+// The free-space floor defaults to 2 GB, which makes every media test a
+// referendum on how full the developer's laptop is. The floor is exercised
+// deliberately, in its own test, by raising it — so the default here is zero.
+process.env.WA_MEDIA_MIN_FREE_BYTES = '0';
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
@@ -25,7 +30,7 @@ const {
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
-  markRead, inboxThread, sendReply,
+  markRead, inboxThread, inboxSearch, sendReply,
   checkPassword, createSession, validSession, destroySession,
   PRICES,
   nodeVersionOk, openDb, SCHEMA,
@@ -330,14 +335,66 @@ test('rejects empty input', () => assert.equal(normalizePhone(''), null));
 console.log('\nparseCSV');
 test('reads name and mobile, and dedupes', () => {
   const csv = 'First Name,Mobile Phone\nRahul,9000000001\nPriya,9000000002\nDupe,+91 90000 00001\n';
-  const out = parseCSV(Buffer.from(csv));
-  assert.equal(out.length, 2);
-  assert.equal(out[0].name, 'Rahul');
-  assert.equal(out[0].dialStr, '919000000001');
+  const { contacts } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 2);
+  assert.equal(contacts[0].name, 'Rahul');
+  assert.equal(contacts[0].dialStr, '919000000001');
 });
 test('defaults a missing name to Contact', () => {
-  const out = parseCSV(Buffer.from('First Name,Mobile Phone\n,9000000001\n'));
-  assert.equal(out[0].name, 'Contact');
+  const { contacts } = parseCSV(Buffer.from('First Name,Mobile Phone\n,9000000001\n'));
+  assert.equal(contacts[0].name, 'Contact');
+});
+
+// Every case below silently produced ZERO contacts before the RFC 4180 split
+// and the widened header match. A CSV that half-parses is worse than one that
+// fails outright: the operator sees a plausible number and never learns which
+// customers were left out.
+test('a quoted comma in a name does not shift the phone column', () => {
+  const csv = 'Name,Mobile Phone,Notes\n"Doe, John",+919000000001,"member 2024"\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].name, 'Doe, John');
+  assert.equal(contacts[0].dialStr, '919000000001');
+  assert.equal(skipped.length, 0);
+});
+test('a doubled quote inside a quoted field is one literal quote', () => {
+  const { contacts } = parseCSV(Buffer.from('Name,Phone\n"Ali ""Bo"" Rao",+919000000001\n'));
+  assert.equal(contacts[0].name, 'Ali "Bo" Rao');
+});
+test('reads a modern Google Contacts export', () => {
+  const csv = 'First Name,Last Name,Phone 1 - Type,Phone 1 - Value\nAsha,Rao,Mobile,+919000000001\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].name, 'Asha Rao');
+  assert.equal(contacts[0].dialStr, '919000000001');
+  assert.equal(skipped.length, 0, 'the "- Type" column holds "Mobile", which is not a failed row');
+});
+test('a row with no usable number is reported, not dropped in silence', () => {
+  const csv = 'Name,Mobile Phone\nAsha,+919000000001\nRahul,not-a-number\nPriya,\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(skipped.length, 2);
+  assert.deepEqual(skipped.map(s => s.row), [3, 4]);
+  assert.equal(skipped[0].name, 'Rahul');
+});
+test('an account number column is never mistaken for a phone number', () => {
+  // 11 digits, so normalizePhone would happily accept it. The header match is
+  // the only thing standing between a membership id and a message to a stranger.
+  const csv = 'Name,Account Number,Mobile Phone\nAsha,12345678901,+919000000001\n';
+  const { contacts } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].dialStr, '919000000001');
+});
+test('two phone columns on one row both count, deduped', () => {
+  const csv = 'Name,Mobile Phone,Home Phone\nAsha,+919000000001,+919000000002\nDup,+919000000003,+919000000003\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 3);
+  assert.equal(skipped.length, 0, 'a duplicate number is not a row that failed to parse');
+});
+test('a CRLF file does not leave a stray return on the last column', () => {
+  const { contacts } = parseCSV(Buffer.from('Name,Mobile Phone\r\nAsha,+919000000001\r\n'));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].dialStr, '919000000001');
 });
 
 console.log('\nverifySignature');
@@ -357,6 +414,13 @@ console.log('\nexplainError');
 test('explains a known send failure', () => assert.match(explainError(131042), /Billing not set up/));
 test('includes an action, not just a label', () => assert.match(explainError(190), /Generate a fresh System User token/));
 test('returns null for an unknown code', () => assert.equal(explainError(999999), null));
+// -1 is this app's own code for "fetch threw", not one of Meta's. Without an
+// entry the skip report told the operator to look it up in Meta's error
+// reference, which does not list it.
+test('explains our own network code rather than blaming Meta', () => {
+  assert.match(explainError(-1), /Could not reach Meta from this server/);
+  assert.doesNotMatch(explainError(-1), /error reference/);
+});
 test('returns null for a missing code', () => assert.equal(explainError(undefined), null));
 test('every entry has both a cause and an action', () => {
   for (const [code, v] of Object.entries(META_ERRORS)) {
@@ -501,14 +565,19 @@ test('an unknown category falls back to the dearest rate, not zero', () => {
   assert.equal(rateFor('NONSENSE'), 0.78);
   assert.equal(rateFor(null), 0.78);
 });
-test('billable excludes opted-out numbers', () => {
+// A predicate rather than a Set: the answer lives in SQL now, and lib/ must not
+// import the database.
+const disabled = (...off) => p => off.includes(p);
+test('billable excludes disabled numbers', () => {
   const contacts = [{ dialStr: '911' }, { dialStr: '922' }, { dialStr: '933' }];
-  assert.equal(billableCount(contacts, new Set(['922'])), 2);
+  assert.equal(billableCount(contacts, disabled('922')), 2);
 });
-test('billable counts everything when nothing has opted out', () => {
-  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }], new Set()), 2);
+test('billable counts everything when nobody is disabled', () => {
+  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }], disabled()), 2);
 });
-test('billable of an empty list is zero, not NaN', () => assert.equal(billableCount([], new Set()), 0));
+test('billable of an empty list is zero, not NaN', () => assert.equal(billableCount([], disabled()), 0));
+test('billable with no predicate counts the whole list rather than throwing', () =>
+  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }]), 2));
 test('estimate multiplies and rounds to paise', () => assert.equal(estimateCost(988, 0.78), 770.64));
 test('estimate never goes negative', () => assert.equal(estimateCost(-5, 0.78), 0));
 test('spend counts delivered only — failures are free', () => assert.equal(spentCost(529, 0.78), 412.62));
@@ -701,14 +770,162 @@ test('thread returns messages oldest first in the shape the UI reads', () => {
 test('thread returns null for an unknown number', () => {
   assert.equal(inboxThread('910000009999'), null);
 });
-test('there is no per-thread message cap', () => {
+test('there is no per-thread message cap — a page is a page, not a ceiling', () => {
   for (let i = 0; i < 250; i++) {
     testDb.prepare('INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES (?, ?, ?, ?, ?, ?)')
           .run(`bulk-${i}`, '910000000008', 'in', 'text', `m${i}`, 1000 + i);
   }
   seedThread('910000000008', 'Chatty', 1700000000000, 1700000000000);
-  assert.equal(inboxThread('910000000008').messages.length, 250);
+  assert.equal(inboxThread('910000000008').total, 250, 'all 250 are still there');
+  // Walk the whole transcript a page at a time and confirm nothing is lost
+  // between pages — the failure this keyset cursor exists to prevent.
+  const seen = [];
+  let before = null, guard = 0;
+  do {
+    const page = inboxThread('910000000008', { before, limit: 30 });
+    seen.push(...page.messages.map(m => m.id));
+    before = page.nextBefore;
+  } while (before && ++guard < 20);
+  assert.equal(new Set(seen).size, 250, 'every message is reachable by paging, exactly once');
 });
+
+// ── P4: search and pagination ─────────────────────────────────────────────────
+console.log('\ninbox — pagination');
+{
+  // A conversation where several messages share one timestamp. Meta sends whole
+  // seconds, so this is the normal case in a busy thread, not a contrived one —
+  // and a cursor on `at` alone would silently drop every message that ties with
+  // a page boundary.
+  seedThread('910000007777', 'Paged', 1700000000000, 1700000000000);
+  for (let i = 0; i < 7; i++) {
+    testDb.prepare('INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(`pg-${i}`, '910000007777', 'in', 'text', `msg ${i}`, 5000 + Math.floor(i / 3) * 1000);
+  }
+
+  test('a thread opens on its newest page, oldest first within it', () => {
+    const t = inboxThread('910000007777', { limit: 3 });
+    assert.equal(t.messages.length, 3);
+    assert.deepEqual(t.messages.map(m => m.id), ['pg-4', 'pg-5', 'pg-6'],
+      'the three newest, in reading order');
+    assert.equal(t.total, 7, 'and it still says how many there are in total');
+    assert.equal(t.hasMore, true);
+    assert.ok(t.nextBefore);
+  });
+
+  test('paging back reaches every message exactly once, across timestamp ties', () => {
+    const seen = [];
+    let before = null, guard = 0;
+    do {
+      const page = inboxThread('910000007777', { before, limit: 3 });
+      seen.push(...page.messages.map(m => m.id));
+      before = page.nextBefore;
+    } while (before && ++guard < 10);
+    assert.equal(seen.length, 7);
+    assert.equal(new Set(seen).size, 7, 'no message is skipped and none is repeated');
+  });
+
+  test('the last page reports no more, and hands back no cursor', () => {
+    let before = null, page, guard = 0;
+    do { page = inboxThread('910000007777', { before, limit: 3 }); before = page.nextBefore; }
+    while (before && ++guard < 10);
+    assert.equal(page.hasMore, false);
+    assert.equal(page.nextBefore, null, 'a cursor that leads nowhere would page forever');
+  });
+
+  test('a junk cursor is ignored rather than throwing', () => {
+    for (const junk of ['nonsense', '12:', ':45', '-1:-1', 'a:b', '']) {
+      const t = inboxThread('910000007777', { before: junk, limit: 3 });
+      assert.equal(t.messages.length, 3, `"${junk}" should fall back to the newest page`);
+    }
+  });
+
+  test('a page size beyond the ceiling is clamped, not honoured', () => {
+    // The ceiling is what stops a crafted request pulling a 200k-row thread
+    // into memory in one response.
+    assert.ok(inboxThread('910000000008', { limit: 99999 }).messages.length <= 200);
+  });
+}
+
+console.log('\ninbox — search');
+{
+  seedThread('910000008881', 'Asha Rao',  1700000000000, 1700000000000);
+  seedThread('910000008882', 'Rahul Mehta', 1700000000000, 1700000000000);
+  const say = (wamid, waId, body, at) =>
+    testDb.prepare('INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(wamid, waId, 'in', 'text', body, at);
+  say('s-1', '910000008881', 'my invoice never arrived', 9000);
+  say('s-2', '910000008881', 'thanks for the invoice',   9001);
+  say('s-3', '910000008882', 'where is the receipt',      9002);
+  say('s-4', '910000008882', 'discount was 50% off',      9003);
+  say('s-5', '910000008882', 'my_order failed',           9004);
+
+  test('a global search finds the word wherever it was said', () => {
+    const r = inboxSearch('invoice');
+    assert.equal(r.messages.length, 2);
+    assert.ok(r.messages.every(m => m.waId === '910000008881'));
+    assert.equal(r.messages[0].name, 'Asha Rao', 'results name the person, not just the number');
+  });
+
+  test('search is newest first', () => {
+    const r = inboxSearch('invoice');
+    assert.ok(r.messages[0].at >= r.messages[1].at);
+  });
+
+  test('scoping to a thread excludes every other conversation', () => {
+    assert.equal(inboxSearch('the', { waId: '910000008882' }).messages
+      .every(m => m.waId === '910000008882'), true);
+    assert.equal(inboxSearch('invoice', { waId: '910000008882' }).messages.length, 0);
+  });
+
+  // % and _ are LIKE wildcards. Unescaped, "50%" matches every message ever
+  // sent — which reads as a broken search rather than a broken query.
+  test('a percent sign is a literal, not a wildcard', () => {
+    const r = inboxSearch('50%');
+    assert.equal(r.messages.length, 1);
+    assert.equal(r.messages[0].id, 's-4');
+  });
+
+  test('an underscore is a literal, not a single-character wildcard', () => {
+    const r = inboxSearch('my_order');
+    assert.equal(r.messages.length, 1, 'unescaped, this would also match "my order"');
+    assert.equal(r.messages[0].id, 's-5');
+  });
+
+  test('a backslash does not corrupt the escape sequence', () => {
+    assert.doesNotThrow(() => inboxSearch('back\\slash'));
+    assert.doesNotThrow(() => inboxSearch('\\'));
+  });
+
+  test('a global search also finds people by name and by number', () => {
+    const byName = inboxSearch('Rahul');
+    assert.ok(byName.people.some(p => p.waId === '910000008882'));
+    const byNumber = inboxSearch('910000008881');
+    assert.ok(byNumber.people.some(p => p.waId === '910000008881'));
+  });
+
+  test('a thread-scoped search returns no people — you know who it is', () => {
+    assert.deepEqual(inboxSearch('Rahul', { waId: '910000008882' }).people, []);
+  });
+
+  test('one character is refused rather than matching most of the database', () => {
+    const r = inboxSearch('a');
+    assert.equal(r.tooShort, true);
+    assert.deepEqual(r.messages, []);
+  });
+
+  test('an empty or missing query is not an error', () => {
+    for (const q of ['', '   ', null, undefined]) {
+      assert.equal(inboxSearch(q).tooShort, true);
+    }
+  });
+
+  test('a term that matches nothing is an empty result, not a failure', () => {
+    const r = inboxSearch('zzzznothinghere');
+    assert.equal(r.tooShort, false);
+    assert.deepEqual(r.messages, []);
+    assert.deepEqual(r.people, []);
+  });
+}
 
 console.log('\nauthentication');
 test('the right password is accepted', () => {
@@ -755,12 +972,14 @@ test('node below 22.5 is rejected', () => {
 test('the schema creates every table', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['campaign_runs', 'media', 'media_assets', 'messages', 'templates', 'threads', 'webhook_events']);
+  assert.deepEqual(names, ['campaign_runs', 'contacts', 'csv_uploads', 'media', 'media_assets',
+                           'messages', 'run_recipients', 'templates', 'threads', 'webhook_events']);
 });
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['idx_messages_run', 'idx_messages_thread']);
+  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_run', 'idx_messages_thread',
+                           'idx_run_recipients_pending', 'idx_run_recipients_retry']);
 });
 test('opening twice does not throw', () => {
   const d = openDb(':memory:');
@@ -1135,15 +1354,819 @@ test('the snapshot still carries every key the frontend reads', () => {
   const st = buildState();
   for (const k of ['phase','currentIdx','total','accepted','delivered','read','failed','skipped',
                    'dailyCount','dailyCap','quality','warmup','pricing','inboxUnread','pauseReason',
-                   'config','configured','currentContact','limits','optOutCount','optOutLabel']) {
+                   'config','configured','currentContact','limits','disabledCount','contacts','optOutLabel']) {
     assert.ok(k in st, `buildState lost the "${k}" key`);
   }
 });
 
-console.log('\nmigration');
 const fsx   = require('node:fs');
 const pathx = require('node:path');
 const osx   = require('node:os');
+
+// ── P2a: one list, one switch ─────────────────────────────────────────────────
+console.log('\ncontacts — enable / disable');
+{
+  const C = require('./server').contacts;
+  let seq = 0;
+  const phone = () => `9199000${String(++seq).padStart(4, '0')}`;
+  const csv = rows => Buffer.from('Name,Mobile Phone\n' + rows.map(r => r.join(',')).join('\n') + '\n');
+
+  test('an unknown number is not disabled — the test-send box accepts typed numbers', () => {
+    assert.equal(C.isDisabled('919888800001'), false);
+    assert.equal(C.isEnabled('919888800001'), true);
+  });
+
+  test('disable creates the row when the contact has never been in a CSV', () => {
+    const p = phone();
+    assert.equal(C.disable(p, 'opt_out'), true);
+    assert.equal(C.isDisabled(p), true);
+    assert.equal(C.getRow(p).disabled_reason, 'opt_out');
+  });
+
+  test('disabling twice for the same reason is not a second event', () => {
+    const p = phone();
+    assert.equal(C.disable(p, 'opt_out'), true);
+    assert.equal(C.disable(p, 'opt_out'), false,
+      'a webhook redelivery of one opt-out tap is not two opt-outs');
+  });
+
+  test('a later reason overwrites an earlier one', () => {
+    const p = phone();
+    C.disable(p, 'manual');
+    assert.equal(C.disable(p, 'failed_hard'), true);
+    assert.equal(C.getRow(p).disabled_reason, 'failed_hard');
+  });
+
+  test('an unknown reason is stored as manual rather than written verbatim', () => {
+    const p = phone();
+    C.disable(p, 'whatever');
+    assert.equal(C.getRow(p).disabled_reason, 'manual');
+  });
+
+  test('enable clears the reason, and enabling an unknown number is a no-op', () => {
+    const p = phone();
+    C.disable(p, 'manual');
+    assert.equal(C.enable(p), true);
+    assert.equal(C.isDisabled(p), false);
+    assert.equal(C.getRow(p).disabled_reason, null);
+    assert.equal(C.enable('919888800002'), false, 'nothing to enable is not a change');
+  });
+
+  // THE test for this phase. `enabled` is absent from the upsert's SET list on
+  // purpose, and an absence is exactly what a future contributor "fixes" by
+  // helpfully adding `enabled = excluded.enabled`.
+  test('re-uploading the same CSV never resurrects someone who opted out', () => {
+    const p = phone();
+    const file = csv([['Asha', p]]);
+    C.upsertFromCsv(parseCSV(file).contacts, { filename: 'list.csv' });
+    C.disable(p, 'opt_out');
+
+    C.upsertFromCsv(parseCSV(file).contacts, { filename: 'list.csv' });
+    assert.equal(C.isDisabled(p), true, 'a re-upload must not undo an opt-out');
+    assert.equal(C.getRow(p).disabled_reason, 'opt_out');
+  });
+
+  test('the upsert refreshes the name but never first_seen', () => {
+    const p = phone();
+    C.upsertFromCsv(parseCSV(csv([['Asha', p]])).contacts, {});
+    const first = C.getRow(p).first_seen;
+    assert.equal(C.getRow(p).name, 'Asha');
+
+    C.upsertFromCsv(parseCSV(csv([['Asha Rao', p]])).contacts, {});
+    assert.equal(C.getRow(p).name, 'Asha Rao', 'a corrected name should stick');
+    assert.equal(C.getRow(p).first_seen, first, 'but the contact is not newly seen');
+  });
+
+  test('extra CSV columns are stored verbatim for a later phase to read', () => {
+    const p = phone();
+    const file = Buffer.from(`Name,Mobile Phone,City\nAsha,${p},Pune\n`);
+    C.upsertFromCsv(parseCSV(file).contacts, {});
+    assert.deepEqual(JSON.parse(C.getRow(p).fields_json), { City: 'Pune' });
+  });
+
+  test('the upload is recorded with what happened to the file', () => {
+    const p = phone();
+    const file = Buffer.from(`Name,Mobile Phone\nAsha,${p}\nGhost,not-a-number\n`);
+    const { contacts: parsed, skipped } = parseCSV(file);
+    const r = C.upsertFromCsv(parsed, { filename: 'mixed.csv', skippedCount: skipped.length });
+    assert.equal(r.rowCount, 1);
+    assert.equal(r.newCount, 1);
+    assert.equal(r.skippedCount, 1, 'the row the parser could not read is on the record');
+
+    const again = C.upsertFromCsv(parsed, { filename: 'mixed.csv', skippedCount: 0 });
+    assert.equal(again.newCount, 0, 'the second upload introduces nobody new');
+  });
+
+  test('counts separate enabled from disabled', () => {
+    const before = C.counts();
+    const p = phone();
+    C.upsertFromCsv(parseCSV(csv([['Asha', p]])).contacts, {});
+    assert.equal(C.counts().enabled, before.enabled + 1);
+    C.disable(p, 'manual');
+    assert.equal(C.counts().disabled, before.disabled + 1);
+    assert.equal(C.counts().total, before.total + 1);
+  });
+
+  test('the disabled list carries the reason, for the operator and for Meta', () => {
+    const p = phone();
+    C.disable(p, 'opt_out');
+    const row = C.disabledRows().find(r => r.phone === p);
+    assert.ok(row, 'a disabled contact must appear on the list you can hand over');
+    assert.equal(row.disabled_reason, 'opt_out');
+    assert.ok(row.disabled_at > 0);
+  });
+
+  // The decision that makes this a switch and not a blocklist: disabled stops
+  // CAMPAIGNS and nothing else. services/inbox.js does not import this module
+  // at all, and that is the enforcement.
+  test('nothing in the inbox path consults the enabled column', () => {
+    const src = fsx.readFileSync('./src/services/inbox.js', 'utf8');
+    assert.ok(!/services\/contacts|isDisabled|isEnabled/.test(src),
+      'a disabled contact who writes in still deserves an answer');
+  });
+}
+
+console.log('\ncontacts — opt-outs.json import');
+{
+  const C = require('./server').contacts;
+  const tmp = () => pathx.join(osx.tmpdir(), `wa-optouts-${process.pid}-${Date.now()}-${Math.random()}.json`);
+
+  test('the old flat file folds into contacts as opt_out, then gets renamed away', () => {
+    const f = tmp();
+    fsx.writeFileSync(f, JSON.stringify(['919777700001', '919777700002']));
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 2);
+    assert.equal(C.getRow('919777700001').disabled_reason, 'opt_out');
+    assert.ok(!fsx.existsSync(f), 'the source is renamed so a later boot has nothing to find');
+    assert.ok(fsx.existsSync(`${f}.migrated`));
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
+  test('a missing file is a no-op, not an error', () => {
+    assert.deepEqual(C.migrateOptOuts({ optOuts: tmp() }), { imported: 0, skipped: true });
+  });
+
+  test('an unreadable file is left in place rather than renamed away', () => {
+    const f = tmp();
+    fsx.writeFileSync(f, '{ this is not json');
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 0);
+    assert.ok(fsx.existsSync(f), 'renaming it would declare success on a silent loss of the list');
+    fsx.rmSync(f, { force: true });
+  });
+}
+
+// ── P2b: the queue on disk ────────────────────────────────────────────────────
+console.log('\nrun_recipients — the send queue');
+{
+  const M = require('./server');
+  const C = M.contacts;
+  const { buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
+          progressForRun, skippedForRun, recipientsForRun } = M;
+
+  let runSeq = 0;
+  const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
+    .run(Date.now(), `t${++runSeq}`).lastInsertRowid);
+  let pseq = 0;
+  const people = n => Array.from({ length: n }, (_, i) => ({
+    name: `P${i}`, dialStr: `9198800${String(++pseq).padStart(5, '0')}` }));
+
+  test('a run stages every contact in order, and pending starts at the first', () => {
+    const run = newRun();
+    const p = people(3);
+    const prog = buildRun(run, p);
+    assert.equal(prog.total, 3);
+    assert.equal(prog.pending, 3);
+    assert.equal(nextPending(run).phone, p[0].dialStr, 'seq order, not insertion luck');
+  });
+
+  test('pending advances only when a row is actually resolved', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+
+    recordRecipientSent(run, p[0].dialStr, 'wamid.a');
+    assert.equal(nextPending(run).phone, p[1].dialStr);
+
+    recordRecipientSkipped(run, p[1].dialStr, 'failed', 131000);
+    assert.equal(nextPending(run).phone, p[2].dialStr);
+
+    recordRecipientSent(run, p[2].dialStr, 'wamid.c');
+    assert.equal(nextPending(run), null, 'an exhausted queue is null, not an index past the end');
+    assert.deepEqual(progressForRun(run), { total: 3, sent: 2, skipped: 1, disabled: 0, retrying: 0, pending: 0 });
+  });
+
+  // The whole reason this table exists. The old design saved an integer, and an
+  // integer a crash leaves ahead of reality silently skips people.
+  test('resume after a crash re-reads the queue and repeats nobody', () => {
+    const run = newRun();
+    const p = people(5);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.0');
+    recordRecipientSent(run, p[1].dialStr, 'wamid.1');
+
+    // "Crash": nothing in memory survives. The queue is asked again from zero.
+    assert.equal(nextPending(run).phone, p[2].dialStr,
+      'resume lands on the first unsent row, derived from what was actually sent');
+    const sent = recipientsForRun(run).filter(r => r.wamid).map(r => r.phone);
+    assert.deepEqual(sent, [p[0].dialStr, p[1].dialStr], 'and nobody already messaged is queued again');
+  });
+
+  test('a disabled contact is staged as a skipped row, not left out', () => {
+    const run = newRun();
+    const p = people(3);
+    C.upsertFromCsv(p, {});
+    C.disable(p[1].dialStr, 'opt_out');
+    const prog = buildRun(run, p, phone => (C.isDisabled(phone) ? 'disabled' : null));
+
+    assert.equal(prog.total, 3, 'they are still on the list');
+    assert.equal(prog.disabled, 1);
+    assert.equal(prog.pending, 2, 'but the loop never reaches them');
+    assert.equal(nextPending(run).phone, p[0].dialStr);
+
+    const report = skippedForRun(run);
+    assert.equal(report.length, 1);
+    assert.equal(report[0].phone, p[1].dialStr,
+      'a row that was never inserted could not tell the operator anything');
+    assert.equal(report[0].skipped_reason, 'disabled');
+  });
+
+  test('the skip report carries the Meta code that caused each one', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientSkipped(run, p[0].dialStr, 'skipped', 131049);
+    recordRecipientSkipped(run, p[1].dialStr, 'failed', 132001);
+    const byPhone = Object.fromEntries(skippedForRun(run).map(r => [r.phone, r]));
+    assert.equal(byPhone[p[0].dialStr].error_code, 131049);
+    assert.equal(byPhone[p[1].dialStr].skipped_reason, 'failed');
+    assert.ok(byPhone[p[0].dialStr].attempted_at > 0);
+  });
+
+  test('rebuilding a run replaces its queue rather than doubling it', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    const again = buildRun(run, p);
+    assert.equal(again.total, 2, 'a primary key on (run_id, phone) is not enough on its own');
+  });
+
+  test('billable follows a disable made after the queue was staged', () => {
+    const run = newRun();
+    const p = people(3);
+    C.upsertFromCsv(p, {});
+    buildRun(run, p, phone => (C.isDisabled(phone) ? 'disabled' : null));
+    assert.equal(M.billableForRun(run), 3);
+
+    // The loop re-checks and will skip them, so no money is spent either way —
+    // but an operator who has just disabled someone expects the number to move.
+    C.disable(p[1].dialStr, 'manual');
+    assert.equal(M.billableForRun(run), 2, 'the estimate must not go on counting them');
+  });
+
+  test('a message already sent stays billable even if the contact is disabled after', () => {
+    const run = newRun();
+    const p = people(2);
+    C.upsertFromCsv(p, {});
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'w-billed');
+    C.disable(p[0].dialStr, 'opt_out');
+    assert.equal(M.billableForRun(run), 2,
+      'that message went out and Meta will bill for it regardless of what happened next');
+  });
+
+  test('a skipped row costs nothing and is not billable', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+    recordRecipientSkipped(run, p[0].dialStr, 'failed', 132001);
+    assert.equal(M.billableForRun(run), 2);
+  });
+
+  test('billable for no run is zero, never a throw', () => {
+    assert.equal(M.billableForRun(null), 0);
+  });
+
+  test('progress for no run at all is zeroes, never a throw', () => {
+    assert.deepEqual(progressForRun(null), { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0 });
+    assert.equal(nextPending(null), null);
+    assert.deepEqual(skippedForRun(null), []);
+  });
+
+  test('the same person twice in one CSV is staged once', () => {
+    const run = newRun();
+    const p = people(1);
+    const prog = buildRun(run, [p[0], { ...p[0], name: 'Duplicate' }]);
+    assert.equal(prog.total, 1, 'the primary key is (run_id, phone)');
+  });
+}
+
+console.log('\nskipDisposition — the classifier the report groups by');
+{
+  const { skipDisposition, SKIP_DISPOSITIONS } = require('./server');
+  test('every code it returns is one the report knows how to render', () => {
+    for (const code of [131026, 131049, 131047, 130429, 132001, 131042, 0, null, undefined]) {
+      assert.ok(SKIP_DISPOSITIONS.includes(skipDisposition(code)),
+        `skipDisposition(${code}) returned something the report cannot group`);
+    }
+  });
+  test('it never throws, whatever it is handed', () => {
+    for (const junk of ['', 'abc', {}, [], NaN, Infinity, -1]) {
+      assert.doesNotThrow(() => skipDisposition(junk));
+    }
+  });
+
+  // The policy itself, asserted per code. These four are the ones the loop
+  // branches on, so a change here changes who gets messaged again.
+  test('it sorts by whether another attempt could possibly work', () => {
+    assert.equal(skipDisposition(131049), 'retry',
+      'the per-person marketing cap is about the moment — nothing on our side caused it');
+    assert.equal(skipDisposition(-1), 'retry',
+      'a network throw is the blip that used to drop contact #340 from a run forever');
+    assert.equal(skipDisposition(131026), 'permanent',
+      'undeliverable is a property of the number; retrying it is never right');
+    assert.equal(skipDisposition(132015), 'fix',
+      'a paused template fails identically on every retry until a human fixes it');
+    assert.equal(skipDisposition(131047), 'fix',
+      'outside the 24h window is our bug — we sent the wrong kind of message');
+  });
+
+  test('a code the table has never seen is unclassified, not guessed', () => {
+    assert.equal(skipDisposition(999999), 'unclassified',
+      'a new Meta code must not silently cost re-sends, nor silently write someone off');
+  });
+}
+
+// ── The retry ladder ──────────────────────────────────────────────────────────
+// A failure that was about the MOMENT goes back on the queue with a deadline
+// instead of being dropped. Everything below asserts that the deadline lives in
+// SQL and that a row waiting on one is counted as pending, never as finished.
+console.log('\nrun_recipients — retrying a moment-based failure');
+{
+  const M = require('./server');
+  const { buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
+          recordRecipientRetry, nextRetryForRun, progressForRun, billableForRun,
+          skippedForRun, lastRunSummary, campaignActive, campaignBlocker,
+          scheduleRetry, RETRY_BACKOFF_MS } = M;
+
+  let runSeq = 0;
+  const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
+    .run(Date.now(), `r${++runSeq}`).lastInsertRowid);
+  let pseq = 0;
+  const people = n => Array.from({ length: n }, (_, i) => ({
+    name: `R${i}`, dialStr: `9198900${String(++pseq).padStart(5, '0')}` }));
+  const rowFor = (run, phone) => db
+    .prepare('SELECT attempts, retry_after, skipped_reason FROM run_recipients WHERE run_id = ? AND phone = ?')
+    .get(run, phone);
+
+  const HOUR_MS = 3600000;
+
+  test('a contact on the ladder is invisible until its deadline, then pending again', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    const due = Date.now() + HOUR_MS;
+    recordRecipientRetry(run, p[0].dialStr, 131049, due);
+
+    assert.equal(nextPending(run).phone, p[1].dialStr,
+      'the run carries on with everyone else rather than stalling on one contact');
+    recordRecipientSent(run, p[1].dialStr, 'wamid.r1');
+    assert.equal(nextPending(run), null, 'nothing is sendable while the backoff is running');
+    assert.equal(nextPending(run, due).phone, p[0].dialStr,
+      'and the same query hands them back the moment the deadline passes');
+  });
+
+  test('a waiting contact counts as pending, never as skipped or finished', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r2');
+    recordRecipientRetry(run, p[1].dialStr, -1, Date.now() + HOUR_MS);
+
+    const prog = progressForRun(run);
+    assert.equal(prog.retrying, 1);
+    assert.equal(prog.skipped, 0, 'nobody has been given up on');
+    assert.equal(prog.pending, 2,
+      'folding a waiting contact into skipped would report the run finished with people still queued');
+  });
+
+  test('a waiting contact is still billable — that message is still going out', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientRetry(run, p[0].dialStr, 131049, Date.now() + HOUR_MS);
+    assert.equal(billableForRun(run), 2,
+      'the estimate must not drop just because one send was deferred');
+  });
+
+  test('the earliest deadline is what the loop sleeps to', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+    const soon = Date.now() + HOUR_MS;
+    recordRecipientRetry(run, p[0].dialStr, 131049, soon + 2 * HOUR_MS);
+    recordRecipientRetry(run, p[1].dialStr, 131049, soon);
+
+    const next = nextRetryForRun(run);
+    assert.equal(next.at, soon, 'min(), so the loop wakes for whoever is due first');
+    assert.equal(next.count, 2);
+    recordRecipientSent(run, p[2].dialStr, 'wamid.r3');
+    assert.equal(progressForRun(run).pending, 2, 'and the run stays open for both of them');
+  });
+
+  test('a send that succeeds after waiting is a sent row, not a retrying one', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    recordRecipientRetry(run, p[0].dialStr, -1, Date.now() - 1);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r4');
+
+    const prog = progressForRun(run);
+    assert.deepEqual([prog.sent, prog.retrying, prog.pending], [1, 0, 0],
+      'leaving skipped_reason set would count one person in two buckets at once');
+    assert.deepEqual(skippedForRun(run), [], 'and they do not appear in the skip report');
+  });
+
+  test('the ladder is three waits, then the failure is reported rather than retried', () => {
+    const run = newRun();
+    const p = people(1);
+    const saved = S.currentRunId;
+    S.currentRunId = run;
+    try {
+      buildRun(run, p);
+      const contact = { name: p[0].name, dialStr: p[0].dialStr };
+      const fail    = { errorCode: 131049, error: 'cap', hint: null };
+
+      for (let i = 0; i < RETRY_BACKOFF_MS.length; i++) {
+        const row = nextPending(run, Date.now() + 99 * HOUR_MS);
+        assert.equal(row.attempts, i, 'attempts is read off the row, never off a counter in the loop');
+        assert.equal(scheduleRetry(contact, row, fail, '[t]'), true);
+        const after = rowFor(run, p[0].dialStr);
+        assert.equal(after.attempts, i + 1);
+        assert.ok(after.retry_after - Date.now() > RETRY_BACKOFF_MS[i] - 5000,
+          `wait ${i + 1} is about ${RETRY_BACKOFF_MS[i] / HOUR_MS}h`);
+      }
+
+      const exhausted = nextPending(run, Date.now() + 99 * HOUR_MS);
+      assert.equal(scheduleRetry(contact, exhausted, fail, '[t]'), false,
+        'four attempts is the whole ladder — a fifth would discover nothing new');
+    } finally { S.currentRunId = saved; }
+  });
+
+  test('a code that is not retryable never goes on the ladder at all', () => {
+    const run = newRun();
+    const p = people(1);
+    const saved = S.currentRunId;
+    S.currentRunId = run;
+    try {
+      buildRun(run, p);
+      const row = nextPending(run);
+      assert.equal(scheduleRetry({ name: p[0].name, dialStr: p[0].dialStr }, row,
+        { errorCode: 131026, error: 'undeliverable' }, '[t]'), false,
+        'retrying a number Meta calls undeliverable burns a send slot on every run, forever');
+      assert.equal(rowFor(run, p[0].dialStr).attempts, 0);
+    } finally { S.currentRunId = saved; }
+  });
+
+  // The second half of the ask: one campaign at a time. stageRun REPLACES the
+  // queue, so an upload over a live run orphans everyone it had not reached.
+  test('an unfinished campaign blocks starting or staging another', () => {
+    const savedPhase = S.phase, savedRun = S.currentRunId;
+    try {
+      const run = newRun();
+      buildRun(run, people(4));
+      S.currentRunId = run;
+
+      for (const phase of ['running', 'waiting', 'paused']) {
+        S.phase = phase;
+        assert.equal(campaignActive(), true, `${phase} is an active campaign`);
+        assert.match(campaignBlocker(), /before starting another/,
+          'and the operator is told what is in the way, not just refused');
+      }
+      S.phase = 'waiting';
+      assert.match(campaignBlocker(), /waiting to retry/,
+        'the reason names the retry ladder rather than saying "running"');
+
+      S.phase = 'idle';
+      assert.equal(campaignActive(), false);
+      assert.equal(campaignBlocker(), null, 'a stopped run is replaceable — that is the escape hatch');
+    } finally { S.phase = savedPhase; S.currentRunId = savedRun; }
+  });
+
+  // The duplicate-send hazard the retry ladder made worse. /stop sets the phase
+  // to idle at once, but the loop is still inside an await for up to a second
+  // after that. If the guard trusted the phase alone, a Start in that window
+  // would put a SECOND loop on the same queue.
+  test('a campaign that is still stopping blocks a new one, even though the phase says idle', () => {
+    const { flags } = M;
+    const savedPhase = S.phase, savedRun = S.currentRunId, savedRunning = flags.running;
+    try {
+      S.currentRunId = null;            // exactly what /api/reset leaves behind
+      S.phase = 'idle';                 // what /stop and /reset set immediately
+      flags.running = true;             // the loop has not returned yet
+
+      assert.equal(campaignActive(), true,
+        'a live loop is an active campaign whatever the phase claims');
+      assert.match(campaignBlocker(), /still stopping/,
+        'and the refusal says so rather than reporting the zeroes a cleared run would give');
+
+      flags.running = false;            // the loop returned and cleared it itself
+      assert.equal(campaignBlocker(), null, 'once the loop is gone, the queue is replaceable');
+    } finally { S.phase = savedPhase; S.currentRunId = savedRun; flags.running = savedRunning; }
+  });
+
+  // The daily-cap wait is up to a full day, and `flags.running` stays true for
+  // every second of it. A bare `await sleep(wait)` here meant a Stop set a flag
+  // nothing read until tomorrow — so campaignBlocker() refused every Start and
+  // every CSV upload overnight with "still stopping, try again in a second".
+  // This drives the real loop into that branch and asserts Stop is answered.
+  testAsync('a Stop is answered while the loop is parked on the daily cap', async () => {
+    const { flags, startLoop, stageRun } = M;
+    const saved = { phase: S.phase, run: S.currentRunId, cap: S.config.dailyCap,
+                    count: S.dailyCount, date: S.dailyDate, warmup: W.enabled };
+    // The loop calls saveCampaignNow() on its way out, and FILES.campaign is the
+    // repo's own campaign.json. Snapshot it so `npm test` leaves it as it found it.
+    const fsc = require('node:fs');
+    const cfile = require('./src/config').FILES.campaign;
+    const hadFile = fsc.existsSync(cfile);
+    const fileWas = hadFile ? fsc.readFileSync(cfile, 'utf8') : null;
+    try {
+      W.enabled = false;                  // effectiveCap() is then S.config.dailyCap
+      S.config.dailyCap = 1;
+      S.dailyDate  = todayKey();          // so checkDaily() does not reset the count
+      S.dailyCount = 5;                   // already over the cap
+      stageRun(people(1), 'cap-stop-test');
+      S.phase = 'running';
+      flags.stopFlag = false; flags.pauseFlag = false;
+      startLoop();
+
+      // Long enough for the loop to reach the cap branch and park.
+      await new Promise(r => setTimeout(r, 100));
+      assert.equal(S.phase, 'paused', 'the loop should be parked on the daily cap');
+      assert.equal(flags.running, true, 'and still holding the run');
+
+      flags.stopFlag = true;
+      const deadline = Date.now() + 3000;
+      while (flags.running && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+
+      assert.equal(flags.running, false,
+        'the loop must notice a Stop within seconds, not at the next IST midnight — '
+        + 'while it is true, campaignBlocker() refuses every Start and CSV upload');
+    } finally {
+      flags.stopFlag = false;
+      Object.assign(S, { phase: saved.phase, currentRunId: saved.run,
+                         dailyCount: saved.count, dailyDate: saved.date });
+      S.config.dailyCap = saved.cap;
+      W.enabled = saved.warmup;
+      if (hadFile) fsc.writeFileSync(cfile, fileWas);
+      else if (fsc.existsSync(cfile)) fsc.unlinkSync(cfile);
+    }
+  });
+
+  test('the last campaign is still readable after a reset drops the current run', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r5');
+    recordRecipientSkipped(run, p[1].dialStr, 'failed', 131047);
+
+    const saved = S.currentRunId;
+    S.currentRunId = null;                       // exactly what /api/reset does
+    try {
+      const last = lastRunSummary();
+      assert.equal(last.id, run, 'read from campaign_runs, not from the state a reset just cleared');
+      assert.equal(last.progress.sent, 1);
+      assert.equal(last.progress.skipped, 1);
+      assert.equal(last.unfinished, false, 'every row is resolved, so it really did finish');
+    } finally { S.currentRunId = saved; }
+  });
+
+  test('a run with contacts still on the ladder reports itself unfinished', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'wamid.r6');
+    recordRecipientRetry(run, p[1].dialStr, 131049, Date.now() + HOUR_MS);
+
+    const last = lastRunSummary();
+    assert.equal(last.id, run);
+    assert.equal(last.unfinished, true,
+      'unfinished is derived from the queue, so it survives the process forgetting the run');
+    assert.equal(last.nextRetry.count, 1);
+  });
+}
+
+// ── Can this box run the scanner it was configured with? ──────────────────────
+// The warning exists because the failure it predicts does not look like itself:
+// clamd gets OOM-killed during a signature reload, and the app then refuses every
+// media save because "configured but unreachable" is fail-closed by design.
+console.log('\nclamd memory headroom');
+{
+  const { memoryWarning } = require('./server');
+  const { CLAMAV } = require('./src/config');
+  const GB = 1024 ** 3;
+
+  const withScanner = (addr, fn) => {
+    const saved = CLAMAV.address;
+    CLAMAV.address = addr;
+    try { return fn(); } finally { CLAMAV.address = saved; }
+  };
+
+  test('a 2 GB box running clamd is warned, and told both ways out', () => {
+    const w = withScanner('127.0.0.1:3310', () => memoryWarning(2 * GB));
+    assert.ok(w, 'clamd plus this app does not fit in 2 GB once freshclam reloads');
+    assert.match(w, /2\.0 GB/, 'the warning states what the machine actually has');
+    assert.match(w, /CLAMAV_ADDRESS/,
+      'and names the setting to unset, because "buy more RAM" is not always an option');
+  });
+
+  test('enough RAM is silence, not a softer warning', () => {
+    assert.equal(withScanner('127.0.0.1:3310', () => memoryWarning(8 * GB)), null);
+  });
+
+  test('no scanner configured is never warned about', () => {
+    assert.equal(withScanner('', () => memoryWarning(512 * 1024 * 1024)), null,
+      'running without a scanner is a supported deployment — the RAM is then nobody\'s problem');
+  });
+}
+
+// ── P5: diagnostics and replay ────────────────────────────────────────────────
+console.log('\nwebhook replay');
+{
+  const { replayUnprocessed } = require('./src/services/ingest');
+  const store = (body, processed = null) => Number(testDb
+    .prepare('INSERT INTO webhook_events (received_at, body, processed_at) VALUES (?, ?, ?)')
+    .run(Date.now(), typeof body === 'string' ? body : JSON.stringify(body), processed).lastInsertRowid);
+  const isProcessed = id =>
+    testDb.prepare('SELECT processed_at FROM webhook_events WHERE id = ?').get(id).processed_at !== null;
+
+  const envelope = (waId, wamid, text) => ({
+    object: 'whatsapp_business_account',
+    entry: [{ id: 'waba-1', changes: [{ field: 'messages', value: {
+      contacts: [{ profile: { name: 'Replay Tester' } }],
+      messages: [{ id: wamid, from: waId, timestamp: '1700000000', type: 'text', text: { body: text } }],
+    } }] }],
+  });
+
+  test('a stored envelope that never processed can be replayed into the inbox', () => {
+    const id = store(envelope('910000005551', 'replay-1', 'hello from replay'));
+    const r = replayUnprocessed();
+    assert.ok(r.replayed >= 1);
+    assert.equal(isProcessed(id), true);
+    assert.ok(inboxThread('910000005551').messages.some(m => m.text === 'hello from replay'),
+      'the message must actually land, not just get stamped done');
+  });
+
+  // The property that makes the button safe to put in front of a human.
+  test('replaying the same envelope twice does not duplicate anything', () => {
+    const id = store(envelope('910000005552', 'replay-2', 'only once'));
+    replayUnprocessed();
+    const after = inboxThread('910000005552').messages.length;
+    const unreadAfter = inboxSummary({ all: true }).threads
+      .find(t => t.waId === '910000005552').unread;
+
+    // Force it back to unprocessed and run it again, as a double-click would.
+    testDb.prepare('UPDATE webhook_events SET processed_at = NULL WHERE id = ?').run(id);
+    replayUnprocessed();
+
+    assert.equal(inboxThread('910000005552').messages.length, after,
+      'messages dedupes on the wamid primary key');
+    assert.equal(inboxSummary({ all: true }).threads.find(t => t.waId === '910000005552').unread,
+      unreadAfter, 'and the unread badge must not climb on a redelivery');
+  });
+
+  test('an envelope that still cannot be parsed stays unprocessed', () => {
+    const id = store('{ not json at all');
+    const r = replayUnprocessed();
+    assert.ok(r.failed >= 1);
+    assert.equal(isProcessed(id), false,
+      'marking it done would throw away the only copy of what Meta sent');
+    assert.ok(r.errors.some(e => e.id === id));
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(id);
+  });
+
+  test('one bad envelope does not stop the good ones after it', () => {
+    const bad  = store('{ broken');
+    const good = store(envelope('910000005553', 'replay-3', 'after the bad one'));
+    const r = replayUnprocessed();
+    assert.ok(r.replayed >= 1 && r.failed >= 1);
+    assert.equal(isProcessed(good), true);
+    assert.equal(isProcessed(bad), false);
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(bad);
+  });
+
+  test('replaying with nothing pending is a no-op, not an error', () => {
+    const r = replayUnprocessed();
+    assert.equal(r.attempted, 0);
+    assert.equal(r.replayed, 0);
+    assert.equal(r.failed, 0);
+  });
+
+  test('an already-processed envelope is never picked up again', () => {
+    const id = store(envelope('910000005554', 'replay-4', 'done already'), Date.now());
+    replayUnprocessed();
+    assert.equal(inboxThread('910000005554'), null,
+      'a processed row must not be reprocessed just because it is still on disk');
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(id);
+  });
+}
+
+console.log('\ndiagnostics');
+{
+  const diag = require('./src/services/diagnostics');
+
+  test('the snapshot renders without reaching Meta or the network', () => {
+    const saved = global.fetch;
+    global.fetch = () => { throw new Error('diagnostics must not call out'); };
+    try { assert.ok(diag.snapshot().at > 0); } finally { global.fetch = saved; }
+  });
+
+  test('it reports every table this app has, so a missing one is visible', () => {
+    const rows = diag.snapshot().rows;
+    for (const t of ['messages', 'threads', 'contacts', 'media', 'media_assets',
+                     'templates', 'campaign_runs', 'run_recipients', 'webhook_events']) {
+      assert.equal(typeof rows[t], 'number', `row count missing for ${t}`);
+    }
+  });
+
+  test('it counts unprocessed webhooks and samples what is stuck', () => {
+    const id = Number(testDb.prepare('INSERT INTO webhook_events (received_at, body) VALUES (?, ?)')
+      .run(Date.now(), '{ unparseable').lastInsertRowid);
+    const d = diag.snapshot();
+    assert.ok(d.webhooks.unprocessed >= 1);
+    assert.ok(d.webhooks.stuck.some(s => s.id === id), 'a count alone does not say WHAT is stuck');
+    assert.ok(d.webhooks.stuck[0].preview.length > 0);
+    testDb.prepare('DELETE FROM webhook_events WHERE id = ?').run(id);
+  });
+
+  test('it reports credential presence but never a credential', () => {
+    const json = JSON.stringify(diag.snapshot());
+    for (const secret of [CFG.accessToken, CFG.appSecret, CFG.appPassword, CFG.webhookVerifyToken]) {
+      if (secret) assert.ok(!json.includes(secret), 'a diagnostics page must not leak what it is diagnosing');
+    }
+    assert.equal(typeof diag.snapshot().account.accessToken, 'boolean');
+  });
+
+  test('the scanner address is reported as set or not, never as a path', () => {
+    const { CLAMAV } = require('./src/config');
+    const saved = CLAMAV.address;
+    CLAMAV.address = '/var/run/clamav/clamd.ctl';
+    try {
+      const d = diag.snapshot();
+      assert.equal(d.scanner.configured, true);
+      assert.equal(d.scanner.address, 'set');
+      assert.ok(!JSON.stringify(d).includes('clamd.ctl'));
+    } finally { CLAMAV.address = saved; }
+  });
+
+  test('it flags the free-space floor that would silently refuse every save', () => {
+    const { MEDIA_LIMITS } = require('./src/config');
+    const saved = MEDIA_LIMITS.minFreeBytes;
+    MEDIA_LIMITS.minFreeBytes = Number.MAX_SAFE_INTEGER;
+    try { assert.equal(diag.snapshot().storage.belowFloor, true); }
+    finally { MEDIA_LIMITS.minFreeBytes = saved; }
+  });
+
+  test('a media directory that does not exist yet is zero, not a throw', () => {
+    const s = diag.snapshot().storage;
+    assert.equal(typeof s.mediaDir.bytes, 'number');
+    assert.equal(typeof s.uploadDir.files, 'number');
+  });
+}
+
+console.log('\ninline error badges');
+{
+  test('a failed outbound message carries its code, title and what to do', () => {
+    seedThread('910000006661', 'Failed Send', 0, 1700000000000);
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status, error_code, error_title)
+                    VALUES (?, ?, 'out', 'template', ?, ?, 'failed', ?, ?)`)
+      .run('fail-1', '910000006661', 'the message', 1700000000000, 131047, 'Re-engagement message');
+    const m = inboxThread('910000006661').messages.find(x => x.id === 'fail-1');
+    assert.equal(m.status, 'failed');
+    assert.equal(m.error.code, 131047);
+    assert.equal(m.error.title, 'Re-engagement message');
+    assert.match(m.error.hint, /24-hour/, 'the number alone tells an operator nothing');
+  });
+
+  test('a delivered message carries no error object at all', () => {
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status)
+                    VALUES (?, ?, 'out', 'template', ?, ?, 'delivered')`)
+      .run('fine-1', '910000006661', 'fine', 1700000000001);
+    const m = inboxThread('910000006661').messages.find(x => x.id === 'fine-1');
+    assert.equal(m.error, null, 'an empty error object would render an empty badge');
+  });
+
+  test('a failure Meta sent no code for still renders rather than breaking', () => {
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status)
+                    VALUES (?, ?, 'out', 'template', ?, ?, 'failed')`)
+      .run('fail-2', '910000006661', 'no code', 1700000000002);
+    const m = inboxThread('910000006661').messages.find(x => x.id === 'fail-2');
+    assert.equal(m.error.code, null);
+    assert.equal(m.error.hint, null);
+  });
+}
+
+console.log('\nmigration');
 
 // Never point these at src/config's real FILES. The migration RENAMES its
 // sources when it finishes, so a test using the real paths would overwrite and
@@ -1348,15 +2371,22 @@ test('a resumed campaign restores the run id it had before the restart', () => w
   assert.equal(S.currentRunId, runId,
     'the persisted run id must survive a restart — a resumed send stamped with a different (or no) run id merges into the wrong bucket');
 }));
-test('a resumed campaign with no persisted run id opens one rather than resuming unattributed', () => withSavedCampaignFile(() => {
-  // What campaign.json looked like before run ids were persisted: no
-  // currentRunId field at all.
+// The original F1 fix opened a run so resumed sends were not attributed to
+// run_id NULL. run_recipients supersedes it: a campaign.json with no run id has
+// no queue, and there is nothing to attribute. Re-sending to the whole array —
+// with no record of who was already messaged — is the one outcome that must not
+// happen, so this now refuses to resume and says why.
+test('a pre-queue campaign.json is refused rather than resumed against no queue', () => withSavedCampaignFile(() => {
   const legacy = { contacts: [{ name: 'Y', dialStr: '910000000001' }], currentIdx: 0,
                     phase: 'running', dailyCount: 0, dailyDate: null, skipped: 0, config: {} };
   fsx.writeFileSync(F1_FILES.campaign, JSON.stringify(legacy));
-  S.currentRunId = null; S.currentIdx = 0; S.phase = 'idle'; S.contacts = [];
+  S.currentRunId = null; S.phase = 'idle';
+  const before = S.logs.length;
   resumeIfInterrupted();
-  assert.ok(S.currentRunId, 'a run id must be opened so resumed sends are attributed instead of landing on run_id NULL');
+  assert.equal(S.currentRunId, null, 'no run is opened for a queue that does not exist');
+  assert.equal(S.phase, 'idle', 'and nothing starts sending');
+  assert.ok(S.logs.slice(before).some(l => /NOT resumed/.test(l.msg)),
+    'the operator must be told their interrupted run did not come back');
 }));
 
 console.log('\nF2 — webhook body size limit');
@@ -2406,6 +3436,60 @@ console.log('\ninbound media — save, serve, expire');
                   VALUES ('mid.neversaved', 'wamid.neversaved', 'image/jpeg', NULL, NULL)`).run();
       sweepMedia();
       assert.equal(db.prepare("SELECT path FROM media WHERE media_id = 'mid.neversaved'").get().path, null);
+    });
+
+    // Saved files are named for their own sha256, so identical bytes arriving
+    // twice — a forwarded photo, one price list sent to two customers — are two
+    // rows over one file with two independent 90-day clocks. The sweep used to
+    // unlink on behalf of whichever row expired first, leaving the other one
+    // still reporting `saved`, still rendering a preview, and 404ing on click.
+    testAsync('an expiring row does not unlink a file another row still points at', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
+                                   Buffer.from(`shared${Date.now()}`)]);
+      const first  = seedInbound({ bytes });
+      const second = seedInbound({ bytes });
+      const save = id => withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      await save(first);
+      await save(second);
+
+      const file = inboundPath(getInbound(first));
+      assert.equal(getInbound(second).path, getInbound(first).path,
+        'identical bytes must dedupe onto one file — that is the premise of this test');
+
+      age(first, 91 * DAY);
+      sweepMedia();
+
+      assert.equal(getInbound(first).path, null, 'the expired row still retires');
+      assert.ok(getInbound(second).path, 'the row inside its own window keeps its claim');
+      assert.ok(fsm.existsSync(file), 'and the bytes it claims are still there');
+
+      // Last row out turns off the lights.
+      age(second, 91 * DAY);
+      sweepMedia();
+      assert.equal(getInbound(second).path, null);
+      assert.ok(!fsm.existsSync(file), 'once nobody points at it, the file goes');
+    });
+
+    testAsync('a later infection verdict condemns every row over the same bytes', async () => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
+                                   Buffer.from(`twins${Date.now()}`)]);
+      const first  = seedInbound({ bytes });
+      const second = seedInbound({ bytes });
+      const save = id => withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(id))));
+      await save(first);
+      await save(second);
+      const file = inboundPath(getInbound(first));
+
+      // Both rows are `skipped` — saved before a scanner existed. Installing one
+      // and asking for the first row is what triggers the rescan.
+      await withClamd('stream: Twin-Test-Signature FOUND\x00',
+        () => rescanIfNeeded(getInbound(first)));
+
+      assert.equal(getInbound(first).scan_status,  'infected');
+      assert.equal(getInbound(second).scan_status, 'infected',
+        'the sibling is the same malware — leaving it `skipped` over deleted bytes is a lie');
+      assert.equal(getInbound(second).path, null);
+      assert.ok(!fsm.existsSync(file));
     });
   }
 

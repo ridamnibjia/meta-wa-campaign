@@ -83,11 +83,70 @@ CREATE TABLE IF NOT EXISTS templates (
   created_at    INTEGER NOT NULL
 );
 
+-- One list with one switch. Before this table there were two — the CSV array in
+-- memory and a flat Set in opt-outs.json — and a person who was in both existed
+-- twice with no single row to look at.
+--
+-- Three things write the enabled column: the customer tapping the quick-reply button
+-- ('opt_out'), the operator clicking disable ('manual'), and a hard send failure
+-- ('failed_hard'). Keeping the compliance path costs nothing here and losing it
+-- is expensive: Meta drops the number's quality rating for messaging people who
+-- opted out, and quality gates the tier the warm-up ladder is climbing.
+CREATE TABLE IF NOT EXISTS contacts (
+  phone           TEXT PRIMARY KEY,       -- normalized dial string, no +
+  name            TEXT,
+  fields_json     TEXT,                   -- other CSV columns, verbatim
+  first_seen      INTEGER NOT NULL,
+  last_messaged   INTEGER,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  disabled_reason TEXT,                   -- 'manual' | 'opt_out' | 'failed_hard'
+  disabled_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_enabled ON contacts(enabled);
+
+-- Provenance. Which upload introduced which contacts, and what the file was.
+-- skipped_count is the number this app used to throw away in silence.
+CREATE TABLE IF NOT EXISTS csv_uploads (
+  id            INTEGER PRIMARY KEY,
+  uploaded_at   INTEGER NOT NULL,
+  filename      TEXT,
+  row_count     INTEGER NOT NULL,
+  new_count     INTEGER NOT NULL,   -- rows that were not already contacts
+  skipped_count INTEGER NOT NULL    -- rows with no usable phone number
+);
+
 CREATE TABLE IF NOT EXISTS campaign_runs (
   id         INTEGER PRIMARY KEY,
   started_at INTEGER NOT NULL,
   label      TEXT
 );
+
+-- The send queue, on disk. This replaces the contacts array that used to be
+-- snapshotted into campaign.json and the S.currentIdx integer that walked it.
+--
+-- The resume point is DERIVED from what was actually sent rather than saved as
+-- a counter. An index that a crash leaves ahead of reality silently skips
+-- people, and nothing downstream can tell — the old design's worst failure mode
+-- and the reason this table exists at all.
+--
+-- Rows are written at CSV upload, not at /start: the queue is then durable from
+-- the moment the operator has one, so a restart before sending begins loses
+-- nothing either.
+CREATE TABLE IF NOT EXISTS run_recipients (
+  run_id         INTEGER NOT NULL REFERENCES campaign_runs(id),
+  phone          TEXT    NOT NULL,
+  name           TEXT,
+  seq            INTEGER NOT NULL,   -- send order, fixed when the run is built
+  wamid          TEXT,               -- set on accept; NULL = not yet attempted
+  skipped_reason TEXT,               -- 'disabled' | 'failed' | 'skipped' | 'retry'
+  error_code     INTEGER,            -- Meta's code, for the skip report
+  attempted_at   INTEGER,
+  PRIMARY KEY (run_id, phone)
+);
+-- Partial index: the pending query is the hot one, and it only ever looks at
+-- rows that are neither sent nor skipped.
+CREATE INDEX IF NOT EXISTS idx_run_recipients_pending ON run_recipients(run_id, seq)
+  WHERE wamid IS NULL AND skipped_reason IS NULL;
 
 CREATE TABLE IF NOT EXISTS messages (
   wamid       TEXT PRIMARY KEY,
@@ -157,6 +216,19 @@ function openDb(file) {
   addColumn(d, 'media', 'scan_status',    'TEXT');
   addColumn(d, 'media', 'scan_signature', 'TEXT');
   addColumn(d, 'media', 'scan_at',        'INTEGER');
+  // A failure that was about the MOMENT rather than about the number gets
+  // rescheduled instead of dropped: skipped_reason = 'retry' plus the wall-clock
+  // time it becomes pending again. Both live on the queue row rather than in the
+  // loop, because a timer in memory does not survive the restart the retry is
+  // most likely to be waiting through.
+  addColumn(d, 'run_recipients', 'attempts',    'INTEGER NOT NULL DEFAULT 0');
+  addColumn(d, 'run_recipients', 'retry_after', 'INTEGER');
+  // After addColumn, not in SCHEMA: SCHEMA runs first on every boot, so an index
+  // naming retry_after would throw "no such column" on any database created
+  // before this change — the exact upgrade this file exists to make painless.
+  d.exec(`CREATE INDEX IF NOT EXISTS idx_run_recipients_retry
+            ON run_recipients(run_id, retry_after)
+            WHERE skipped_reason = 'retry' AND wamid IS NULL`);
   return d;
 }
 

@@ -17,7 +17,9 @@ const { buildState } = require('./src/services/status');
 const { resumeIfInterrupted } = require('./src/services/campaign');
 const { startRetention } = require('./src/services/retention');
 const { migrateJsonToSql } = require('./src/services/migrate');
+const { migrateOptOuts }   = require('./src/services/contacts');
 const { unprocessedWebhookCount } = require('./src/services/messages');
+const { memoryWarning } = require('./src/services/diagnostics');
 
 const app    = express();
 const server = http.createServer(app);
@@ -79,6 +81,13 @@ app.get('/health', (req, res) => res.json({
 auth.mount(app);      // /api/login, /api/logout, /api/session — outside the gate
 routes.mount(app);    // /webhook (signed), then everything behind requireAuth
 
+// Anything under /api that no router claimed is a 404 in JSON, not the SPA
+// shell. Without this the catch-all below answers a mistyped endpoint with a
+// 200 and an HTML login page, which a client cannot tell apart from success.
+app.use('/api', (req, res) => res.status(404).json({
+  error: `No such endpoint: ${req.method} ${req.originalUrl}`,
+}));
+
 // Catch-all: serve the SPA shell for any non-API path.
 app.get('*', (req, res) => {
   const f = path.join(PUBLIC_DIR, 'index.html');
@@ -108,6 +117,12 @@ if (!CFG.appPassword)   console.warn('[WARN] APP_PASSWORD not set — the API is
   const pending = unprocessedWebhookCount();
   if (pending > 0) console.warn(`[WARN] ${pending} webhook event(s) recorded but never processed — check the logs around when they arrived`);
 }
+// Said at boot as well as on the Diagnostics page: the symptom it predicts is an
+// OOM kill days later, and nobody opens Diagnostics before the thing breaks.
+{
+  const m = memoryWarning();
+  if (m) console.warn(`[WARN] ${m}`);
+}
 
 // Only listen when run directly, so test.js can require the pure helpers. This
 // also guards migrateJsonToSql(): it defaults to the real FILES paths, and
@@ -116,6 +131,10 @@ if (!CFG.appPassword)   console.warn('[WARN] APP_PASSWORD not set — the API is
 // msg-index.json the moment `npm test` loaded this file.
 if (require.main === module) {
   migrateJsonToSql(undefined, undefined, { templateName: S.config.templateName || null });
+  // Losing the opt-out list would be a compliance failure, not a cosmetic one:
+  // Meta drops the number's quality rating for messaging people who asked you
+  // to stop. It folds into contacts.enabled = 0 with reason 'opt_out'.
+  migrateOptOuts();
   resumeIfInterrupted();
   startRetention();
   server.listen(CFG.port, () => {
@@ -146,6 +165,8 @@ module.exports = {
   isWindowOpen:   require('./src/services/inbox').isWindowOpen,
   recordInbound:  require('./src/services/inbox').recordInbound,
   inboxSummary:   require('./src/services/inbox').summary,
+  inboxSearch:    require('./src/services/inbox').search,
+  INBOX_PAGE_SIZE: require('./src/services/inbox').PAGE_SIZE,
   describeInbound: require('./src/services/inbox').describe,
   markRead:    require('./src/services/inbox').markRead,
   inboxThread: require('./src/services/inbox').thread,
@@ -157,8 +178,15 @@ module.exports = {
   buildState,
   todayKey: require('./src/state').todayKey,
   S,
+  // The loop's control flags, so a test can assert what a Stop does and does not
+  // touch. `running` is owned by the loop; a route only ever sets a *Flag.
+  flags: require('./src/state').flags,
+  memoryWarning,
   W: require('./src/services/warmup').W,
-  optOuts: require('./src/services/optouts').optOuts,
+  // Namespaced rather than spread: `list`, `counts`, `enable` and `disable` are
+  // too generic to sit at the top of a module that already re-exports thirteen
+  // others.
+  contacts: require('./src/services/contacts'),
   LIMITS: require('./src/config').LIMITS,
   PRICES: require('./src/config').PRICES,
   OPT_OUT_LABEL: require('./src/config').OPT_OUT_LABEL,

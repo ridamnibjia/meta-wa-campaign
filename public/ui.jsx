@@ -5,6 +5,15 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 const cn = (...xs) => xs.filter(Boolean).join(' ');
 
+// Why a contact is switched off. The server stores the machine-readable reason;
+// these are the words an operator reads. It lives here rather than in a view
+// because two of them render it, and this file is the first script on the page.
+const REASON_LABEL = {
+  opt_out:     'opted out',
+  manual:      'disabled by you',
+  failed_hard: 'undeliverable',
+};
+
 // ── Card ───────────────────────────────────────────────────────────────────────
 const Card = ({ className, children, ...p }) => (
   <div className={cn('rounded-lg border border-border bg-card text-card-foreground shadow-sm', className)} {...p}>{children}</div>

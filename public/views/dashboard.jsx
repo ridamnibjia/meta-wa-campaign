@@ -2,7 +2,8 @@
 // things you might want to do next.
 function Dashboard() {
   const { ss, account, threads, logs, contacts } = useApp();
-  const { phase, accepted, delivered, read, failed, skipped, total, dailyCount, dailyCap, pricing = {}, warmup } = ss;
+  const { phase, accepted, delivered, read, failed, skipped, total, dailyCount, dailyCap,
+          pricing = {}, warmup, retrying = 0, nextRetry, lastRun } = ss;
 
   const done = accepted + failed + skipped;
   const pct  = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -12,10 +13,15 @@ function Dashboard() {
 
   const PHASE = {
     running: ['success', 'Sending'],
+    // Its own label, not 'Sending': the loop can be asleep for hours between
+    // retry attempts, and "Sending" over a four-hour sleep reads as a hang.
+    waiting: ['warning', 'Waiting to retry'],
     paused:  ['warning', 'Paused'],
     done:    ['secondary', 'Finished'],
     idle:    ['outline', 'Idle'],
   }[phase] || ['outline', phase];
+
+  const when = ms => new Date(ms).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
@@ -38,7 +44,48 @@ function Dashboard() {
         </div>
       </div>
 
-      {ss.pauseReason && <Alert variant="warning" title="Campaign paused">{ss.pauseReason}</Alert>}
+      {ss.pauseReason && (
+        <Alert variant="warning" title={phase === 'waiting' ? 'Campaign waiting to retry' : 'Campaign paused'}>
+          {ss.pauseReason}
+        </Alert>
+      )}
+
+      {/* ── The last campaign ────────────────────────────────────────
+          Derived from campaign_runs, so it survives a Reset and a restart and
+          still answers "what did the last send actually do". `unfinished` is a
+          property of the queue rather than of the phase: rows still pending
+          means people still owed a message, whatever the process thinks. */}
+      {lastRun && (
+        <Card>
+          <CardHeader row>
+            <div>
+              <CardTitle>Last campaign — {lastRun.label || `run ${lastRun.id}`}</CardTitle>
+              <CardDescription>Started {when(lastRun.startedAt)}</CardDescription>
+            </div>
+            <Badge variant={lastRun.unfinished ? 'warning' : 'secondary'}>
+              {lastRun.unfinished ? `${num(lastRun.progress.pending)} still to go` : 'Finished'}
+            </Badge>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.progress.sent)}</strong> of {num(lastRun.progress.total)} sent</span>
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.counts.delivered)}</strong> delivered</span>
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.counts.failed)}</strong> failed</span>
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.progress.skipped)}</strong> skipped</span>
+              {lastRun.progress.retrying > 0 && (
+                <span><strong className="text-warning tabular-nums">{num(lastRun.progress.retrying)}</strong> waiting to retry</span>
+              )}
+            </div>
+            {lastRun.unfinished && (
+              <p className="rounded-md bg-muted/60 p-2 text-[11px] text-muted-foreground">
+                This campaign is not done{lastRun.nextRetry ? `, and picks its next contact up at ${when(lastRun.nextRetry.at)}` : ''}.
+                Starting another, or uploading a new list, is blocked until it finishes or you stop it —
+                the queue can only be walked by one campaign at a time.
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Counters */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
@@ -47,6 +94,10 @@ function Dashboard() {
         <Stat label="Read"      value={num(read)}      hint={`${rate(read)} of accepted`} />
         <Stat label="Failed"    value={num(failed)}    tone={failed ? 'text-destructive' : undefined} />
         <Stat label="Skipped"   value={num(skipped)}   hint="opted out or undeliverable" />
+        {retrying > 0 && (
+          <Stat label="Waiting" value={num(retrying)} tone="text-warning"
+                hint={nextRetry ? `next attempt ${new Date(nextRetry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'queued for another try'} />
+        )}
       </div>
 
       <div className="grid gap-4 lg:grid-cols-3">

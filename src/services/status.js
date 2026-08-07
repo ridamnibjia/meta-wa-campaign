@@ -2,9 +2,10 @@
 const { CFG, LIMITS, OPT_OUT_LABEL, PRICES } = require('../config');
 const { S, emit, todayKey } = require('../state');
 const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap } = require('./warmup');
-const { optOuts } = require('./optouts');
-const { countsForRun } = require('./messages');
-const { rateFor, billableCount, estimateCost, spentCost } = require('../lib/pricing');
+const { counts: contactCounts } = require('./contacts');
+const { countsForRun, progressForRun, nextPending, billableForRun,
+        nextRetryForRun, lastRunSummary } = require('./messages');
+const { rateFor, estimateCost, spentCost } = require('../lib/pricing');
 const inbox = require('./inbox');
 
 // The single snapshot every client renders from. The counters are a GROUP BY
@@ -13,12 +14,19 @@ const inbox = require('./inbox');
 // disagree with the messages it counts.
 function buildState() {
   const rate     = rateFor(S.config.templateCategory);
-  const billable = billableCount(S.contacts, optOuts);
+  const known    = contactCounts();
   const c        = countsForRun(S.currentRunId);
+  // The queue is the source of truth for every progress number now. `billable`
+  // is asked against the CURRENT enabled flags rather than the snapshot taken
+  // when the queue was staged, so disabling someone moves the estimate straight
+  // away instead of only once the loop reaches them.
+  const p        = progressForRun(S.currentRunId);
+  const billable = billableForRun(S.currentRunId);
+  const next     = nextPending(S.currentRunId);
   return {
     phase:          S.phase,
-    currentIdx:     S.currentIdx,
-    total:          S.contacts.length,
+    currentIdx:     p.sent + p.skipped,
+    total:          p.total,
     accepted:       c.accepted,
     delivered:      c.delivered,
     read:           c.read,
@@ -26,7 +34,16 @@ function buildState() {
     // row — S.failed) and a delivery failure webhook (a row — c.failed).
     // The operator wants "did not arrive", which is both.
     failed:         S.failed + c.failed,
-    skipped:        S.skipped,
+    skipped:        p.skipped,
+    // Contacts a moment-based failure put back on the queue. They are neither
+    // sent nor skipped, and a run is not finished while any remain — which is
+    // why this is its own number rather than folded into either.
+    retrying:       p.retrying,
+    nextRetry:      nextRetryForRun(S.currentRunId),
+    // What the last send actually did, read from campaign_runs rather than from
+    // the current run — so it still answers the question after a Reset, which
+    // is exactly when it gets asked.
+    lastRun:        lastRunSummary(),
     dailyCount:     S.dailyCount,
     dailyCap:       effectiveCap(),
     quality:        S.quality,
@@ -58,9 +75,13 @@ function buildState() {
     // Surfacing it here is what lets the composer grey the option out rather
     // than accepting an upload and failing at submit time.
     mediaHeadersAvailable: !!CFG.appId,
-    currentContact: S.contacts[S.currentIdx] || null,
+    currentContact: next ? { name: next.name, dialStr: next.phone } : null,
     limits:         LIMITS,
-    optOutCount:    optOuts.size,
+    // OPT_OUT_LABEL stays: it builds the quick-reply button and matches the
+    // inbound reply. The COUNT is now every disabled contact, whatever turned
+    // them off — an opt-out, an operator, or an undeliverable number.
+    contacts:       known,
+    disabledCount:  known.disabled,
     optOutLabel:    OPT_OUT_LABEL,
   };
 }

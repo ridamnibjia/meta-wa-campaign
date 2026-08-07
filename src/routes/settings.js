@@ -7,6 +7,8 @@ const { fetchAccountInfo } = require('../services/graph');
 const { CONTACT_FIELDS } = require('../services/campaign');
 const { W, saveWarmup, warmupCap, warmupStep } = require('../services/warmup');
 const { missingParams } = require('../services/campaign');
+const diagnostics = require('../services/diagnostics');
+const { replayUnprocessed } = require('../services/ingest');
 
 const router = express.Router();
 
@@ -75,6 +77,22 @@ router.post('/warmup', (req, res) => {
   if (typeof req.body.enabled === 'boolean') { W.enabled = req.body.enabled; saveWarmup(); }
   broadcast();
   res.json({ ok: true, enabled: W.enabled, cap: warmupCap(), step: warmupStep(), daysSent: W.days.length });
+});
+
+// ── Diagnostics ────────────────────────────────────────────────────────────────
+router.get('/diagnostics', (req, res) => {
+  try { res.json(diagnostics.snapshot()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// The only state-changing thing on that page. Replay is idempotent by
+// construction — messages dedupes on its primary key, applyStatus only moves a
+// status forward, and disable() is a no-op when the contact is already off for
+// that reason — so pressing it twice costs nothing but a little work.
+router.post('/diagnostics/replay', (req, res) => {
+  const r = replayUnprocessed({ limit: req.body?.limit });
+  broadcast();
+  res.json({ ok: true, ...r });
 });
 
 router.get('/state',   (req, res) => res.json(buildState()));

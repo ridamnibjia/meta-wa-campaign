@@ -89,10 +89,19 @@ const CLAMAV = {
 // stops a save filling the boot disk out from under SQLite, which handles a
 // full filesystem by refusing writes: an unbounded media save would take the
 // message store down with it, which is far worse than a refused Save.
+// `Number(x) || fallback` cannot express zero, and zero is a legitimate setting
+// for the free-space floor: a self-hoster on a dedicated media disk may not want
+// one at all. An unset or unparseable variable still falls back.
+const num = (raw, fallback) => {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
 const MEDIA_LIMITS = {
-  maxBytes:      Number(process.env.WA_MEDIA_MAX_BYTES)      || 100 * 1024 * 1024,
-  minFreeBytes:  Number(process.env.WA_MEDIA_MIN_FREE_BYTES) || 2 * 1024 * 1024 * 1024,
-  retentionDays: Number(process.env.WA_MEDIA_RETENTION_DAYS) || 90,
+  maxBytes:      num(process.env.WA_MEDIA_MAX_BYTES,      100 * 1024 * 1024),
+  minFreeBytes:  num(process.env.WA_MEDIA_MIN_FREE_BYTES, 2 * 1024 * 1024 * 1024),
+  retentionDays: num(process.env.WA_MEDIA_RETENTION_DAYS, 90),
 };
 
 // Files uploaded for use as a template header. Separate from MEDIA_DIR, which

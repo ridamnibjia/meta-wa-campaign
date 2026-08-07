@@ -14,6 +14,7 @@
 // (`n`) exists too; `z` is used here because it does not care what is in the
 // data it is framing.
 const net = require('node:net');
+const { Readable } = require('node:stream');
 const { CLAMAV } = require('../config');
 
 // The EICAR test string: not malware, but every scanner on earth is required to
@@ -48,6 +49,21 @@ const connectOptions = addr => {
   return m ? { host: m[1], port: Number(m[2]) } : { path: addr };
 };
 
+// The INSTREAM wire format, as a generator so the socket can pull it at its own
+// pace. 64 KiB is clamd's own preferred chunk size: larger chunks are legal but
+// the daemon buffers each one whole, and this file may be 100 MB.
+function* frames(buf) {
+  yield Buffer.from('zINSTREAM\0');
+  for (let i = 0; i < buf.length; i += 65536) {
+    const chunk = buf.subarray(i, i + 65536);
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(chunk.length);
+    yield len;
+    yield chunk;
+  }
+  yield Buffer.alloc(4);   // uint32be 0 — end of stream
+}
+
 // Never throws and never rejects. Every caller is a save path that has to turn
 // the outcome into a database row and a sentence for an operator, and an
 // exception here would be indistinguishable at the catch site from a clean
@@ -63,19 +79,17 @@ function scanBuffer(buf) {
     sock.setTimeout(CLAMAV.timeoutMs);
 
     let reply = '';
-    sock.on('connect', () => {
-      sock.write('zINSTREAM\0');
-      // 64 KiB is clamd's own preferred chunk size. Larger chunks are legal but
-      // the daemon buffers each one whole, and this file may be 100 MB.
-      for (let i = 0; i < buf.length; i += 65536) {
-        const chunk = buf.subarray(i, i + 65536);
-        const len = Buffer.alloc(4);
-        len.writeUInt32BE(chunk.length);
-        sock.write(len);
-        sock.write(chunk);
-      }
-      sock.write(Buffer.alloc(4));   // uint32be 0 — end of stream
-    });
+    // pipe, not a write loop. sock.write() does not block — it returns false
+    // once the kernel buffer is full and queues the rest in userland. A loop
+    // that ignores that return value runs to completion in microseconds and
+    // leaves the whole file sitting in the socket's write queue, so scanning
+    // one 100 MB document cost 100 MB for the buffer plus 100 MB for its copy.
+    // Piping a generator gives us clamd's own backpressure for free and holds
+    // the framing to one chunk at a time.
+    //
+    // end: false — half-closing the socket here would be legal, but clamd's
+    // answer comes back on the same connection and `done` owns the teardown.
+    sock.on('connect', () => Readable.from(frames(buf)).pipe(sock, { end: false }));
 
     sock.on('data',  d => { reply += d.toString(); });
     // Both, because a daemon that answers and hangs up may fire either first

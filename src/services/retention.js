@@ -13,7 +13,7 @@ const path = require('path');
 const { MEDIA_DIR, MEDIA_LIMITS } = require('../config');
 const { db }  = require('../lib/db');
 const { log } = require('../state');
-const { inboundPath } = require('./media');
+const { inboundPath, pathIsShared } = require('./media');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -49,6 +49,16 @@ function sweepMedia({ now = Date.now() } = {}) {
       continue;
     }
     try {
+      // Files are named for their own sha256, so a forwarded photo is two rows
+      // over one file with two independent 90-day clocks. This row's clock has
+      // run out; the sibling's has not. Retire the row and leave the bytes —
+      // unlinking here would strand a message that still shows an attachment
+      // and 404 it on click. The last row out deletes the file.
+      if (pathIsShared(row)) {
+        clearPath.run(row.media_id);
+        swept++;
+        continue;
+      }
       // A file that is already gone is the end state this function is trying to
       // reach, not a failure — so size it first and treat a missing one as zero
       // bytes freed rather than an error.
