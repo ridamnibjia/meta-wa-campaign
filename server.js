@@ -17,6 +17,7 @@ const { buildState } = require('./src/services/status');
 const { resumeIfInterrupted } = require('./src/services/campaign');
 const { startRetention } = require('./src/services/retention');
 const { migrateJsonToSql } = require('./src/services/migrate');
+const { migrateOptOuts }   = require('./src/services/contacts');
 const { unprocessedWebhookCount } = require('./src/services/messages');
 
 const app    = express();
@@ -123,6 +124,10 @@ if (!CFG.appPassword)   console.warn('[WARN] APP_PASSWORD not set — the API is
 // msg-index.json the moment `npm test` loaded this file.
 if (require.main === module) {
   migrateJsonToSql(undefined, undefined, { templateName: S.config.templateName || null });
+  // Losing the opt-out list would be a compliance failure, not a cosmetic one:
+  // Meta drops the number's quality rating for messaging people who asked you
+  // to stop. It folds into contacts.enabled = 0 with reason 'opt_out'.
+  migrateOptOuts();
   resumeIfInterrupted();
   startRetention();
   server.listen(CFG.port, () => {
@@ -165,7 +170,10 @@ module.exports = {
   todayKey: require('./src/state').todayKey,
   S,
   W: require('./src/services/warmup').W,
-  optOuts: require('./src/services/optouts').optOuts,
+  // Namespaced rather than spread: `list`, `counts`, `enable` and `disable` are
+  // too generic to sit at the top of a module that already re-exports thirteen
+  // others.
+  contacts: require('./src/services/contacts'),
   LIMITS: require('./src/config').LIMITS,
   PRICES: require('./src/config').PRICES,
   OPT_OUT_LABEL: require('./src/config').OPT_OUT_LABEL,

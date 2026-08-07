@@ -78,11 +78,12 @@ function ContactListDialog({ open, onClose }) {
       {shown?.length === 0 && <Empty icon="⌕" title={rows.length ? 'No contact matches that' : 'No contacts loaded'} />}
       <div className="divide-y divide-border">
         {(shown || []).map(c => (
-          <div key={c.dialStr} className={cn('flex items-center justify-between gap-3 py-2 text-sm', c.optedOut && 'opacity-50')}>
-            <span className={cn('font-medium', c.optedOut && 'line-through')}>{c.name}</span>
+          <div key={c.dialStr} className={cn('flex items-center justify-between gap-3 py-2 text-sm', c.disabled && 'opacity-50')}>
+            <span className={cn('font-medium', c.disabled && 'line-through')}>{c.name}</span>
             <span className="flex items-center gap-2">
-              <span className={cn('font-mono text-xs text-muted-foreground', c.optedOut && 'line-through')}>+{c.dialStr}</span>
-              {c.optedOut ? <Badge variant="outline">opted out</Badge> : c.sent ? <Badge variant="secondary">sent</Badge> : null}
+              <span className={cn('font-mono text-xs text-muted-foreground', c.disabled && 'line-through')}>+{c.dialStr}</span>
+              {c.disabled ? <Badge variant="outline">{REASON_LABEL[c.disabledReason] || 'disabled'}</Badge>
+                : c.sent ? <Badge variant="secondary">sent</Badge> : null}
             </span>
           </div>
         ))}
@@ -221,7 +222,7 @@ function Campaign() {
   const {
     ss, contacts, setContacts, templates, picked, setPicked, params, setParams,
     tmplErr, active, vars, flushParams, loadTemplates, uploadCSV, logs, setLogs,
-    failLog, setFailLog, optOuts,
+    failLog, setFailLog,
   } = useApp();
 
   const [showAll,  setShowAll]  = useState(false);
@@ -414,7 +415,7 @@ function Campaign() {
                 </div>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   {num(pricing.billable)} billable × {money(pricing.rate, cur)} per delivered {String(pricing.category || '').toLowerCase() || 'marketing'} message
-                  {optOuts.length > 0 && <> · {num(contacts.count - pricing.billable)} skipped for opt-outs</>}
+                  {contacts.count > pricing.billable && <> · {num(contacts.count - pricing.billable)} skipped as disabled</>}
                 </p>
               </div>
             </>

@@ -169,7 +169,6 @@ function App() {
   const [tmplErr,  setTmplErr]  = useState(null);
   const [logs,     setLogs]     = useState([]);
   const [failLog,  setFailLog]  = useState([]);
-  const [optOuts,  setOptOuts]  = useState([]);
   const [threads,  setThreads]  = useState([]);
   const reloadTmpl = useRef(() => {});
 
@@ -273,7 +272,6 @@ function App() {
     }).catch(() => loadTemplates());
 
     api.get('/api/faillog').then(d => setFailLog(d || [])).catch(() => {});
-    api.get('/api/optouts').then(d => setOptOuts(d.numbers || [])).catch(() => {});
     api.get('/api/account-info').then(a => { if (!a.error) setAccount(a); }).catch(() => {});
     loadInbox();
   }, [session.authed, loadTemplates, loadInbox]);
@@ -302,7 +300,7 @@ function App() {
   const ctx = {
     api, session, signOut, dark, setDark, connected,
     ss, account, contacts, setContacts, templates, setTemplates, picked, setPicked,
-    params, setParams, tmplErr, logs, setLogs, failLog, setFailLog, optOuts, setOptOuts,
+    params, setParams, tmplErr, logs, setLogs, failLog, setFailLog,
     threads, setThreads, active, vars, flushParams, loadTemplates, loadInbox, uploadCSV,
   };
 

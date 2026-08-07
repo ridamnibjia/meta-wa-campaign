@@ -2,7 +2,7 @@
 const { CFG, LIMITS, OPT_OUT_LABEL, PRICES } = require('../config');
 const { S, emit, todayKey } = require('../state');
 const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap } = require('./warmup');
-const { optOuts } = require('./optouts');
+const { isDisabled, counts: contactCounts } = require('./contacts');
 const { countsForRun } = require('./messages');
 const { rateFor, billableCount, estimateCost, spentCost } = require('../lib/pricing');
 const inbox = require('./inbox');
@@ -13,7 +13,8 @@ const inbox = require('./inbox');
 // disagree with the messages it counts.
 function buildState() {
   const rate     = rateFor(S.config.templateCategory);
-  const billable = billableCount(S.contacts, optOuts);
+  const billable = billableCount(S.contacts, isDisabled);
+  const known    = contactCounts();
   const c        = countsForRun(S.currentRunId);
   return {
     phase:          S.phase,
@@ -60,7 +61,11 @@ function buildState() {
     mediaHeadersAvailable: !!CFG.appId,
     currentContact: S.contacts[S.currentIdx] || null,
     limits:         LIMITS,
-    optOutCount:    optOuts.size,
+    // OPT_OUT_LABEL stays: it builds the quick-reply button and matches the
+    // inbound reply. The COUNT is now every disabled contact, whatever turned
+    // them off — an opt-out, an operator, or an undeliverable number.
+    contacts:       known,
+    disabledCount:  known.disabled,
     optOutLabel:    OPT_OUT_LABEL,
   };
 }

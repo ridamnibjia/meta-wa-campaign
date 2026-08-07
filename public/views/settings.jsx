@@ -1,7 +1,7 @@
 // Everything that used to be buried in "Advanced": pacing, pricing, warm-up,
-// opt-outs and credentials.
+// contacts and credentials.
 function SettingsView() {
-  const { ss, account, optOuts, setOptOuts } = useApp();
+  const { ss, account } = useApp();
   const { warmup: warm, pricing = {} } = ss;
 
   const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 1000 });
@@ -9,6 +9,21 @@ function SettingsView() {
   const [creds,    setCreds]    = useState({ phoneId: '', token: '', wabaId: '' });
   const [saved,    setSaved]    = useState('');
   const [optAdd,   setOptAdd]   = useState('');
+
+  // The directory is loaded here rather than held in app state: it is only ever
+  // read on this page, and a campaign of a thousand contacts should not push a
+  // thousand rows through every socket broadcast.
+  const [directory, setDirectory] = useState([]);
+  const [counts,    setCounts]    = useState({ total: 0, enabled: 0, disabled: 0 });
+  const [filter,    setFilter]    = useState('disabled');
+
+  const loadDirectory = useCallback(() => {
+    api.get(`/api/contacts/directory${filter === 'disabled' ? '?disabled=1' : ''}`)
+      .then(d => { setDirectory(d.contacts || []); setCounts(d.counts || counts); })
+      .catch(() => {});
+  }, [filter]);
+
+  useEffect(() => { loadDirectory(); }, [loadDirectory, ss.disabledCount]);
 
   useEffect(() => {
     const c = ss.config || {};
@@ -39,10 +54,11 @@ function SettingsView() {
     flash(r.configured ? 'Credentials saved' : 'Saved — still incomplete');
   };
 
-  const editOptOuts = async patch => {
-    const r = await api.post('/api/optouts', patch).catch(() => null);
-    if (!r?.ok) return alert('Could not update the opt-out list.');
-    setOptOuts(r.numbers);
+  const editContacts = async patch => {
+    const r = await api.post('/api/contacts/directory', patch).catch(() => null);
+    if (!r?.ok) return alert('Could not update the contact list.');
+    setCounts(r.counts);
+    loadDirectory();
     if (r.invalid?.length) alert('Not a valid phone number: ' + r.invalid.join(', '));
   };
 
@@ -144,37 +160,67 @@ function SettingsView() {
         </Card>
       )}
 
-      {/* Opt-outs */}
+      {/* Contacts — one list, one switch */}
       <Card>
         <CardHeader>
-          <CardTitle>Opt-out list — {num(optOuts.length)} number{optOuts.length === 1 ? '' : 's'}</CardTitle>
-          <CardDescription>Never messaged again. Taps on “Stop promotions” land here automatically.</CardDescription>
+          <CardTitle>
+            Contacts — {num(counts.total)} known, {num(counts.disabled)} disabled
+          </CardTitle>
+          <CardDescription>
+            A disabled contact is skipped by campaigns and stays fully replyable in the inbox.
+            Taps on “Stop promotions” land here automatically, as do numbers Meta reports as undeliverable.
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="flex gap-2">
             <Input className="flex-1 font-mono" value={optAdd} placeholder="+91 98765 43210"
                    onChange={e => setOptAdd(e.target.value)}
-                   onKeyDown={e => { if (e.key === 'Enter' && optAdd) { editOptOuts({ add: [optAdd] }); setOptAdd(''); } }} />
+                   onKeyDown={e => { if (e.key === 'Enter' && optAdd) { editContacts({ disable: [optAdd] }); setOptAdd(''); } }} />
             <Button variant="outline" disabled={!optAdd}
-                    onClick={() => { editOptOuts({ add: [optAdd] }); setOptAdd(''); }}>Add</Button>
+                    onClick={() => { editContacts({ disable: [optAdd] }); setOptAdd(''); }}>Disable</Button>
           </div>
-          {optOuts.length > 0 && (
+
+          <div className="flex gap-1.5 text-xs">
+            {['disabled', 'all'].map(f => (
+              <Button key={f} size="sm" variant={filter === f ? 'secondary' : 'ghost'}
+                      onClick={() => setFilter(f)}>
+                {f === 'disabled' ? `Disabled (${num(counts.disabled)})` : `All (${num(counts.total)})`}
+              </Button>
+            ))}
+          </div>
+
+          {directory.length > 0 ? (
             <>
-              <div className="max-h-48 divide-y divide-border overflow-y-auto rounded-md border border-border">
-                {optOuts.map(n => (
-                  <div key={n} className="flex items-center justify-between px-3 py-1.5 text-xs">
-                    <span className="font-mono">+{n}</span>
-                    <Button variant="link" size="sm" className="text-destructive" onClick={() => {
-                      if (confirm(`Remove +${n}? They asked not to be messaged — only do this if they asked to come back.`))
-                        editOptOuts({ remove: [n] });
-                    }}>Remove</Button>
+              <div className="max-h-64 divide-y divide-border overflow-y-auto rounded-md border border-border">
+                {directory.map(c => (
+                  <div key={c.phone} className="flex items-center justify-between gap-2 px-3 py-1.5 text-xs">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-medium">{c.name || '—'}</p>
+                      <p className="font-mono text-[11px] text-muted-foreground">+{c.phone}</p>
+                    </div>
+                    {!c.enabled && <Badge variant="outline">{REASON_LABEL[c.disabledReason] || 'disabled'}</Badge>}
+                    {c.enabled ? (
+                      <Button variant="link" size="sm" className="text-destructive"
+                              onClick={() => editContacts({ disable: [c.phone] })}>Disable</Button>
+                    ) : (
+                      <Button variant="link" size="sm" onClick={() => {
+                        const why = c.disabledReason === 'opt_out'
+                          ? `+${c.phone} asked not to be messaged. Only re-enable them if they have asked to come back.`
+                          : `Re-enable +${c.phone}?`;
+                        if (confirm(why)) editContacts({ enable: [c.phone] });
+                      }}>Enable</Button>
+                    )}
                   </div>
                 ))}
               </div>
-              <a href="/api/optouts/download" className="inline-block text-xs text-primary underline-offset-4 hover:underline">
-                Download backup
+              <a href="/api/contacts/directory/download" className="inline-block text-xs text-primary underline-offset-4 hover:underline">
+                Download the disabled list
               </a>
             </>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {filter === 'disabled' ? 'Nobody is disabled.' : 'No contacts yet — upload a CSV on the Campaign page.'}
+            </p>
           )}
         </CardContent>
       </Card>

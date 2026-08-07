@@ -67,6 +67,13 @@ function parseCSV(buffer) {
   const nameI  = hdr.findIndex(h => /name/i.test(h));
   const phoneCols = hdr.map((h, i) => (isPhoneHeader(h) ? i : -1)).filter(i => i >= 0);
 
+  // Every column that is not a name and not a phone, kept verbatim under its own
+  // header. Nothing reads these yet — contacts.fields_json just stores them, so
+  // a later phase that wants "{{2}} is their city" does not need a re-upload of
+  // a file the operator may no longer have.
+  const extraCols = hdr.map((h, i) => i)
+    .filter(i => i !== firstI && i !== lastI && i !== nameI && !phoneCols.includes(i) && hdr[i]);
+
   const contacts = [], skipped = [], seen = new Set();
   for (let i = 1; i < lines.length; i++) {
     const p = splitCsvLine(lines[i]);
@@ -75,6 +82,9 @@ function parseCSV(buffer) {
     const name = (firstI >= 0
       ? [p[firstI], lastI >= 0 ? p[lastI] : ''].filter(Boolean).join(' ')
       : (nameI >= 0 ? p[nameI] : '')).trim() || 'Contact';
+
+    const fields = {};
+    for (const col of extraCols) if (p[col]) fields[hdr[col]] = p[col];
 
     let usable = false;
     for (const col of phoneCols) {
@@ -85,7 +95,7 @@ function parseCSV(buffer) {
       usable = true;                       // the row had a number; a duplicate
       if (seen.has(d)) continue;           // is not a row that failed to parse
       seen.add(d);
-      contacts.push({ name, phone: raw, dialStr: d });
+      contacts.push({ name, phone: raw, dialStr: d, fields });
     }
     if (!usable) skipped.push({ row: i + 1, name, reason: 'no usable phone number in this row' });
   }

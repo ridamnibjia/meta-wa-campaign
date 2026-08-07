@@ -3,7 +3,7 @@ const { CFG, FILES } = require('../config');
 const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
 const { S, flags, log, sleep, todayKey, checkDaily } = require('../state');
 const { broadcast } = require('./status');
-const { optOuts } = require('./optouts');
+const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
 const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
 const { recordOutbound, countsForRun, startRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
@@ -205,9 +205,13 @@ async function campaignLoop() {
     }
     const c = S.contacts[S.currentIdx];
     const n = `[${S.currentIdx + 1}/${S.contacts.length}]`;
-    if (optOuts.has(c.dialStr)) {
+    if (isDisabled(c.dialStr)) {
       S.skipped++; S.currentIdx++;
-      log('warn', `${n} skipped — ${c.name} opted out`);
+      // The reason is worth saying out loud: "opted out" and "Meta says this
+      // number is undeliverable" are the same skip to the loop and completely
+      // different problems to the operator.
+      const why = getRow(c.dialStr)?.disabled_reason || 'disabled';
+      log('warn', `${n} skipped — ${c.name} is disabled (${why})`);
       saveCampaign();
       broadcast();
       continue;   // no delay: nothing was sent
@@ -217,6 +221,7 @@ async function campaignLoop() {
     if (result.ok) {
       S.dailyCount++;
       markWarmupDay();
+      markMessaged(c.dialStr);
       recordOutbound({ wamid: result.messageId, waId: c.dialStr, name: c.name,
                        body: renderBody(S.config.templateBody, result.params)
                              ?? `[template: ${S.config.templateName}]`,
@@ -224,6 +229,13 @@ async function campaignLoop() {
       log('success', `${n} accepted — today:${S.dailyCount}/${cap}`);
     } else if (result.skip) {
       S.skipped++;
+      // 131026 is a property of the NUMBER, not of the attempt: not on
+      // WhatsApp, or blocked by Meta on quality grounds. Retrying it is never
+      // right, and left enabled it burns a send slot on every run, forever.
+      // The other skippable codes are about the moment, so they change nothing.
+      if (result.errorCode === 131026 && disable(c.dialStr, 'failed_hard', c.name)) {
+        log('warn', `${n} ${c.name} disabled — Meta reports this number as undeliverable, so later runs will not retry it`);
+      }
       log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
     } else if (result.rateLimit) {
       log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s. ${result.hint || result.error} [${result.errorCode}]`);

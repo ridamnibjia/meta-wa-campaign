@@ -13,6 +13,11 @@ process.env.WA_UPLOAD_DIR = require('path').join(
 process.env.WA_MEDIA_DIR = require('path').join(
   require('os').tmpdir(), `wa-media-${process.pid}-${Date.now()}`);
 
+// The free-space floor defaults to 2 GB, which makes every media test a
+// referendum on how full the developer's laptop is. The floor is exercised
+// deliberately, in its own test, by raising it — so the default here is zero.
+process.env.WA_MEDIA_MIN_FREE_BYTES = '0';
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
@@ -553,14 +558,19 @@ test('an unknown category falls back to the dearest rate, not zero', () => {
   assert.equal(rateFor('NONSENSE'), 0.78);
   assert.equal(rateFor(null), 0.78);
 });
-test('billable excludes opted-out numbers', () => {
+// A predicate rather than a Set: the answer lives in SQL now, and lib/ must not
+// import the database.
+const disabled = (...off) => p => off.includes(p);
+test('billable excludes disabled numbers', () => {
   const contacts = [{ dialStr: '911' }, { dialStr: '922' }, { dialStr: '933' }];
-  assert.equal(billableCount(contacts, new Set(['922'])), 2);
+  assert.equal(billableCount(contacts, disabled('922')), 2);
 });
-test('billable counts everything when nothing has opted out', () => {
-  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }], new Set()), 2);
+test('billable counts everything when nobody is disabled', () => {
+  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }], disabled()), 2);
 });
-test('billable of an empty list is zero, not NaN', () => assert.equal(billableCount([], new Set()), 0));
+test('billable of an empty list is zero, not NaN', () => assert.equal(billableCount([], disabled()), 0));
+test('billable with no predicate counts the whole list rather than throwing', () =>
+  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }]), 2));
 test('estimate multiplies and rounds to paise', () => assert.equal(estimateCost(988, 0.78), 770.64));
 test('estimate never goes negative', () => assert.equal(estimateCost(-5, 0.78), 0));
 test('spend counts delivered only — failures are free', () => assert.equal(spentCost(529, 0.78), 412.62));
@@ -807,12 +817,13 @@ test('node below 22.5 is rejected', () => {
 test('the schema creates every table', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['campaign_runs', 'media', 'media_assets', 'messages', 'templates', 'threads', 'webhook_events']);
+  assert.deepEqual(names, ['campaign_runs', 'contacts', 'csv_uploads', 'media', 'media_assets',
+                           'messages', 'templates', 'threads', 'webhook_events']);
 });
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['idx_messages_run', 'idx_messages_thread']);
+  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_run', 'idx_messages_thread']);
 });
 test('opening twice does not throw', () => {
   const d = openDb(':memory:');
@@ -1187,15 +1198,169 @@ test('the snapshot still carries every key the frontend reads', () => {
   const st = buildState();
   for (const k of ['phase','currentIdx','total','accepted','delivered','read','failed','skipped',
                    'dailyCount','dailyCap','quality','warmup','pricing','inboxUnread','pauseReason',
-                   'config','configured','currentContact','limits','optOutCount','optOutLabel']) {
+                   'config','configured','currentContact','limits','disabledCount','contacts','optOutLabel']) {
     assert.ok(k in st, `buildState lost the "${k}" key`);
   }
 });
 
-console.log('\nmigration');
 const fsx   = require('node:fs');
 const pathx = require('node:path');
 const osx   = require('node:os');
+
+// ── P2a: one list, one switch ─────────────────────────────────────────────────
+console.log('\ncontacts — enable / disable');
+{
+  const C = require('./server').contacts;
+  let seq = 0;
+  const phone = () => `9199000${String(++seq).padStart(4, '0')}`;
+  const csv = rows => Buffer.from('Name,Mobile Phone\n' + rows.map(r => r.join(',')).join('\n') + '\n');
+
+  test('an unknown number is not disabled — the test-send box accepts typed numbers', () => {
+    assert.equal(C.isDisabled('919888800001'), false);
+    assert.equal(C.isEnabled('919888800001'), true);
+  });
+
+  test('disable creates the row when the contact has never been in a CSV', () => {
+    const p = phone();
+    assert.equal(C.disable(p, 'opt_out'), true);
+    assert.equal(C.isDisabled(p), true);
+    assert.equal(C.getRow(p).disabled_reason, 'opt_out');
+  });
+
+  test('disabling twice for the same reason is not a second event', () => {
+    const p = phone();
+    assert.equal(C.disable(p, 'opt_out'), true);
+    assert.equal(C.disable(p, 'opt_out'), false,
+      'a webhook redelivery of one opt-out tap is not two opt-outs');
+  });
+
+  test('a later reason overwrites an earlier one', () => {
+    const p = phone();
+    C.disable(p, 'manual');
+    assert.equal(C.disable(p, 'failed_hard'), true);
+    assert.equal(C.getRow(p).disabled_reason, 'failed_hard');
+  });
+
+  test('an unknown reason is stored as manual rather than written verbatim', () => {
+    const p = phone();
+    C.disable(p, 'whatever');
+    assert.equal(C.getRow(p).disabled_reason, 'manual');
+  });
+
+  test('enable clears the reason, and enabling an unknown number is a no-op', () => {
+    const p = phone();
+    C.disable(p, 'manual');
+    assert.equal(C.enable(p), true);
+    assert.equal(C.isDisabled(p), false);
+    assert.equal(C.getRow(p).disabled_reason, null);
+    assert.equal(C.enable('919888800002'), false, 'nothing to enable is not a change');
+  });
+
+  // THE test for this phase. `enabled` is absent from the upsert's SET list on
+  // purpose, and an absence is exactly what a future contributor "fixes" by
+  // helpfully adding `enabled = excluded.enabled`.
+  test('re-uploading the same CSV never resurrects someone who opted out', () => {
+    const p = phone();
+    const file = csv([['Asha', p]]);
+    C.upsertFromCsv(parseCSV(file).contacts, { filename: 'list.csv' });
+    C.disable(p, 'opt_out');
+
+    C.upsertFromCsv(parseCSV(file).contacts, { filename: 'list.csv' });
+    assert.equal(C.isDisabled(p), true, 'a re-upload must not undo an opt-out');
+    assert.equal(C.getRow(p).disabled_reason, 'opt_out');
+  });
+
+  test('the upsert refreshes the name but never first_seen', () => {
+    const p = phone();
+    C.upsertFromCsv(parseCSV(csv([['Asha', p]])).contacts, {});
+    const first = C.getRow(p).first_seen;
+    assert.equal(C.getRow(p).name, 'Asha');
+
+    C.upsertFromCsv(parseCSV(csv([['Asha Rao', p]])).contacts, {});
+    assert.equal(C.getRow(p).name, 'Asha Rao', 'a corrected name should stick');
+    assert.equal(C.getRow(p).first_seen, first, 'but the contact is not newly seen');
+  });
+
+  test('extra CSV columns are stored verbatim for a later phase to read', () => {
+    const p = phone();
+    const file = Buffer.from(`Name,Mobile Phone,City\nAsha,${p},Pune\n`);
+    C.upsertFromCsv(parseCSV(file).contacts, {});
+    assert.deepEqual(JSON.parse(C.getRow(p).fields_json), { City: 'Pune' });
+  });
+
+  test('the upload is recorded with what happened to the file', () => {
+    const p = phone();
+    const file = Buffer.from(`Name,Mobile Phone\nAsha,${p}\nGhost,not-a-number\n`);
+    const { contacts: parsed, skipped } = parseCSV(file);
+    const r = C.upsertFromCsv(parsed, { filename: 'mixed.csv', skippedCount: skipped.length });
+    assert.equal(r.rowCount, 1);
+    assert.equal(r.newCount, 1);
+    assert.equal(r.skippedCount, 1, 'the row the parser could not read is on the record');
+
+    const again = C.upsertFromCsv(parsed, { filename: 'mixed.csv', skippedCount: 0 });
+    assert.equal(again.newCount, 0, 'the second upload introduces nobody new');
+  });
+
+  test('counts separate enabled from disabled', () => {
+    const before = C.counts();
+    const p = phone();
+    C.upsertFromCsv(parseCSV(csv([['Asha', p]])).contacts, {});
+    assert.equal(C.counts().enabled, before.enabled + 1);
+    C.disable(p, 'manual');
+    assert.equal(C.counts().disabled, before.disabled + 1);
+    assert.equal(C.counts().total, before.total + 1);
+  });
+
+  test('the disabled list carries the reason, for the operator and for Meta', () => {
+    const p = phone();
+    C.disable(p, 'opt_out');
+    const row = C.disabledRows().find(r => r.phone === p);
+    assert.ok(row, 'a disabled contact must appear on the list you can hand over');
+    assert.equal(row.disabled_reason, 'opt_out');
+    assert.ok(row.disabled_at > 0);
+  });
+
+  // The decision that makes this a switch and not a blocklist: disabled stops
+  // CAMPAIGNS and nothing else. services/inbox.js does not import this module
+  // at all, and that is the enforcement.
+  test('nothing in the inbox path consults the enabled column', () => {
+    const src = fsx.readFileSync('./src/services/inbox.js', 'utf8');
+    assert.ok(!/services\/contacts|isDisabled|isEnabled/.test(src),
+      'a disabled contact who writes in still deserves an answer');
+  });
+}
+
+console.log('\ncontacts — opt-outs.json import');
+{
+  const C = require('./server').contacts;
+  const tmp = () => pathx.join(osx.tmpdir(), `wa-optouts-${process.pid}-${Date.now()}-${Math.random()}.json`);
+
+  test('the old flat file folds into contacts as opt_out, then gets renamed away', () => {
+    const f = tmp();
+    fsx.writeFileSync(f, JSON.stringify(['919777700001', '919777700002']));
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 2);
+    assert.equal(C.getRow('919777700001').disabled_reason, 'opt_out');
+    assert.ok(!fsx.existsSync(f), 'the source is renamed so a later boot has nothing to find');
+    assert.ok(fsx.existsSync(`${f}.migrated`));
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
+  test('a missing file is a no-op, not an error', () => {
+    assert.deepEqual(C.migrateOptOuts({ optOuts: tmp() }), { imported: 0, skipped: true });
+  });
+
+  test('an unreadable file is left in place rather than renamed away', () => {
+    const f = tmp();
+    fsx.writeFileSync(f, '{ this is not json');
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 0);
+    assert.ok(fsx.existsSync(f), 'renaming it would declare success on a silent loss of the list');
+    fsx.rmSync(f, { force: true });
+  });
+}
+
+console.log('\nmigration');
 
 // Never point these at src/config's real FILES. The migration RENAMES its
 // sources when it finishes, so a test using the real paths would overwrite and

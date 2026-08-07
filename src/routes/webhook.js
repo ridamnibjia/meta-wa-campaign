@@ -4,7 +4,7 @@ const { CFG, OPT_OUT_LABEL } = require('../config');
 const { S, log, emit } = require('../state');
 const { verifySignature } = require('../lib/signature');
 const { broadcast } = require('../services/status');
-const { addOptOut } = require('../services/optouts');
+const { disable } = require('../services/contacts');
 const { applyStatus, recordEnvelope, markEnvelopeProcessed } = require('../services/messages');
 const inbox = require('../services/inbox');
 
@@ -63,7 +63,12 @@ function processEnvelope(body) {
 
         const label = m.button?.text || m.interactive?.button_reply?.title;
         if (label && label.trim().toLowerCase() === OPT_OUT_LABEL.toLowerCase()) {
-          if (addOptOut(m.from)) log('warn', `opt-out — +${m.from} will be skipped from now on`);
+          // Campaigns only. The contact stays fully replyable in the inbox —
+          // someone who opted out of promotions and then asks a question still
+          // deserves an answer, and answering is not a marketing message.
+          if (disable(m.from, 'opt_out', profileName)) {
+            log('warn', `opt-out — +${m.from} will be skipped by campaigns from now on`);
+          }
         }
         broadcast();
       }

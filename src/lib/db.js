@@ -83,6 +83,38 @@ CREATE TABLE IF NOT EXISTS templates (
   created_at    INTEGER NOT NULL
 );
 
+-- One list with one switch. Before this table there were two — the CSV array in
+-- memory and a flat Set in opt-outs.json — and a person who was in both existed
+-- twice with no single row to look at.
+--
+-- Three things write the enabled column: the customer tapping the quick-reply button
+-- ('opt_out'), the operator clicking disable ('manual'), and a hard send failure
+-- ('failed_hard'). Keeping the compliance path costs nothing here and losing it
+-- is expensive: Meta drops the number's quality rating for messaging people who
+-- opted out, and quality gates the tier the warm-up ladder is climbing.
+CREATE TABLE IF NOT EXISTS contacts (
+  phone           TEXT PRIMARY KEY,       -- normalized dial string, no +
+  name            TEXT,
+  fields_json     TEXT,                   -- other CSV columns, verbatim
+  first_seen      INTEGER NOT NULL,
+  last_messaged   INTEGER,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  disabled_reason TEXT,                   -- 'manual' | 'opt_out' | 'failed_hard'
+  disabled_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_enabled ON contacts(enabled);
+
+-- Provenance. Which upload introduced which contacts, and what the file was.
+-- skipped_count is the number this app used to throw away in silence.
+CREATE TABLE IF NOT EXISTS csv_uploads (
+  id            INTEGER PRIMARY KEY,
+  uploaded_at   INTEGER NOT NULL,
+  filename      TEXT,
+  row_count     INTEGER NOT NULL,
+  new_count     INTEGER NOT NULL,   -- rows that were not already contacts
+  skipped_count INTEGER NOT NULL    -- rows with no usable phone number
+);
+
 CREATE TABLE IF NOT EXISTS campaign_runs (
   id         INTEGER PRIMARY KEY,
   started_at INTEGER NOT NULL,

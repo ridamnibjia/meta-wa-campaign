@@ -3,7 +3,7 @@ const express = require('express');
 const { CFG } = require('../config');
 const { S, flags, log, todayKey } = require('../state');
 const { broadcast } = require('../services/status');
-const { optOuts } = require('../services/optouts');
+const { isDisabled, markMessaged, getRow } = require('../services/contacts');
 const { W, effectiveCap } = require('../services/warmup');
 const { startRun, recordOutbound } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
@@ -34,8 +34,13 @@ router.post('/test-send', async (req, res) => {
   for (const n of raw) {
     const dialStr = normalizePhone(n);
     if (!dialStr) { results.push({ input: n, ok: false, error: 'Not a valid phone number' }); continue; }
-    // An opt-out is an opt-out even when you are only testing.
-    if (optOuts.has(dialStr)) { results.push({ input: n, dialStr, ok: false, error: 'This number has opted out' }); continue; }
+    // A disabled contact is disabled even when you are only testing.
+    if (isDisabled(dialStr)) {
+      const why = getRow(dialStr)?.disabled_reason || 'disabled';
+      results.push({ input: n, dialStr, ok: false,
+        error: why === 'opt_out' ? 'This number has opted out' : `This contact is disabled (${why})` });
+      continue;
+    }
     const contact = { name: req.body.name || 'there', phone: n, dialStr };
     log('info', `test send → +${dialStr}`);
     const r = await sendTemplate(contact);
@@ -43,6 +48,7 @@ router.post('/test-send', async (req, res) => {
       // Counted like any other send so the stat tiles walk accepted → delivered
       // → read in front of you; /api/start opens a new run before the campaign.
       S.dailyCount++;
+      markMessaged(dialStr);
       recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, r.params)
                              ?? `[template: ${S.config.templateName}]`,
