@@ -1,5 +1,5 @@
 'use strict';
-const { CFG, LIMITS } = require('../config');
+const { CFG, LIMITS, MEDIA_LIMITS } = require('../config');
 const { db } = require('../lib/db');
 const { log, emit } = require('../state');
 const { normalizePhone } = require('../lib/phone');
@@ -184,7 +184,7 @@ const pageOfMessages = db.prepare(`
   SELECT m.wamid, m.dir, m.type, m.body, m.at, m.rowid AS rid, m.status,
          m.error_code, m.error_title,
          md.media_id, md.mime_type, md.filename, md.file_size, md.path,
-         md.risk, md.risk_reason, md.scan_status, md.scan_signature
+         md.risk, md.risk_reason, md.scan_status, md.scan_signature, md.provisional
     FROM messages m
     LEFT JOIN media md ON md.wamid = m.wamid
    WHERE m.wa_id = ?
@@ -226,6 +226,9 @@ const toEntry = (r, now = Date.now()) => ({
     filename: r.filename,
     size:     r.file_size,
     saved:    !!r.path,
+    // Here to be looked at, not to be kept. The UI needs the difference so it
+    // can offer Keep and Discard instead of pretending the decision is made.
+    provisional: !!r.path && !!r.provisional,
     expired:  !r.path && (now - r.at) > INBOUND_TTL_MS,
     // A verdict is only meaningful once there are bytes to have a verdict
     // about. Reporting a tier for an unsaved row would put a red warning on a
@@ -288,6 +291,9 @@ function thread(waId, { now = Date.now(), before = null, limit = PAGE_SIZE } = {
     nextBefore: hasMore && page.length ? encodeCursor(page[page.length - 1]) : null,
     windowOpen: isWindowOpen({ lastInboundAt: t.last_inbound_at }, now),
     windowClosesAt: t.last_inbound_at ? t.last_inbound_at + WINDOW_MS : null,
+    // Once per thread, not once per attachment: the UI states this number in
+    // two places and neither should be a literal that drifts from config.
+    previewHours: MEDIA_LIMITS.previewHours,
   };
 }
 

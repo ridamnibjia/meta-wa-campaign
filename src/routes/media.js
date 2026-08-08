@@ -3,7 +3,8 @@ const express = require('express');
 const fs      = require('fs');
 const multer  = require('multer');
 const { MEDIA_KINDS, saveUpload, listAssets, getAsset, assetPath,
-        getInbound, inboundPath, saveInbound, rescanIfNeeded } = require('../services/media');
+        getInbound, inboundPath, saveInbound, rescanIfNeeded,
+        keepInbound, discardInbound } = require('../services/media');
 const { effectiveRisk } = require('../lib/filerisk');
 const { log } = require('../state');
 
@@ -57,11 +58,18 @@ router.get('/media/asset/:id', (req, res) => {
 //
 // An allowlist, not a denylist, for the same reason it always was: a denylist
 // of script-capable types is a guess about every browser's future behaviour.
-// PDF is deliberately absent — nothing renders one inline here.
+//
+// PDF is the one entry that is NOT reachable from tier `safe`. classify() caps
+// a PDF at `ok` — correctly, since a PDF is a document format with a scripting
+// engine behind it — so it previews under a narrower rule below rather than
+// through the general gate. The exception is worth it: operators were told to
+// download an invoice to their own machine to find out whether it was the
+// invoice, which puts the file in a desktop reader instead of a sandboxed tab.
 const INLINE_SAFE = new Set([
   'image/jpeg', 'image/png', 'image/webp', 'image/gif',
   'audio/aac', 'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/amr',
-  'video/mp4', 'video/3gpp',
+  'video/mp4', 'video/3gpp', 'video/quicktime', 'video/webm', 'video/x-matroska',
+  'application/pdf',
 ]);
 
 // WhatsApp voice notes arrive as "audio/ogg; codecs=opus". The allowlist holds
@@ -73,6 +81,30 @@ const bareMime = m => String(m || '').split(';')[0].trim().toLowerCase();
 // so the bytes only ever land on this server because someone asked for them.
 router.post('/media/inbound/:mediaId', async (req, res) => {
   const r = await saveInbound(req.params.mediaId);
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+// The same fetch, on a shorter clock. An operator cannot decide whether a file
+// is worth keeping without looking at it, and they cannot look at it while it
+// is still on Meta's servers behind a token the browser does not have. So the
+// bytes come here first — scanned and classified exactly as a Save is, because
+// the risk is in the file and not in the button that asked for it — and the
+// retention sweep removes them in hours unless someone says Keep.
+router.post('/media/inbound/:mediaId/preview', async (req, res) => {
+  const r = await saveInbound(req.params.mediaId, { provisional: true });
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+router.post('/media/inbound/:mediaId/keep', (req, res) => {
+  const r = keepInbound(req.params.mediaId);
+  if (r.ok) log('info', `Operator kept inbound media ${req.params.mediaId}`);
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+// DELETE, because it deletes. The service refuses to touch anything an operator
+// has already kept, so the worst this can do is undo a preview.
+router.delete('/media/inbound/:mediaId', (req, res) => {
+  const r = discardInbound(req.params.mediaId);
   res.status(r.ok ? 200 : 400).json(r);
 });
 
@@ -131,7 +163,19 @@ router.get('/media/inbound/:mediaId', async (req, res) => {
   // dashboard with the operator's own session cookie attached. So inline needs
   // the tier AND the allowlist to agree; everything else is opaque bytes.
   const bare   = bareMime(row.mime_type);
-  const inline = risk === 'safe' && INLINE_SAFE.has(bare) && !req.query.download;
+
+  // The one tier-`ok` exception, kept narrow on purpose. `row.risk` is the RAW
+  // column, not effectiveRisk: a NULL tier also reads as `ok`, and a row saved
+  // before classification existed has no evidence behind it — only a default.
+  // Requiring both means the bytes were actually sniffed AND the scan was not
+  // floored to `warn` for being oversize.
+  //
+  // What makes this safe is the sandbox header below, which is already sent on
+  // every response from this route: `sandbox` with no allow- tokens puts the
+  // document in a unique opaque origin, so the browser's PDF viewer cannot
+  // reach this origin's cookies, storage or DOM even if the file is hostile.
+  const pdfPreview = bare === 'application/pdf' && row.risk === 'ok' && risk === 'ok';
+  const inline = (risk === 'safe' || pdfPreview) && INLINE_SAFE.has(bare) && !req.query.download;
 
   res.type(inline ? bare : 'application/octet-stream');
   // nosniff, because without it a browser will happily ignore

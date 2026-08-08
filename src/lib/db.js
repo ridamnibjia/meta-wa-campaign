@@ -216,6 +216,14 @@ function openDb(file) {
   addColumn(d, 'media', 'scan_status',    'TEXT');
   addColumn(d, 'media', 'scan_signature', 'TEXT');
   addColumn(d, 'media', 'scan_at',        'INTEGER');
+  // A file fetched to be LOOKED at, not to be kept. It has been scanned and
+  // classified like any other — the flag says nothing about safety, only that
+  // no operator has yet said "keep this", so the retention sweep removes it in
+  // hours rather than in 90 days.
+  //
+  // DEFAULT 0 is the safe direction for an ALTER on a live table: every row
+  // that already exists was saved deliberately, and reads as kept.
+  addColumn(d, 'media', 'provisional',    'INTEGER NOT NULL DEFAULT 0');
   // A failure that was about the MOMENT rather than about the number gets
   // rescheduled instead of dropped: skipped_reason = 'retry' plus the wall-clock
   // time it becomes pending again. Both live on the queue row rather than in the

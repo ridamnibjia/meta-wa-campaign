@@ -102,6 +102,11 @@ const MEDIA_LIMITS = {
   maxBytes:      num(process.env.WA_MEDIA_MAX_BYTES,      100 * 1024 * 1024),
   minFreeBytes:  num(process.env.WA_MEDIA_MIN_FREE_BYTES, 2 * 1024 * 1024 * 1024),
   retentionDays: num(process.env.WA_MEDIA_RETENTION_DAYS, 90),
+  // How long a previewed-but-not-kept file stays on disk. Long enough that an
+  // operator can look at something, get pulled away, and still find it after
+  // lunch; short enough that browsing a thread does not quietly build a
+  // permanent archive of every file anyone ever sent.
+  previewHours:  num(process.env.WA_MEDIA_PREVIEW_HOURS, 24),
 };
 
 // Files uploaded for use as a template header. Separate from MEDIA_DIR, which

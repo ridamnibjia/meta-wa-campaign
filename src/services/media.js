@@ -240,11 +240,16 @@ const inboundRow = db.prepare(`
 const setInboundFile = db.prepare(`
   UPDATE media SET path = ?, downloaded_at = ?,
                    risk = ?, risk_reason = ?, sniffed_mime = ?,
-                   scan_status = ?, scan_signature = ?, scan_at = ?
+                   scan_status = ?, scan_signature = ?, scan_at = ?,
+                   provisional = ?
    WHERE media_id = ?`);
 const setInboundVerdict = db.prepare(
   'UPDATE media SET scan_status = ?, scan_signature = ?, scan_at = ? WHERE media_id = ?');
-const clearInboundFile = db.prepare('UPDATE media SET path = NULL WHERE media_id = ?');
+// provisional goes back to 0 alongside the path: a row with no bytes is not
+// "provisionally saved", it is simply not saved, and leaving the flag set would
+// hand the next preview a row that already looks decided.
+const clearInboundFile = db.prepare('UPDATE media SET path = NULL, provisional = 0 WHERE media_id = ?');
+const setKept          = db.prepare('UPDATE media SET provisional = 0 WHERE media_id = ?');
 
 // Every row sharing these bytes is the same malware, so they are condemned
 // together. Clearing only the row that happened to be requested would leave a
@@ -268,6 +273,45 @@ const pathIsShared = row => !!row.path && siblingCount.get(row.path, row.media_i
 // Same rule as assetPath: the row stores a bare filename so WA_MEDIA_DIR can
 // move the whole store without rewriting a single row.
 const inboundPath = row => path.join(MEDIA_DIR, row.path);
+
+// The ONE place inbound bytes are unlinked. Three callers now want to delete a
+// file — the 90-day sweep, the preview sweep, and an operator clicking Discard
+// — and every one of them needs the same two guards, so they share the code
+// rather than each remembering:
+//
+//   1. A file shared with a sibling row is never unlinked. Files are named for
+//      their own sha256, so one forwarded photo is two rows over one file.
+//      Unlinking for one would leave the other claiming `saved` and 404ing.
+//   2. A `path` that resolves outside MEDIA_DIR is a bug or a tampered row.
+//      This function deletes things, so it does not take the column on trust.
+//
+// Returns rather than throws: every caller has to turn the outcome into either
+// a log line or a sentence for an operator.
+function dropBytes(row) {
+  if (!row || !row.path) return { removed: false, freed: 0, shared: false };
+
+  const file = inboundPath(row);
+  const dir  = path.resolve(MEDIA_DIR);
+  const rel  = path.relative(dir, path.resolve(file));
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { removed: false, freed: 0, shared: false,
+             error: `the path stored for ${row.media_id} resolves outside the media directory` };
+  }
+
+  // The row retires, the bytes stay. The last row out deletes the file.
+  if (pathIsShared(row)) {
+    clearInboundFile.run(row.media_id);
+    return { removed: false, freed: 0, shared: true };
+  }
+
+  // A file that is already gone is the end state this is trying to reach, not a
+  // failure — so size it first and treat a missing one as zero bytes freed.
+  let freed = 0;
+  try { freed = fs.statSync(file).size; } catch { /* already gone */ }
+  fs.rmSync(file, { force: true });
+  clearInboundFile.run(row.media_id);
+  return { removed: true, freed, shared: false };
+}
 
 // Computed, never stored. Meta deletes the file 30 days after the message, so
 // the deadline is a property of the message we already have the timestamp for —
@@ -300,9 +344,17 @@ function freeBytes(dir) {
 // here, in this order, because each step costs more than the one before it:
 // size cap → free-space guard → download → checksum → virus scan →
 // classification → write.
-async function saveInbound(mediaId) {
+// `provisional` changes exactly one thing: which clock the retention sweep runs
+// against this row. Every check below — the size cap, the free-space guard, the
+// checksum, the virus scan, the classification — happens either way, because a
+// file an operator is only LOOKING at is still a file that arrived on this
+// machine from a stranger. The flag is about storage policy, never about trust.
+async function saveInbound(mediaId, { provisional = false } = {}) {
   const row = getInbound(mediaId);
   if (!row) return { ok: false, error: `No inbound media found for ${mediaId}` };
+  // Already here. A Preview on a kept file must not demote it back to
+  // provisional and put a 24-hour clock on something an operator kept on
+  // purpose, so this returns the row as it stands rather than re-stamping it.
   if (row.path) return { ok: true, media: row, already: true };
   // Terminal, and deliberately checked before the expiry and token checks: a
   // file we have already identified as malware must not be re-fetched just
@@ -385,13 +437,51 @@ async function saveInbound(mediaId) {
     // readable by every other account on it.
     fs.writeFileSync(path.join(MEDIA_DIR, name), buf, { mode: 0o600 });
     setInboundFile.run(name, Date.now(), verdict.tier, verdict.reason, verdict.sniffed,
-      scan.status, scan.signature, Date.now(), row.media_id);
+      scan.status, scan.signature, Date.now(), provisional ? 1 : 0, row.media_id);
 
-    log('info', `Saved inbound ${row.mime_type || 'file'} from message ${row.wamid} — risk ${verdict.tier}, scan ${scan.status}`);
-    return { ok: true, media: getInbound(mediaId), risk: verdict.tier };
+    log('info', `${provisional ? 'Fetched' : 'Saved'} inbound ${row.mime_type || 'file'} from message ${row.wamid}`
+              + ` — risk ${verdict.tier}, scan ${scan.status}${provisional ? ', not kept' : ''}`);
+    return { ok: true, media: getInbound(mediaId), risk: verdict.tier, provisional: !!provisional };
   } catch (e) {
     return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
   }
+}
+
+// The two halves of the decision a preview exists to enable.
+function keepInbound(mediaId) {
+  const row = getInbound(mediaId);
+  if (!row) return { ok: false, error: `No inbound media found for ${mediaId}` };
+  if (!row.path) {
+    return { ok: false, error: 'There is nothing on this server to keep — preview or save it first.' };
+  }
+  setKept.run(row.media_id);
+  log('info', `Kept inbound media ${row.media_id} — it now falls under the ${MEDIA_LIMITS.retentionDays}-day retention window`);
+  return { ok: true, media: getInbound(mediaId) };
+}
+
+// Deliberately refuses a kept file. Discard is the other half of Preview — it
+// undoes a fetch nobody committed to — and an operator who has already said
+// "keep this" should not lose it to the same button in a thread they are
+// scrolling quickly.
+//
+// ponytail: no "delete a kept file" path at all. Nobody has asked for one, and
+// the 90-day sweep already removes them. Add a route with its own confirmation
+// if a real deployment needs it.
+function discardInbound(mediaId) {
+  const row = getInbound(mediaId);
+  if (!row) return { ok: false, error: `No inbound media found for ${mediaId}` };
+  if (!row.path) return { ok: true, media: row, already: true };
+  if (!row.provisional) {
+    return { ok: false, error: 'This file was kept on purpose, so Discard will not remove it. It goes automatically at the end of its retention window.' };
+  }
+
+  const r = dropBytes(row);
+  if (r.error) {
+    log('warn', `Refused to discard media ${row.media_id}: ${r.error}`);
+    return { ok: false, error: 'This file could not be removed — the server logged why. Nothing was deleted.' };
+  }
+  log('info', `Discarded inbound media ${row.media_id}${r.shared ? ' (bytes kept — another message shares them)' : ''}`);
+  return { ok: true, media: getInbound(mediaId) };
 }
 
 // A file saved before ClamAV was installed is marked `skipped` forever, which
@@ -435,5 +525,5 @@ module.exports = {
   MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, headerComponent,
   INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound, rescanIfNeeded,
-  pathIsShared, clearInboundFile,
+  pathIsShared, clearInboundFile, dropBytes, keepInbound, discardInbound,
 };

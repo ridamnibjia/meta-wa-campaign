@@ -41,6 +41,7 @@ const {
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
   saveInbound, inboundPath, getInbound, INBOUND_TTL_MS, rescanIfNeeded, sweepMedia,
+  keepInbound, discardInbound,
   classify, sniff, extOf, worst, TIERS,
   scanBuffer, parseReply, scannerConfigured, EICAR,
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
@@ -3227,11 +3228,50 @@ console.log('\ninbound media — save, serve, expire');
     });
 
     testAsync('an ok file downloads as an attachment', async () => {
-      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: 'invoice.pdf' });
+      const id = await savedFile({ mime: 'text/plain', type: 'document', filename: 'notes.txt' });
       setRisk(id, 'ok');
       const r = await get(id);
       assert.equal(r.status, 200);
       assert.match(r.headers.get('content-disposition'), /^attachment/);
+    });
+
+    // PDF is the single exception to "only tier safe renders inline". It is
+    // narrow by construction, and each of these asserts one edge of it.
+    testAsync('a classified ok PDF previews inline, sandboxed', async () => {
+      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: 'invoice.pdf' });
+      setRisk(id, 'ok');
+      const r = await get(id);
+      assert.equal(r.status, 200);
+      assert.match(r.headers.get('content-disposition'), /^inline/,
+        'an operator should not have to download an invoice to find out whether it is the invoice');
+      assert.match(r.headers.get('content-type'), /application\/pdf/);
+      assert.match(r.headers.get('content-security-policy'), /sandbox/,
+        'the sandbox is the whole reason this exception is affordable');
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+    });
+
+    testAsync('the PDF exception does not extend to an unclassified row', async () => {
+      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: 'legacy.pdf' });
+      db.prepare('UPDATE media SET risk = NULL WHERE media_id = ?').run(id);
+      const r = await get(id);
+      assert.match(r.headers.get('content-disposition'), /^attachment/,
+        'NULL reads as ok, but nothing ever looked at these bytes — that is a default, not evidence');
+    });
+
+    testAsync('an oversize scan takes the PDF preview away too', async () => {
+      const id = await savedFile({ mime: 'application/pdf', type: 'document', filename: 'big.pdf' });
+      setRisk(id, 'ok', 'oversize');
+      const r = await get(id);
+      assert.match(r.headers.get('content-disposition'), /^attachment/,
+        'a file too big for the scanner is a file nobody vouched for, PDF or not');
+    });
+
+    testAsync('the PDF exception is keyed on the mime, not on the tier alone', async () => {
+      const id = await savedFile({ mime: 'application/msword', type: 'document', filename: 'memo.doc' });
+      setRisk(id, 'ok');
+      const r = await get(id);
+      assert.match(r.headers.get('content-disposition'), /^attachment/,
+        'opening tier ok for PDF must not open it for every other document format');
     });
 
     testAsync('a warn file is always opaque bytes, never its declared type', async () => {
@@ -3384,6 +3424,111 @@ console.log('\ninbound media — save, serve, expire');
         sweepMedia();
         assert.equal(getInbound(id).path, null);
       } finally { MEDIA_LIMITS.retentionDays = saved; }
+    });
+
+    // ── Preview: fetched to be looked at, not to be kept ──────────────────────
+    // The whole point of the flag is that it changes the CLOCK and nothing else.
+    // Each of these pins one half of that sentence.
+    const HOUR = 60 * 60 * 1000;
+
+    const previewOne = async (opts = {}) => {
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
+                                   Buffer.from(`p${Date.now()}${Math.random()}`)]);
+      const id = seedInbound({ bytes, ...opts });
+      await withoutScanner(() => withToken(() =>
+        withMeta(metaOk(bytes, opts.mime), () => saveInbound(id, { provisional: true }))));
+      return id;
+    };
+
+    testAsync('a previewed file is still scanned and classified like any other', async () => {
+      const id = await previewOne();
+      const row = getInbound(id);
+      assert.equal(row.provisional, 1, 'it is on the short clock');
+      assert.equal(row.risk, 'safe', 'but it went through classify() all the same');
+      assert.ok(row.risk_reason, 'and carries the sentence the UI renders');
+      assert.ok(row.path, 'the bytes are genuinely here — a preview cannot render what was not fetched');
+    });
+
+    testAsync('a preview nobody keeps is swept in hours, not days', async () => {
+      const id = await previewOne();
+      const file = inboundPath(getInbound(id));
+      age(id, MEDIA_LIMITS.previewHours * HOUR + HOUR);
+
+      sweepMedia();
+      assert.ok(!fsm.existsSync(file), 'browsing a thread must not quietly build a permanent archive');
+      assert.equal(getInbound(id).path, null);
+    });
+
+    testAsync('a preview inside its window survives the 90-day sweep', async () => {
+      const id = await previewOne();
+      age(id, 1 * HOUR);
+      sweepMedia();
+      assert.ok(getInbound(id).path, 'an operator who looked an hour ago is still looking');
+    });
+
+    testAsync('Keep moves a preview onto the 90-day clock', async () => {
+      const id = await previewOne();
+      assert.equal(keepInbound(id).ok, true);
+      assert.equal(getInbound(id).provisional, 0);
+
+      age(id, MEDIA_LIMITS.previewHours * HOUR + HOUR);
+      sweepMedia();
+      assert.ok(getInbound(id).path, 'the short clock must not still apply to a file someone kept');
+    });
+
+    testAsync('Discard removes the bytes and reverts the bubble', async () => {
+      const id = await previewOne();
+      const file = inboundPath(getInbound(id));
+      assert.equal(discardInbound(id).ok, true);
+      assert.ok(!fsm.existsSync(file));
+
+      const row = getInbound(id);
+      assert.equal(row.path, null);
+      assert.equal(row.provisional, 0, 'a row with no bytes is not "provisionally saved", it is unsaved');
+    });
+
+    testAsync('Discard refuses a file that was kept on purpose', async () => {
+      const id = await previewOne();
+      keepInbound(id);
+      const file = inboundPath(getInbound(id));
+
+      const r = discardInbound(id);
+      assert.equal(r.ok, false);
+      assert.match(r.error, /kept on purpose/);
+      assert.ok(fsm.existsSync(file), 'the one thing this must never do is delete a kept file');
+    });
+
+    testAsync('Discard leaves bytes a second message still points at', async () => {
+      // Same bytes, two media rows — a forwarded photo. Files are named for
+      // their own sha256, so both rows are one file on disk.
+      const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from('shared-preview')]);
+      const a = seedInbound({ bytes });
+      const b = seedInbound({ bytes });
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () => saveInbound(a))));
+      await withoutScanner(() => withToken(() => withMeta(metaOk(bytes), () =>
+        saveInbound(b, { provisional: true }))));
+
+      const file = inboundPath(getInbound(a));
+      assert.equal(discardInbound(b).ok, true);
+      assert.equal(getInbound(b).path, null, 'the discarded row lets go');
+      assert.ok(fsm.existsSync(file), 'but the kept row must not be left 404ing on click');
+      assert.ok(getInbound(a).path, 'and must still claim the file');
+    });
+
+    testAsync('Preview on an already-kept file does not demote it', async () => {
+      const id = await saveOne();
+      const r = await withoutScanner(() => withToken(() =>
+        withMeta(metaOk(Buffer.from('x')), () => saveInbound(id, { provisional: true }))));
+      assert.equal(r.ok, true);
+      assert.equal(getInbound(id).provisional, 0,
+        'a Preview click must not put a 24-hour clock on something kept on purpose');
+    });
+
+    testAsync('Keep refuses a row with nothing on disk', () => {
+      const id = seedInbound({ bytes: Buffer.from([0xff, 0xd8, 0xff, 0x01]) });
+      const r = keepInbound(id);
+      assert.equal(r.ok, false);
+      assert.match(r.error, /preview or save it first/);
     });
 
     testAsync('a swept file can be saved again from Meta', async () => {
@@ -3628,6 +3773,29 @@ console.log('\nfile risk classification');
   test('a voice note with codec parameters still classifies safe', () => {
     const ogg = Buffer.from('OggS\x00\x02\x00\x00');
     assert.equal(classify({ mime: 'audio/ogg; codecs=opus', filename: undefined, bytes: ogg }).tier, 'safe');
+  });
+
+  // A video shared as a document keeps the container it was recorded in. Both
+  // of these mimes were missing from the table, so they voted `ok` as
+  // unrecognised — and a video that can never reach `safe` can never preview,
+  // however clean its bytes are.
+  test('a quicktime video from an iPhone classifies safe', () => {
+    const mov = Buffer.concat([Buffer.from([0, 0, 0, 0x14]), Buffer.from('ftypqt  ')]);
+    const v = classify({ mime: 'video/quicktime', filename: 'IMG_4021.mov', bytes: mov });
+    assert.equal(v.tier, 'safe', 'a .mov that sniffs as an ISO container has evidence from all three signals');
+    assert.equal(v.sniffed, 'mp4');
+  });
+
+  test('a webm video classifies safe on its EBML header', () => {
+    const webm = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('\x01\x00\x00\x00')]);
+    const v = classify({ mime: 'video/webm', filename: 'clip.webm', bytes: webm });
+    assert.equal(v.tier, 'safe');
+    assert.equal(v.sniffed, 'ebml');
+  });
+
+  test('a webm name over executable bytes is still blocked', () => {
+    assert.equal(classify({ mime: 'video/webm', filename: 'clip.webm', bytes: mz }).tier, 'block',
+      'adding a container to the safe list must not buy anything past the byte check');
   });
 
   test('safe needs all three signals — unrecognised bytes demote to ok', () => {

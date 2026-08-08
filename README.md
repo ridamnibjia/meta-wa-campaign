@@ -951,7 +951,23 @@ that: files this app did not create, from people you may never have met.
 
 **Nothing downloads automatically.** The webhook records a *descriptor* — media
 id, mime type, filename, size, checksum — and stops there. The bytes only reach
-this server when an operator clicks **Save** on that specific attachment.
+this server when an operator asks for that specific attachment.
+
+There are two ways to ask, and they differ in one thing only:
+
+| Button | What it does | How long the copy lasts |
+|---|---|---|
+| **Preview** | Fetches the file so you can look at it before deciding | Hours (`WA_MEDIA_PREVIEW_HOURS`, default 24) unless you press **Keep** |
+| **Save** | Fetches the file and commits to it | 90 days (`WA_MEDIA_RETENTION_DAYS`) |
+
+A previewed file is size-capped, checksummed, virus-scanned and classified
+exactly as a saved one is — the risk lives in the file, not in which button
+asked for it. The only difference is which clock the retention sweep runs
+against it. **Keep** moves it onto the 90-day clock; **Discard** removes it now.
+
+This is also why **Download** appears only after the file is here. Before that,
+the bytes are still on WhatsApp's servers behind an access token your browser
+does not have, so there is nothing for a download link to point at.
 
 #### Files are classified from three signals, not one
 
@@ -1048,7 +1064,11 @@ so turning scanning on later still covers what is already on disk.
 |---|---|---|
 | Meta's copy | **30 days** from the message | Meta. Nothing you can do about it. |
 | Your saved copy | **90 days** from download (`WA_MEDIA_RETENTION_DAYS`) | This app, swept on boot and daily. |
+| A preview you never kept | **24 hours** (`WA_MEDIA_PREVIEW_HOURS`) | The same sweep, on a shorter cutoff. |
 | The chat itself | Indefinite | Never swept — message history is not media. |
+
+The preview clock is what stops browsing a thread from quietly building a
+permanent archive of every file anyone ever sent you.
 
 When a file is swept, only the bytes go: the message and its attachment row
 survive, and the bubble reverts to a **Save** button. If the message is by then

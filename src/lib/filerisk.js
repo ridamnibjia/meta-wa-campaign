@@ -26,6 +26,11 @@ const MIME_TIER = new Map(Object.entries({
   'image/jpeg': 'safe', 'image/png': 'safe', 'image/webp': 'safe', 'image/gif': 'safe',
   'audio/aac': 'safe', 'audio/mpeg': 'safe', 'audio/mp4': 'safe', 'audio/ogg': 'safe',
   'audio/amr': 'safe', 'video/mp4': 'safe', 'video/3gpp': 'safe',
+  // A video shared as a document keeps its original container. iPhone sends
+  // video/quicktime and Android browsers send video/webm; both were absent, so
+  // they voted `ok` as unrecognised and could never preview however clean their
+  // bytes were. Every browser this dashboard supports plays both.
+  'video/quicktime': 'safe', 'video/webm': 'safe', 'video/x-matroska': 'safe',
 
   'application/pdf': 'ok', 'text/plain': 'ok',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'ok',
@@ -63,7 +68,7 @@ const MIME_TIER = new Map(Object.entries({
 // app hard-codes an extension.
 const EXT_TIER = new Map();
 const put = (tier, list) => list.split(' ').forEach(e => EXT_TIER.set('.' + e, tier));
-put('safe',  'jpg jpeg png webp gif mp3 m4a aac ogg oga opus amr mp4 3gp 3gpp mov wav');
+put('safe',  'jpg jpeg png webp gif mp3 m4a aac ogg oga opus amr mp4 3gp 3gpp mov webm mkv wav');
 put('ok',    'pdf txt docx xlsx pptx odt ods odp');
 put('warn',  'zip rar 7z gz tgz tar bz2 xz csv rtf xml doc xls ppt docm xlsm pptm dotm xltm xlsb');
 put('block', 'exe msi bat cmd com scr pif vbs vbe js jse mjs wsf wsh ps1 psm1 jar apk '
@@ -118,7 +123,11 @@ const MAGIC = [
   ['mp3',  0, B('ID3')],
   ['mp3',  0, B([0xff, 0xfb])],
   ['wav',  8, B('WAVE')],
-  ['mp4',  4, B('ftyp')],
+  ['mp4',  4, B('ftyp')],   // also .mov and .3gp — same ISO base media container
+  // EBML, which is webm and mkv alike. The bytes cannot tell those two apart
+  // any more than PK can tell docx from apk, but unlike zip both readings are
+  // video, so there is no tie for the extension to break.
+  ['ebml', 0, B([0x1a, 0x45, 0xdf, 0xa3])],
 ];
 
 // Markup is the reason this whole module exists, so it gets a looser test than
@@ -139,7 +148,7 @@ const SNIFF_TIER = {
   rar: 'warn', '7z': 'warn', gzip: 'warn', ole2: 'warn', rtf: 'warn',
   pdf: 'ok',
   jpeg: 'safe', png: 'safe', gif: 'safe', webp: 'safe',
-  ogg: 'safe', mp3: 'safe', wav: 'safe', amr: 'safe', mp4: 'safe',
+  ogg: 'safe', mp3: 'safe', wav: 'safe', amr: 'safe', mp4: 'safe', ebml: 'safe',
   // zip is decided by the extension — see zipTier below.
 };
 

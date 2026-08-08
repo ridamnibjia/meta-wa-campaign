@@ -25,11 +25,59 @@ const RISK_COPY = {
   block: 'This file type can run code on your computer. We will not preview it.',
 };
 
-function Attachment({ media, onSaved }) {
+// Message types that carry no attachment and no text of their own. describe()
+// in services/inbox.js stores them as "[location]" — honest, and compact enough
+// for a search index, but on the bubble it reads like this app broke rather
+// than like a WhatsApp limitation.
+//
+// Keyed on the type rather than rewritten into the body, so every message
+// already in the database reads correctly too. Backfilling bodies would be a
+// migration run for the sake of wording.
+//
+// `unsupported` is Meta's own type, not ours: the Cloud API refuses to relay
+// view-once media, polls, live location and a few newer formats, and sends this
+// in their place with error 131051. There is no media id in that envelope, so
+// there is nothing to save and nothing to preview — only something to tell the
+// customer.
+const TYPE_NOTE = {
+  unsupported: ['Unsupported message',
+    "WhatsApp could not relay this one — usually a view-once photo, a poll, or live location. "
+    + 'Ask them to resend it as an ordinary photo or file.'],
+  location: ['Location',     'Shared a location.'],
+  contacts: ['Contact card', 'Shared a contact card.'],
+  order:    ['Cart order',   'Sent a cart order.'],
+  system:   ['System notice', 'WhatsApp changed something about this chat — a new number, or a new security code.'],
+};
+
+// The stored body for these is exactly "[type]". Matching that shape rather
+// than the type column keeps this to one place: the thread list is served by a
+// summary query that returns a preview string and no type at all.
+const relabel = s => String(s || '').replace(/^\[(\w+)\]$/, (m, t) => TYPE_NOTE[t]?.[0] || m);
+
+// Open and Download under every preview. The preview answers "what is this";
+// these answer "and now what". Without them the only route to the bytes was a
+// right-click on a <video>, which several browsers answer with nothing at all.
+const MediaLinks = ({ src, size }) => (
+  <p className="mt-0.5 flex items-center gap-3 text-[10px] text-muted-foreground">
+    {size ? <span>{fileSize(size)}</span> : null}
+    <a href={src} target="_blank" rel="noreferrer"
+       className="text-primary underline-offset-4 hover:underline">Open</a>
+    <a href={`${src}?download=1`}
+       className="text-primary underline-offset-4 hover:underline">Download</a>
+  </p>
+);
+
+function Attachment({ media, onSaved, previewHours }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  // PDF previews on request, not on render: a thread with forty invoices in it
+  // should not hand forty documents to the browser's PDF viewer on scroll.
+  const [open, setOpen] = useState(false);
   const src = `/api/media/inbound/${encodeURIComponent(media.mediaId)}`;
   const kind = (media.mime || '').split('/')[0];
+  // WhatsApp voice notes arrive as "audio/ogg; codecs=opus" — the parameters
+  // come off before any comparison, exactly as they do server-side.
+  const bare = (media.mime || '').split(';')[0].trim().toLowerCase();
   const label = media.filename || `${kind || 'file'} attachment`;
   const icon = kind === 'image' ? '▣' : kind === 'video' ? '▶' : kind === 'audio' ? '♪' : '▤';
 
@@ -41,28 +89,53 @@ function Attachment({ media, onSaved }) {
     );
   }
 
+  // One helper for every button that talks to the server about this file. They
+  // all share the same three states — busy, failed with a sentence, reload —
+  // and three copies of that was three places to forget the error branch.
+  const act = (fn, fallbackError) => async () => {
+    setSaving(true); setError('');
+    const r = await fn().catch(() => ({ ok: false, error: 'Network error' }));
+    setSaving(false);
+    if (!r.ok) return setError(r.error || fallbackError);
+    onSaved();
+  };
+
+  const fetchToPreview = act(() => api.post(`${src}/preview`), 'Could not fetch this file');
+  const keep           = act(() => api.post(`${src}/keep`),    'Could not keep this file');
+  const discard        = act(() => api.del(src),               'Could not remove this file');
+
   if (!media.saved) {
-    const save = async () => {
-      setSaving(true); setError('');
-      const r = await api.post(src).catch(() => ({ ok: false, error: 'Network error' }));
-      setSaving(false);
-      if (!r.ok) return setError(r.error || 'Could not save this file');
-      onSaved();
-    };
+    // Two buttons, one fetch, different clocks. Preview brings the bytes here
+    // to be looked at and removed again; Save commits to the retention window.
+    // Neither can render anything before the file has been scanned and
+    // classified, which is why there is no third "just show it" button.
     return (
       <div className="mb-1">
         <div className="flex items-center gap-2 rounded border border-border bg-background/60 px-2 py-1.5">
           <span className="text-base leading-none">{icon}</span>
           <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
           {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
-          <Button size="sm" variant="outline" disabled={saving} onClick={save}>
-            {saving ? 'Saving…' : 'Save'}
+          <Button size="sm" variant="outline" disabled={saving} onClick={fetchToPreview}>
+            {saving ? 'Fetching…' : 'Preview'}
+          </Button>
+          <Button size="sm" variant="outline" disabled={saving}
+                  onClick={act(() => api.post(src), 'Could not save this file')}>
+            Save
           </Button>
         </div>
+        <p className="mt-1 text-[10px] text-muted-foreground">
+          Nothing is fetched from WhatsApp until you ask. Preview brings a copy here to look at;
+          Save keeps it.
+        </p>
         {error && <p className="mt-1 text-[11px] font-medium text-destructive">{error}</p>}
       </div>
     );
   }
+
+  // Everything from here down renders bytes that are already on this server.
+  // It is a function so the "not kept yet" footer can wrap whichever branch
+  // fires, instead of five branches each remembering to include it.
+  const body = () => {
 
   // Saved, but the server will not hand it over without an explicit acceptance.
   // The confirm() IS the gate on this side: two deliberate clicks, and what
@@ -100,23 +173,86 @@ function Attachment({ media, onSaved }) {
   // The server would refuse to render anything else anyway; matching it here is
   // what stops the UI requesting an <img> that comes back as a download.
   if (media.risk === 'safe') {
-    if (kind === 'image') {
-      return (
-        <a href={src} target="_blank" rel="noreferrer" className="mb-1 block">
-          <img src={src} alt={label} className="max-h-[260px] max-w-full rounded" />
-        </a>
-      );
-    }
-    if (kind === 'video') return <video src={src} controls className="mb-1 max-h-[260px] max-w-full rounded" />;
-    if (kind === 'audio') return <audio src={src} controls className="mb-1 w-full" />;
+    // preload="metadata", not auto: a thread of videos would otherwise pull
+    // every one of them off this server the moment the transcript renders.
+    const preview =
+      kind === 'image' ? <img src={src} alt={label} className="max-h-[260px] max-w-full rounded" />
+      : kind === 'video' ? <video src={src} controls preload="metadata" className="max-h-[260px] max-w-full rounded" />
+      : kind === 'audio' ? <audio src={src} controls preload="metadata" className="w-full" />
+      : null;
+    if (preview) return <div className="mb-1">{preview}<MediaLinks src={src} size={media.size} /></div>;
   }
 
+  // PDF is the one type that previews from tier `ok` rather than `safe`, under
+  // a rule of its own in routes/media.js. Matching that rule here — the exact
+  // tier, and the exact mime — is what stops this asking for an embed the
+  // server would answer with a download.
+  if (media.risk === 'ok' && bare === 'application/pdf') {
+    return (
+      <div className="mb-1">
+        <div className="flex items-center gap-2 rounded border border-border bg-background/60 px-2 py-1.5">
+          <span className="text-base leading-none">{icon}</span>
+          <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
+          {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
+          <Button size="sm" variant="outline" onClick={() => setOpen(o => !o)}>
+            {open ? 'Hide' : 'Preview'}
+          </Button>
+        </div>
+        {open && (
+          <>
+            <object data={src} type="application/pdf"
+                    className="mt-1 h-[70vh] w-full rounded border border-border">
+              {/* Rendered only where the browser refuses to embed a PDF at all.
+                  The link is the whole point of the fallback — without it the
+                  operator gets an empty box and no way forward. */}
+              <p className="p-3 text-xs text-muted-foreground">
+                This browser will not preview PDFs inline.{' '}
+                <a href={src} target="_blank" rel="noreferrer"
+                   className="text-primary underline-offset-4 hover:underline">Open it in a new tab</a> instead.
+              </p>
+            </object>
+            <MediaLinks src={src} />
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // Anything with no preview of its own: a docx, a spreadsheet, a plain text
+  // file. Open alongside Download because some of these the browser can in fact
+  // display, and the operator is better placed to know which.
   return (
     <div className="mb-1 flex items-center gap-2 rounded border border-border bg-background/60 px-2 py-1.5">
       <span className="text-base leading-none">{icon}</span>
       <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
       {media.size ? <span className="text-[10px] text-muted-foreground">{fileSize(media.size)}</span> : null}
+      <a href={src} target="_blank" rel="noreferrer"
+         className="text-xs text-primary underline-offset-4 hover:underline">Open</a>
       <a href={`${src}?download=1`} className="text-xs text-primary underline-offset-4 hover:underline">Download</a>
+    </div>
+  );
+
+  };
+
+  // Fetched to be looked at, and not yet kept. The bar is the decision itself:
+  // without it a preview would quietly become storage, which is the thing the
+  // provisional flag exists to prevent.
+  return (
+    <div>
+      {body()}
+      {media.provisional && (
+        <div className="mb-1 flex flex-wrap items-center gap-2 rounded border border-dashed border-border px-2 py-1.5">
+          <span className="min-w-0 flex-1 text-[11px] text-muted-foreground">
+            Not kept — this copy is removed automatically
+            {previewHours ? ` in ${previewHours} hours` : ' shortly'}.
+          </span>
+          <Button size="sm" variant="outline" disabled={saving} onClick={keep}>
+            {saving ? 'Working…' : 'Keep'}
+          </Button>
+          <Button size="sm" variant="ghost" disabled={saving} onClick={discard}>Discard</Button>
+        </div>
+      )}
+      {error && <p className="mb-1 text-[11px] font-medium text-destructive">{error}</p>}
     </div>
   );
 }
@@ -124,7 +260,7 @@ function Attachment({ media, onSaved }) {
 // One popover on the thread header, not one per bubble. Everything an operator
 // needs to know about where these files live and how long they last is the same
 // for every attachment in the thread, so repeating it forty times is noise.
-function MediaInfo() {
+function MediaInfo({ previewHours }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="relative shrink-0">
@@ -143,16 +279,28 @@ function MediaInfo() {
             <p className="mb-2 text-xs font-semibold">Attachments in this thread</p>
             <dl className="space-y-2 text-[11px] leading-snug text-muted-foreground">
               <div>
+                <dt className="font-medium text-foreground">Preview</dt>
+                <dd>
+                  Brings a copy here so you can look at it before deciding. It is virus-scanned and
+                  checked on the way in, exactly as a save is, and removed again after
+                  {previewHours ? ` ${previewHours} hours` : ' a while'} unless you press Keep.
+                </dd>
+              </div>
+              <div>
                 <dt className="font-medium text-foreground">Save to server</dt>
                 <dd>Pulls the file from WhatsApp onto this app's storage so it outlives Meta's copy. Nothing is fetched until you click it.</dd>
               </div>
               <div>
                 <dt className="font-medium text-foreground">Download</dt>
-                <dd>Copies the file to your own computer. Anything we flag asks you to confirm first.</dd>
+                <dd>Copies the file to your own computer. Anything we flag asks you to confirm first. It only appears once the file is here — before that, the bytes are still on WhatsApp's servers behind a token your browser does not have.</dd>
               </div>
               <div>
                 <dt className="font-medium text-foreground">How long things are kept</dt>
-                <dd>Chats: indefinitely · Files saved here: 90 days · Meta's own copy: 30 days from the message.</dd>
+                <dd>
+                  Chats: indefinitely · Files you keep: 90 days ·
+                  Previews you do not keep: {previewHours || '—'} hours ·
+                  Meta's own copy: 30 days from the message.
+                </dd>
               </div>
             </dl>
           </div>
@@ -232,7 +380,7 @@ function Thread({ waId, onBack }) {
         <Badge variant={data.windowOpen ? 'success' : 'outline'}>
           {data.windowOpen ? `Reply window ${countdown(msLeft)}` : 'Window closed'}
         </Badge>
-        <MediaInfo />
+        <MediaInfo previewHours={data.previewHours} />
       </div>
 
       <div className="flex-1 space-y-2 overflow-y-auto bg-muted/30 p-4">
@@ -251,11 +399,16 @@ function Thread({ waId, onBack }) {
           <div key={m.id} className={cn('flex', m.dir === 'out' ? 'justify-end' : 'justify-start')}>
             <div className={cn('max-w-[75%] rounded-lg px-3 py-2 text-sm shadow-sm',
               m.dir === 'out' ? 'bg-primary text-primary-foreground' : 'bg-card text-card-foreground border border-border')}>
-              {m.media && <Attachment media={m.media} onSaved={load} />}
+              {m.media && <Attachment media={m.media} onSaved={load} previewHours={data.previewHours} />}
               {/* describe() writes "[image]" as the body so the thread-list
                   preview says something. Once the bubble renders the real
                   attachment, repeating the placeholder under it is noise. */}
-              {m.text && m.text !== `[${m.type}]` && (
+              {TYPE_NOTE[m.type] ? (
+                <div>
+                  <p className="text-xs font-medium">{TYPE_NOTE[m.type][0]}</p>
+                  <p className="mt-0.5 text-[11px] leading-snug opacity-80">{TYPE_NOTE[m.type][1]}</p>
+                </div>
+              ) : m.text && m.text !== `[${m.type}]` && (
                 <p className="whitespace-pre-wrap break-words">{m.text}</p>
               )}
               {/* On the message itself, not only in a fail log that /api/start
@@ -346,7 +499,7 @@ function SearchResults({ q, onOpen }) {
             <span className="truncate text-xs font-medium">{m.name}</span>
             <span className="shrink-0 text-[10px] text-muted-foreground">{timeAgo(m.at)}</span>
           </div>
-          <p className="truncate text-xs text-muted-foreground">{m.dir === 'out' ? 'You: ' : ''}{m.text}</p>
+          <p className="truncate text-xs text-muted-foreground">{m.dir === 'out' ? 'You: ' : ''}{relabel(m.text)}</p>
         </button>
       ))}
     </div>
@@ -416,7 +569,7 @@ function ThreadList({ threads, selected, open }) {
                     <span className="truncate text-sm font-medium">{t.name}</span>
                     <span className="shrink-0 text-[10px] text-muted-foreground">{timeAgo(t.lastAt)}</span>
                   </div>
-                  <p className="truncate text-xs text-muted-foreground">{t.lastDir === 'out' ? 'You: ' : ''}{t.preview}</p>
+                  <p className="truncate text-xs text-muted-foreground">{t.lastDir === 'out' ? 'You: ' : ''}{relabel(t.preview)}</p>
                 </div>
                 {t.unread > 0 && <Badge variant="destructive">{t.unread}</Badge>}
               </button>

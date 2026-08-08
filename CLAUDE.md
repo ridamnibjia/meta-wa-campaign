@@ -66,7 +66,7 @@ webhook cannot be re-fetched from Meta's push-only API, which would make the
 | `webhook_events` | Raw envelopes, written before the 200 OK. `processed_at IS NULL` means it needs replay. |
 | `threads` | One per `wa_id`. `last_inbound_at` drives the 24-hour window. |
 | `messages` | Both directions. `wamid` primary key is the dedupe. |
-| `media` | Inbound descriptors, and bytes once an operator saves them. |
+| `media` | Inbound descriptors, and bytes once an operator asks. `provisional` = previewed, not yet kept. |
 | `media_assets` | Outbound template header files, deduped on sha256. |
 | `templates` | What we submitted. Meta stays the source of truth for `status`. |
 | `contacts` | The customer list and the one `enabled` switch. |
@@ -143,9 +143,37 @@ the only tier that renders inline, and it needs positive evidence from all three
 derived from evidence, the other is a list somebody wrote down, and a bug in
 either alone should not put a customer's file in an `<img>` on this origin.
 
+**PDF is the one exception, and it is deliberately narrow.** `classify()` caps a
+PDF at `ok` — correctly, it is a document format with a scripting engine behind
+it — so it can never reach `safe`, and operators were downloading invoices to a
+desktop reader to find out whether they were the invoice. The rule that lets it
+preview reads `bare === 'application/pdf' && row.risk === 'ok' && risk === 'ok'`:
+the **raw** column, because a NULL tier also reads as `ok` and a row nothing ever
+classified has a default rather than evidence; and the effective tier, because an
+oversize scan must still take the preview away. What makes it affordable is the
+`Content-Security-Policy: sandbox; default-src 'none'` this route already sent on
+every response — a unique opaque origin, so the viewer cannot reach this origin's
+cookies. Verified rendering in Chrome under that header. Do not widen this to
+`risk === 'ok'` generally; there is a test for each edge.
+
 **Saved media files are named by content hash**, so identical bytes from two
 messages are two rows over one file. Nothing may unlink a file without checking
-`pathIsShared()` first — see the retention sweep and `rescanIfNeeded`.
+`pathIsShared()` first. `dropBytes()` in `services/media.js` is the only place
+that unlinks inbound bytes, and it holds both guards — the sibling check and the
+"does this path resolve inside MEDIA_DIR" check. Three callers need them (the
+90-day sweep, the preview sweep, Discard); a second copy is a second thing to
+get wrong.
+
+**Preview and Save are the same fetch on different clocks.** `saveInbound(id,
+{ provisional: true })` runs every check a Save runs — size cap, free space,
+checksum, ClamAV, `classify()` — because the risk is in the file and not in the
+button that asked for it. `media.provisional` changes exactly one thing: which
+cutoff `sweepMedia` applies. Do not let it come to mean "less trusted", and do
+not add a path that renders bytes before the scan — the reason Preview exists at
+all is that an operator cannot decide whether to keep a file without seeing it,
+and cannot see it while it is still on Meta's servers behind a token the browser
+does not have. `ALTER TABLE` defaults it to `0` so every row that predates it
+reads as kept. `discardInbound` refuses a kept file outright.
 
 **`Number(x) || fallback` cannot express zero.** `src/config.js` has a `num()`
 helper for this. `WA_MEDIA_MIN_FREE_BYTES=0` is a legitimate setting.
