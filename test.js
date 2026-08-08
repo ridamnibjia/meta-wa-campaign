@@ -41,7 +41,7 @@ const {
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
   saveInbound, inboundPath, getInbound, INBOUND_TTL_MS, rescanIfNeeded, sweepMedia,
-  keepInbound, discardInbound,
+  keepInbound, discardInbound, sha256Hex,
   classify, sniff, extOf, worst, TIERS,
   scanBuffer, parseReply, scannerConfigured, EICAR,
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
@@ -2834,6 +2834,61 @@ console.log('\ninbound media — save, serve, expire');
       assert.match(r.error, /checksum|sha256/i, 'the error must name what failed');
       assert.equal(getInbound(id).path, null, 'a corrupt download must not be recorded as saved');
     }));
+  });
+
+  // The bug this suite could not see. Every fixture above seeds a HEX digest,
+  // but a real webhook envelope carries base64 — so the comparison the code
+  // actually performs in production was never the one being tested, and a check
+  // that refused 100% of real saves passed every test here.
+  const shaB64 = b => crypto.createHash('sha256').update(b).digest('base64');
+
+  testAsync('a base64 webhook sha256 verifies against the download', async () => {
+    const bytes = Buffer.from(`b64-checksum-${Date.now()}`);
+    const id = seedInbound({ bytes, sha256: shaB64(bytes) });
+    await withToken(() => withMeta(metaOk(bytes), async () => {
+      const r = await saveInbound(id);
+      assert.equal(r.ok, true,
+        'Meta states one digest in two encodings; refusing one of them refuses every real file');
+      assert.ok(getInbound(id).path);
+    }));
+  });
+
+  testAsync('a base64 sha256 that genuinely differs is still refused', async () => {
+    const bytes = Buffer.from(`b64-wrong-${Date.now()}`);
+    const id = seedInbound({ bytes, sha256: shaB64(Buffer.from('entirely other bytes')) });
+    await withToken(() => withMeta(metaOk(bytes), async () => {
+      const r = await saveInbound(id);
+      assert.equal(r.ok, false, 'normalising encodings must not turn the guard off');
+      assert.equal(getInbound(id).path, null);
+    }));
+  });
+
+  testAsync('an unreadable webhook digest falls back to the Graph value, not to nothing', async () => {
+    const bytes = Buffer.from(`unreadable-${Date.now()}`);
+    // metaOk reports the correct hex digest, so the fallback should succeed.
+    const id = seedInbound({ bytes, sha256: 'not-a-digest-at-all!!' });
+    await withToken(() => withMeta(metaOk(bytes), async () => {
+      assert.equal((await saveInbound(id)).ok, true);
+    }));
+  });
+
+  test('sha256Hex normalises every encoding Meta uses, and nothing else', () => {
+    const bytes = Buffer.from('hash me');
+    const hex   = crypto.createHash('sha256').update(bytes).digest('hex');
+
+    assert.equal(sha256Hex(hex), hex, 'hex passes through');
+    assert.equal(sha256Hex(hex.toUpperCase()), hex, 'and case does not matter');
+    assert.equal(sha256Hex(shaB64(bytes)), hex, 'base64 decodes to the same 32 bytes');
+    assert.equal(sha256Hex(shaB64(bytes).replace(/\+/g, '-').replace(/\//g, '_')), hex,
+      'base64url too — the padding and alphabet vary, the digest does not');
+
+    // Anything that is not 32 bytes however it was written is unrecognised, and
+    // unrecognised must not read as a match.
+    assert.equal(sha256Hex('deadbeef'), null, 'too short to be a sha256');
+    assert.equal(sha256Hex('z'.repeat(64)), null, 'right length, not hex');
+    assert.equal(sha256Hex(''), null);
+    assert.equal(sha256Hex(null), null);
+    assert.equal(sha256Hex(undefined), null);
   });
 
   testAsync('an unknown media id is an error, not a throw', async () => {

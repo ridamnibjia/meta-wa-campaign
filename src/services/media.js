@@ -313,6 +313,25 @@ function dropBytes(row) {
   return { removed: true, freed, shared: false };
 }
 
+// Meta reports one sha256 in two encodings — base64 in the webhook envelope,
+// hex from GET /{media-id} — so a comparison has to normalise before it can
+// mean anything. Returns null for anything that is not 32 bytes however it was
+// written, because "unrecognised" and "does not match" are different answers
+// and only one of them should refuse a file.
+//
+// The length check is the real gate: Buffer.from(…, 'base64') is lenient and
+// will happily decode nonsense into something short.
+function sha256Hex(digest) {
+  const s = String(digest == null ? '' : digest).trim();
+  if (/^[0-9a-f]{64}$/i.test(s)) return s.toLowerCase();
+  // base64 and base64url alike; padding optional.
+  if (/^[A-Za-z0-9+/_-]+={0,2}$/.test(s)) {
+    const b = Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    return b.length === 32 ? b.toString('hex') : null;
+  }
+  return null;
+}
+
 // Computed, never stored. Meta deletes the file 30 days after the message, so
 // the deadline is a property of the message we already have the timestamp for —
 // there is nothing to migrate and nothing to age out.
@@ -400,8 +419,23 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
     // lands on disk as a perfectly valid-looking file that nothing downstream
     // will ever question. Prefer the webhook's own checksum — it was recorded
     // before this fetch and cannot be forged by whatever answered it.
-    const expected = row.sha256 || meta.sha256 || null;
+    //
+    // Both sides are normalised first because Meta states the same digest in
+    // two encodings depending on which surface you asked: the webhook envelope
+    // carries base64, GET /{media-id} carries hex. Comparing the preferred
+    // (webhook) value against a hex digest therefore failed for EVERY row that
+    // carried a checksum, which is every row — the guard was not strict, it was
+    // unconditional, and it had never once been in a position to catch the
+    // truncation it exists for.
     const actual   = crypto.createHash('sha256').update(buf).digest('hex');
+    const expected = sha256Hex(row.sha256) || sha256Hex(meta.sha256);
+
+    // A digest we cannot parse is not a digest we can check against. Falling
+    // through to the next source is right, but doing it silently would turn a
+    // changed Meta format back into "saves stopped working" with no trail.
+    if (row.sha256 && !sha256Hex(row.sha256)) {
+      log('warn', `Media ${row.media_id}: could not read the webhook sha256 as hex or base64 — falling back to the Graph value`);
+    }
     if (expected && expected !== actual) {
       return { ok: false, error: 'Checksum mismatch — the download did not match the sha256 WhatsApp reported, so nothing was saved.' };
     }
@@ -525,5 +559,5 @@ module.exports = {
   MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath,
   ensureHandle, ensureMediaId, headerComponent,
   INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound, rescanIfNeeded,
-  pathIsShared, clearInboundFile, dropBytes, keepInbound, discardInbound,
+  pathIsShared, clearInboundFile, dropBytes, keepInbound, discardInbound, sha256Hex,
 };

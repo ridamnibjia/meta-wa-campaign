@@ -199,6 +199,14 @@ exist. Do not add a non-idempotent write to `processEnvelope`.
 - **`migrateJsonToSql` and `migrateOptOuts` rename their source files.** They run
   only under `require.main === module` in `server.js`. Never call them at require
   time, or `npm test` renames the repo's own state files.
+- **Meta states one media `sha256` in two encodings.** The webhook envelope
+  carries **base64** (`/ZYvm28…D6xw=`); `GET /{media-id}` carries **hex**
+  (`fd962f9b…43eb1c`). Same 32 bytes. `sha256Hex()` in `services/media.js`
+  normalises before comparing, and every comparison must go through it. The
+  original code compared the preferred webhook value against a hex digest, so it
+  refused **every** inbound file on every deployment that had one — and the test
+  suite missed it for 400+ tests because the fixtures seeded hex. If you write a
+  media fixture, seed base64: that is what production sends.
 - **The Resumable Upload API keys on `APP_ID`**, not the WABA id. Its second call
   needs `Authorization: OAuth`, not `Bearer` — the one documented exception in
   the whole Graph surface.
