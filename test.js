@@ -1782,7 +1782,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   const { buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
           recordRecipientRetry, nextRetryForRun, progressForRun, billableForRun,
           skippedForRun, lastRunSummary, campaignActive, campaignBlocker,
-          scheduleRetry, RETRY_BACKOFF_MS } = M;
+          scheduleRetry, RETRY_BACKOFF_MS, IST_OFFSET_MS } = M;
 
   let runSeq = 0;
   const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
@@ -1862,7 +1862,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     assert.deepEqual(skippedForRun(run), [], 'and they do not appear in the skip report');
   });
 
-  test('the ladder is three waits, then the failure is reported rather than retried', () => {
+  test('the ladder is five waits, then the failure is reported rather than retried', () => {
     const run = newRun();
     const p = people(1);
     const saved = S.currentRunId;
@@ -1884,7 +1884,33 @@ console.log('\nrun_recipients — retrying a moment-based failure');
 
       const exhausted = nextPending(run, Date.now() + 99 * HOUR_MS);
       assert.equal(scheduleRetry(contact, exhausted, fail, '[t]'), false,
-        'four attempts is the whole ladder — a fifth would discover nothing new');
+        'six attempts is the whole ladder — a seventh would discover nothing new, and a run ' +
+        'that never stops retrying is a run that never closes');
+    } finally { S.currentRunId = saved; }
+  });
+
+  test('the ladder is five even rungs of three hours', () => {
+    assert.equal(RETRY_BACKOFF_MS.length, 5,
+      'three rungs over seven hours closed runs with people still owed a message, because ' +
+      '131049 is a rolling per-person cap and not a counter that resets');
+    assert.ok(RETRY_BACKOFF_MS.every(ms => ms === 3 * HOUR_MS),
+      'even spacing is what makes the ladder explainable to an operator');
+  });
+
+  test('a stored retry deadline never lands in the middle of the night', () => {
+    const run = newRun();
+    const p = people(1);
+    const saved = S.currentRunId;
+    S.currentRunId = run;
+    try {
+      buildRun(run, p);
+      scheduleRetry({ name: p[0].name, dialStr: p[0].dialStr }, { attempts: 0 },
+        { errorCode: 131049, error: 'cap' }, '[t]');
+      const at = rowFor(run, p[0].dialStr).retry_after;
+      const hourIST = new Date(at + IST_OFFSET_MS).getUTCHours();
+      assert.ok(hourIST >= 7 && hourIST < 23,
+        `a retry was stored for ${hourIST}:00 IST — the deferral has to happen before the ` +
+        'row is written, or the queue and the operator disagree about when this contact is due');
     } finally { S.currentRunId = saved; }
   });
 
