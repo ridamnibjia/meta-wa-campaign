@@ -3756,6 +3756,32 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(row.risk, 'safe', 'the verdict survives too, so a re-save need not re-derive it');
     });
 
+    // The two stores have two lifetimes and must never be confused. `media` is
+    // what customers sent us, lives in MEDIA_DIR and is on a 90-day clock;
+    // `media_assets` is what the operator uploaded, lives in UPLOAD_DIR and is
+    // never swept. This guards a property that already holds — it exists so a
+    // later change to retention.js cannot quietly break it, because deleting an
+    // operator's price list is silent and unrecoverable.
+    testAsync('the sweep never touches an operator upload', async () => {
+      const up = saveUpload({ buffer: Buffer.from(`%PDF-1.7 keep me ${Math.random()}`),
+                              originalname: 'price-list.pdf', mimetype: 'application/pdf' });
+      assert.equal(up.ok, true, up.error);
+      const file = assetPath(up.asset);
+      assert.ok(fsm.existsSync(file), 'the fixture has to exist before the sweep to prove anything');
+
+      // An inbound file old enough to actually make the sweep do work, so this
+      // is not passing merely because nothing was swept at all.
+      const id = await saveOne();
+      age(id, 400 * DAY);
+      const r = sweepMedia();
+      assert.ok(r.swept >= 1, 'the sweep must have run for real');
+
+      assert.ok(fsm.existsSync(file),
+        'UPLOAD_DIR holds files the operator owns and is still sending — only MEDIA_DIR is on a clock');
+      assert.ok(getAsset(up.asset.id),
+        'and the row survives too, or the library would lose a file whose bytes are still there');
+    });
+
     testAsync('a file inside the window is left alone', async () => {
       const id = await saveOne();
       const file = inboundPath(getInbound(id));
