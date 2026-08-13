@@ -1698,6 +1698,80 @@ console.log('\nskipDisposition — the classifier the report groups by');
   });
 }
 
+// ── Quiet hours ───────────────────────────────────────────────────────────────
+// The retry ladder now runs for up to a day, so a rung can land at 3am. Delivery
+// would work; what breaks is the quality rating, because a night notification is
+// what a dealer blocks and reports — and the quality rating gates the messaging
+// tier. Every assertion below is on a fixed timestamp, so none of them wait.
+console.log('\nlib/schedule — retries do not fire in the middle of the night');
+{
+  const { deferPastQuietHours, IST_OFFSET_MS } = require('./server');
+
+  // IST instants built out of UTC, so these mean the same thing on a laptop in
+  // IST and on a server in UTC. 18:30 UTC is 00:00 IST the following day.
+  const ist = (y, m, d, h, min = 0) => Date.UTC(y, m - 1, d, h - 5, min - 30);
+
+  test('a daytime deadline is left exactly where it is', () => {
+    const at = ist(2026, 8, 14, 14, 0);
+    assert.equal(deferPastQuietHours(at), at,
+      'deferring a 2pm retry would delay every rung in the working day for no reason');
+  });
+
+  test('a deadline just before the window is left alone', () => {
+    const at = ist(2026, 8, 14, 22, 59);
+    assert.equal(deferPastQuietHours(at), at,
+      '22:59 is outside a 23:00-07:00 window and must fire on time');
+  });
+
+  test('a late-evening deadline moves to 8am the NEXT morning', () => {
+    assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 30)), ist(2026, 8, 15, 8, 0),
+      'the next morning after the 14th is the 15th — landing back on the 14th would be in the past');
+  });
+
+  test('an after-midnight deadline moves to 8am the SAME morning', () => {
+    assert.equal(deferPastQuietHours(ist(2026, 8, 15, 2, 0)), ist(2026, 8, 15, 8, 0),
+      '02:00 IST is already the 15th, and pushing it to the 16th would cost the contact a whole day');
+  });
+
+  test('the window is closed at its start and open at its end', () => {
+    assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 0)), ist(2026, 8, 15, 8, 0),
+      '23:00:00 exactly is inside the quiet window');
+    const seven = ist(2026, 8, 15, 7, 0);
+    assert.equal(deferPastQuietHours(seven), seven,
+      '07:00:00 exactly is outside it — the window is [23:00, 07:00)');
+  });
+
+  test('the hour between 07:00 and 08:00 is grace, not a gap', () => {
+    const halfSeven = ist(2026, 8, 15, 7, 30);
+    assert.equal(deferPastQuietHours(halfSeven), halfSeven,
+      'a deadline that reached 07:30 on its own is a morning deadline; 08:00 is only where a ' +
+      "deferred night's worth of retries is released, staggered off the moment people wake");
+  });
+
+  test('quiet hours are IST whatever timezone the server runs in', () => {
+    const saved = process.env.TZ;
+    try {
+      process.env.TZ = 'America/New_York';
+      assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 30)), ist(2026, 8, 15, 8, 0),
+        'the deployment host may not run in IST, and the dealers always do');
+    } finally { process.env.TZ = saved; }
+  });
+
+  test('a non-wrapping window would still be handled correctly', () => {
+    // Nothing configures this today. It is asserted because the wrap-aware
+    // branch is the kind of code a later reader "simplifies" to a plain range
+    // check, and this is the case that would then break silently.
+    const noon = ist(2026, 8, 14, 12, 0);
+    assert.equal(deferPastQuietHours(noon, { start: 11, end: 14, resumeAt: 14 }),
+      ist(2026, 8, 14, 14, 0), 'a window inside one day defers forward within that day');
+  });
+
+  test('IST_OFFSET_MS is the whole zone, with no daylight saving to track', () => {
+    assert.equal(IST_OFFSET_MS, 5.5 * 3600000,
+      'India has one offset year-round, which is why this is a constant and not a lookup');
+  });
+}
+
 // ── The retry ladder ──────────────────────────────────────────────────────────
 // A failure that was about the MOMENT goes back on the queue with a deadline
 // instead of being dropped. Everything below asserts that the deadline lives in

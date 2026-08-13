@@ -153,6 +153,7 @@ module.exports = {
   ...require('./src/lib/errors'),
   ...require('./src/lib/signature'),
   ...require('./src/lib/pricing'),
+  ...require('./src/lib/schedule'),
   ...require('./src/services/templates'),
   ...require('./src/services/warmup'),
   ...require('./src/services/messages'),
