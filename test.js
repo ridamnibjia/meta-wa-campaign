@@ -2220,6 +2220,144 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   });
 }
 
+// ── Campaign history ──────────────────────────────────────────────────────────
+// Read-only, and every field derived. The point of these assertions is that
+// campaign_runs gains no ended_at and no status column: both are properties of
+// the queue, and a stored copy is a number that can disagree with the rows.
+console.log('\nhistory — listRuns and runDetail');
+{
+  const M = require('./server');
+  const { listRuns, runDetail, buildRun, recordRecipientSent, recordRecipientSkipped,
+          recordRecipientRetry } = M;
+
+  let hseq = 0;
+  const person = name => ({ name, dialStr: `9198800${String(++hseq).padStart(5, '0')}` });
+  const newRun = (label, body) => Number(db.prepare(
+    'INSERT INTO campaign_runs (started_at, label, template_body, template_lang) VALUES (?,?,?,?)')
+    .run(Date.now(), label, body ?? null, 'en').lastInsertRowid);
+
+  // Every test here reads a run that is NOT the current one, which is what the
+  // History page always does. Pinning currentRunId to null keeps 'in-progress'
+  // out of the answer unless a test asks for it.
+  const detached = fn => {
+    const savedRun = S.currentRunId, savedPhase = S.phase;
+    S.currentRunId = null; S.phase = 'idle';
+    try { return fn(); } finally { S.currentRunId = savedRun; S.phase = savedPhase; }
+  };
+
+  test('a run staged and never started is hidden from history', () => {
+    const empty = newRun('staged_never_started');
+    const real  = newRun('karnataka_price_list');
+    buildRun(real, [person('Asha')]);
+    detached(() => {
+      const runs = listRuns();
+      assert.equal(runs[0].id, real, 'newest first — the campaign just run is the one being looked for');
+      assert.ok(!runs.some(r => r.id === empty),
+        'a run with no recipients is noise; showing it makes the list untrustworthy');
+    });
+  });
+
+  test('ended-at is the last attempt on the queue, not a stored column', () => {
+    const run = newRun('ended_at');
+    const p = person('Rahul');
+    buildRun(run, [p]);
+    recordRecipientSent(run, p.dialStr, 'w-hist-1');
+    const row = db.prepare('SELECT attempted_at FROM run_recipients WHERE run_id = ?').get(run);
+    detached(() => {
+      assert.equal(runDetail(run).endedAt, row.attempted_at,
+        'a stored ended_at needs writing on finish, on Stop, on ladder exhaustion and after a ' +
+        'crash — four places to forget, and a forgotten one shows a campaign that never ended');
+    });
+    const cols = db.prepare('PRAGMA table_info(campaign_runs)').all().map(c => c.name);
+    assert.ok(!cols.includes('ended_at') && !cols.includes('status'),
+      'neither may ever become a column — that is the whole decision');
+  });
+
+  test('a run with everyone resolved reads completed', () => {
+    const run = newRun('all_done');
+    const a = person('Asha'), b = person('Marco');
+    buildRun(run, [a, b]);
+    recordRecipientSent(run, a.dialStr, 'w-hist-2');
+    recordRecipientSkipped(run, b.dialStr, 'skipped', 131026);
+    detached(() => assert.equal(runDetail(run).status, 'completed',
+      'sent and skipped are both resolved — nothing is owed'));
+  });
+
+  test('a run with pending rows that is not current reads incomplete', () => {
+    const run = newRun('stopped_halfway');
+    const a = person('Sarah'), b = person('Priya');
+    buildRun(run, [a, b]);
+    recordRecipientSent(run, a.dialStr, 'w-hist-3');
+    detached(() => {
+      const d = runDetail(run);
+      assert.equal(d.status, 'incomplete',
+        'reporting a stopped campaign as complete hides the people it never reached');
+      assert.equal(d.progress.pending, 1, 'and the count says how many');
+    });
+  });
+
+  test('the current run being walked reads in-progress, retry ladder included', () => {
+    const run = newRun('live_one');
+    const p = person('Asha');
+    buildRun(run, [p]);
+    recordRecipientRetry(run, p.dialStr, 131049, Date.now() + 3 * 3600000);
+    const savedRun = S.currentRunId, savedPhase = S.phase;
+    S.currentRunId = run; S.phase = 'waiting';
+    try {
+      assert.equal(runDetail(run).status, 'in-progress',
+        'a campaign still working its retry ladder is not finished, and history must not say it is');
+    } finally { S.currentRunId = savedRun; S.phase = savedPhase; }
+  });
+
+  test('the body shown is the one that run sent, not the template as it reads now', () => {
+    const run = newRun('body_snapshot', 'Old price list for {{1}}');
+    buildRun(run, [person('Rahul')]);
+    const savedBody = S.config.templateBody;
+    S.config.templateBody = 'A completely different message';
+    try {
+      detached(() => assert.equal(runDetail(run).body, 'Old price list for {{1}}',
+        'editing a template must never rewrite what last month\'s campaign said'));
+    } finally { S.config.templateBody = savedBody; }
+  });
+
+  test('an unknown id is null rather than the current run', () => {
+    detached(() => {
+      assert.equal(runDetail(999999), null,
+        'a stale bookmark that renders a different campaign reads as an answer, which is ' +
+        'worse than a 404 because the operator acts on it');
+      assert.equal(runDetail('nonsense'), null);
+      assert.equal(runDetail(0), null);
+      assert.equal(runDetail(null), null);
+    });
+  });
+
+  test('an inbox reply is never counted against a campaign', () => {
+    const run = newRun('no_leak');
+    const p = person('Asha');
+    buildRun(run, [p]);
+    // run_id left NULL, exactly as services/inbox.js writes it.
+    db.prepare('INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status) VALUES (?,?,?,?,?,?,?)')
+      .run('reply-hist-1', p.dialStr, 'out', 'text', 'a free-form reply', Date.now(), 'delivered');
+    detached(() => assert.equal(runDetail(run).counts.delivered, 0,
+      'run_id IS NULL is the bucket inbox replies land in — counting it inflates every report ' +
+      'and prices free-form replies at the template rate'));
+  });
+
+  test('the skip report travels with the run, codes and attempts included', () => {
+    const run = newRun('with_skips');
+    const a = person('Marco'), b = person('Priya');
+    buildRun(run, [a, b]);
+    recordRecipientSent(run, a.dialStr, 'w-hist-4');
+    recordRecipientSkipped(run, b.dialStr, 'skipped', 131049);
+    detached(() => {
+      const d = runDetail(run);
+      assert.equal(d.skips.length, 1, 'the operator has to be able to see who was not reached');
+      assert.equal(d.skips[0].error_code, 131049, 'and why, in Meta\'s own terms');
+      assert.equal(d.recipients.length, 2, 'while the full list still shows everyone');
+    });
+  });
+}
+
 // ── Can this box run the scanner it was configured with? ──────────────────────
 // The warning exists because the failure it predicts does not look like itself:
 // clamd gets OOM-killed during a signature reload, and the app then refuses every
