@@ -310,12 +310,105 @@ function MediaInfo({ previewHours }) {
   );
 }
 
+const KIND_ICON = { image: '▣', video: '▶', document: '▤' };
+const mb = n => `${((n || 0) / 1024 / 1024).toFixed(1)} MB`;
+
+// Library first, upload second, and in that order on purpose: the whole reason
+// this exists is that one price list goes to every dealer in a state, and
+// re-uploading it per conversation is the work being removed. The same bytes
+// dedupe to one row and one Meta media id however many times they are sent.
+//
+// Module scope, like every other component in this file — one defined inside a
+// render is a new type on every render, and React remounts new types.
+function MediaPicker({ waId, onSent, onClose }) {
+  const [assets, setAssets] = useState(null);
+  const [picked, setPicked] = useState(null);
+  const [caption, setCaption] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    api.get('/api/media')
+      .then(d => setAssets(d.assets || []))
+      .catch(() => { setAssets([]); setError('Could not load the library.'); });
+  }, []);
+
+  const upload = async file => {
+    if (!file) return;
+    setBusy(true); setError('');
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await api.upload('/api/media/upload', fd)
+      .catch(() => ({ ok: false, error: 'Network error' }));
+    setBusy(false);
+    // The classifier refuses a file whose bytes disagree with its name, so this
+    // is a sentence the operator has to see rather than a silent no-op.
+    if (!r.ok) return setError(r.error);
+    setAssets(a => [r.asset, ...(a || []).filter(x => x.id !== r.asset.id)]);
+    setPicked(r.asset.id);
+  };
+
+  const send = async () => {
+    setBusy(true); setError('');
+    const r = await api.post(`/api/inbox/${waId}/media`, { assetId: picked, caption })
+      .catch(() => ({ ok: false, error: 'Network error' }));
+    setBusy(false);
+    if (!r.ok) return setError(r.error + (r.hint ? ` — ${r.hint}` : ''));
+    onSent();
+  };
+
+  return (
+    <div className="mb-2 rounded-md border border-border bg-card p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="text-xs font-semibold">Send a file</p>
+        <Button variant="ghost" size="sm" onClick={onClose}>✕</Button>
+      </div>
+
+      <label className={cn('mb-2 block rounded-md border border-dashed border-border p-3 text-center text-xs',
+        busy ? 'text-muted-foreground' : 'cursor-pointer text-muted-foreground hover:bg-accent')}>
+        {busy ? 'Working…' : 'Upload a new file'}
+        <input type="file" className="hidden" disabled={busy}
+               onChange={e => { upload(e.target.files[0]); e.target.value = ''; }} />
+      </label>
+
+      {assets === null ? (
+        <p className="mb-2 text-xs text-muted-foreground">Loading library…</p>
+      ) : assets.length === 0 ? (
+        <p className="mb-2 text-xs text-muted-foreground">
+          Nothing uploaded yet. A file you upload here stays in the library and can be sent again
+          without uploading it a second time.
+        </p>
+      ) : (
+        <div className="mb-2 max-h-44 space-y-1 overflow-y-auto">
+          {assets.map(a => (
+            <button key={a.id} type="button" onClick={() => setPicked(a.id)}
+              className={cn('flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs',
+                picked === a.id ? 'bg-secondary text-secondary-foreground' : 'hover:bg-accent')}>
+              <span className="opacity-70">{KIND_ICON[a.kind] || '▤'}</span>
+              <span className="min-w-0 flex-1 truncate">{a.filename}</span>
+              <span className="shrink-0 text-muted-foreground">{mb(a.file_size)}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      <Input className="mb-2" placeholder="Caption (optional)" value={caption} maxLength={1024}
+             disabled={busy} onChange={e => setCaption(e.target.value)} />
+      {error && <p className="mb-2 text-xs font-medium text-destructive">{error}</p>}
+      <Button size="sm" disabled={!picked || busy} onClick={send}>
+        {busy ? 'Sending…' : 'Send file'}
+      </Button>
+    </div>
+  );
+}
+
 function Thread({ waId, onBack }) {
   const { loadInbox } = useApp();
   const [data, setData] = useState(null);
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
+  const [pickerOpen, setPickerOpen] = useState(false);
   const endRef = useRef(null);
 
   // `older` holds the pages walked back from the newest one, oldest page first.
@@ -400,6 +493,15 @@ function Thread({ waId, onBack }) {
             <div className={cn('max-w-[75%] rounded-lg px-3 py-2 text-sm shadow-sm',
               m.dir === 'out' ? 'bg-primary text-primary-foreground' : 'bg-card text-card-foreground border border-border')}>
               {m.media && <Attachment media={m.media} onSaved={load} previewHours={data.previewHours} />}
+              {/* The operator's own file. No risk verdict and no expiry to show:
+                  those belong to inbound bytes, and this one came from here. */}
+              {m.outMedia && (
+                <p className="flex items-center gap-1.5 text-xs opacity-90">
+                  <span>{KIND_ICON[m.outMedia.kind] || '▤'}</span>
+                  <span className="min-w-0 truncate font-medium">{m.outMedia.filename}</span>
+                  <span className="shrink-0 opacity-70">{mb(m.outMedia.size)}</span>
+                </p>
+              )}
               {/* describe() writes "[image]" as the body so the thread-list
                   preview says something. Once the bubble renders the real
                   attachment, repeating the placeholder under it is noise. */}
@@ -439,7 +541,15 @@ function Thread({ waId, onBack }) {
           </p>
         )}
         {error && <p className="text-xs font-medium text-destructive">{error}</p>}
+        {pickerOpen && data.windowOpen && (
+          <MediaPicker waId={waId}
+            onSent={() => { setPickerOpen(false); load(); loadInbox(); }}
+            onClose={() => setPickerOpen(false)} />
+        )}
         <div className="flex gap-2">
+          <Button type="button" variant="ghost" disabled={!data.windowOpen || sending}
+                  title={data.windowOpen ? 'Send a file' : 'Reply window closed'}
+                  onClick={() => setPickerOpen(o => !o)}>📎</Button>
           <Input className="flex-1" placeholder={data.windowOpen ? 'Type a reply…' : 'Reply window closed'}
                  value={text} disabled={!data.windowOpen || sending}
                  onChange={e => setText(e.target.value)} />
