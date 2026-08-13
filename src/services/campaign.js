@@ -254,6 +254,11 @@ async function sleepUntil(at) {
 // await for up to a second afterwards. Trusting the phase alone let a Start in
 // that window spawn a SECOND loop over the same queue, and two loops walking one
 // run message whoever they both reach twice.
+// 'waiting' is the retry phase. Every label the operator sees for it says "In
+// progress" instead — this string is state, that string is presentation, and
+// they are allowed to differ. Renaming this one to match the label silently
+// changes what campaignBlocker() refuses and what resumeIfInterrupted() picks
+// back up, which is how the two-loops-on-one-queue double send got in before.
 const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
 const campaignActive = () => flags.running || ACTIVE_PHASES.includes(S.phase);
 
@@ -268,7 +273,7 @@ function campaignBlocker() {
   }
   const p = progressForRun(S.currentRunId);
   const what = S.phase === 'waiting'
-      ? `waiting to retry ${p.retrying} contact${p.retrying === 1 ? '' : 's'}`
+      ? `in progress — retrying ${p.retrying} contact${p.retrying === 1 ? '' : 's'}`
     : S.phase === 'paused' ? 'paused part-way through'
     : 'still sending';
   return `A campaign is ${what} — ${p.sent + p.skipped} of ${p.total} done, ${p.pending} left. Stop it, or let it finish, before starting another.`;
@@ -299,7 +304,10 @@ async function campaignLoop() {
       const retry = nextRetryForRun(S.currentRunId);
       if (retry) {
         S.phase = 'waiting';
-        S.pauseReason = `Waiting to retry — ${retry.count} contact${retry.count === 1 ? '' : 's'}, next attempt ${clockIST(retry.at)}`;
+        // "In progress", not "Waiting". The ladder runs for up to a day now, and
+        // an operator who reads this as stalled presses Stop — which abandons
+        // precisely the contacts the ladder exists to recover.
+        S.pauseReason = `In progress — retrying ${retry.count} contact${retry.count === 1 ? '' : 's'}, next attempt ${clockIST(retry.at)}`;
         log('info', S.pauseReason);
         saveCampaignNow(); broadcast();
         await sleepUntil(retry.at);

@@ -15,7 +15,7 @@ function Dashboard() {
     running: ['success', 'Sending'],
     // Its own label, not 'Sending': the loop can be asleep for hours between
     // retry attempts, and "Sending" over a four-hour sleep reads as a hang.
-    waiting: ['warning', 'Waiting to retry'],
+    waiting: ['warning', 'In progress — retrying'],
     paused:  ['warning', 'Paused'],
     done:    ['secondary', 'Finished'],
     idle:    ['outline', 'Idle'],
@@ -45,7 +45,7 @@ function Dashboard() {
       </div>
 
       {ss.pauseReason && (
-        <Alert variant="warning" title={phase === 'waiting' ? 'Campaign waiting to retry' : 'Campaign paused'}>
+        <Alert variant="warning" title={phase === 'waiting' ? 'Campaign in progress — retrying' : 'Campaign paused'}>
           {ss.pauseReason}
         </Alert>
       )}
@@ -73,7 +73,7 @@ function Dashboard() {
               <span><strong className="text-foreground tabular-nums">{num(lastRun.counts.failed)}</strong> failed</span>
               <span><strong className="text-foreground tabular-nums">{num(lastRun.progress.skipped)}</strong> skipped</span>
               {lastRun.progress.retrying > 0 && (
-                <span><strong className="text-warning tabular-nums">{num(lastRun.progress.retrying)}</strong> waiting to retry</span>
+                <span><strong className="text-warning tabular-nums">{num(lastRun.progress.retrying)}</strong> retrying</span>
               )}
             </div>
             {lastRun.unfinished && (

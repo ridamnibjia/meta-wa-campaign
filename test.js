@@ -1945,8 +1945,9 @@ console.log('\nrun_recipients — retrying a moment-based failure');
           'and the operator is told what is in the way, not just refused');
       }
       S.phase = 'waiting';
-      assert.match(campaignBlocker(), /waiting to retry/,
-        'the reason names the retry ladder rather than saying "running"');
+      assert.match(campaignBlocker(), /in progress — retrying/,
+        'the ladder now runs for up to a day, and an operator who reads "waiting" assumes the ' +
+        'campaign is stuck and presses Stop — abandoning exactly the contacts it exists to recover');
 
       S.phase = 'idle';
       assert.equal(campaignActive(), false);
