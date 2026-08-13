@@ -39,4 +39,18 @@ router.post('/inbox/:waId/reply', async (req, res) => {
   res.status(r.ok ? 200 : 400).json(r);
 });
 
+// Sends a file that is already in the library. Uploading is deliberately NOT
+// here: it reuses POST /media/upload, which already dedupes on content hash and
+// now runs the risk classifier. Two upload endpoints would be two places to keep
+// those guarantees in step, and the second one is always the one that drifts.
+router.post('/inbox/:waId/media', async (req, res) => {
+  const waId = normalizePhone(req.params.waId) || req.params.waId;
+  const assetId = Number(req.body?.assetId);
+  if (!Number.isInteger(assetId) || assetId <= 0) {
+    return res.status(400).json({ ok: false, error: 'Pick a file to send.' });
+  }
+  const r = await inbox.sendMedia(waId, assetId, req.body?.caption);
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
 module.exports = router;

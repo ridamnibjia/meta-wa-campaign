@@ -2746,6 +2746,39 @@ console.log('\nmedia routes');
       assert.ok(Array.isArray((await signedIn.json()).assets));
     } finally { s.close(); CFG.appPassword = savedPw; }
   });
+
+  // Same two halves as above. The 400 proves the route exists and reached the
+  // service; the 401 proves an anonymous caller cannot send a file to a customer.
+  testAsync('the media reply route is mounted below the password gate', async () => {
+    const savedPw = CFG.appPassword;
+    CFG.appPassword = 'test-password';
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const post = (headers) => fetch(`${base}/api/inbox/919700000099/media`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({ assetId: 1, caption: 'hi' }),
+      });
+
+      assert.equal((await post()).status, 401,
+        'an anonymous caller must not be able to send a file to a customer');
+
+      const signedIn = await post({ cookie: `wa_session=${createSession()}` });
+      assert.equal(signedIn.status, 400,
+        'a signed-in caller reaches the service, which refuses because that thread has no open window');
+      assert.equal((await signedIn.json()).ok, false);
+
+      const noAsset = await fetch(`${base}/api/inbox/919700000099/media`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: `wa_session=${createSession()}` },
+        body: JSON.stringify({ caption: 'no file' }),
+      });
+      assert.equal(noAsset.status, 400, 'a post with no assetId is refused before the service is called');
+      assert.match((await noAsset.json()).error, /Pick a file/);
+    } finally { s.close(); CFG.appPassword = savedPw; }
+  });
 }
 
 console.log('\nmedia — Meta identifiers');
