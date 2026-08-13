@@ -30,7 +30,7 @@ const {
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
-  markRead, inboxThread, inboxSearch, sendReply,
+  markRead, inboxThread, inboxSearch, sendReply, sendMedia, CAPTION_LIMIT,
   checkPassword, createSession, validSession, destroySession,
   PRICES,
   nodeVersionOk, openDb, SCHEMA,
@@ -1291,6 +1291,138 @@ testAsync('a reply inside the window is stored with no run_id', async () => {
     require('./src/config').CFG.phoneNumberId = savedPhone;
   }
 });
+
+// ── Sending a file into the service window ────────────────────────────────────
+// The half of the 131049 answer the retry ladder cannot give: the per-user
+// marketing cap does not apply inside the 24-hour window, so a free-form send
+// here reaches people no amount of retrying a marketing template will.
+console.log('\ninbox — sendMedia');
+{
+  const openThread = (waId, name) => {
+    const now = Date.now();
+    testDb.prepare('INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES (?,?,0,?,?)')
+      .run(waId, name, now, now);
+  };
+  // media_id is stamped fresh so ensureMediaId answers from the row instead of
+  // uploading. These tests are about sendMedia; the 29-day refresh has its own.
+  const seedAsset = () => {
+    const a = saveUpload({
+      buffer: Buffer.from(`%PDF-1.7 price list ${Math.random()}`),
+      originalname: 'price-list.pdf', mimetype: 'application/pdf' }).asset;
+    testDb.prepare('UPDATE media_assets SET media_id = ?, media_id_at = ? WHERE id = ?')
+      .run(`mid-${a.id}`, Date.now(), a.id);
+    return a;
+  };
+
+  // stubGraph swaps global.fetch, so the arguments are (url, opts) — the JSON
+  // body Meta receives is opts.body, already serialised.
+  const bodyOf = opts => JSON.parse(opts.body);
+
+  const withCreds = async fn => {
+    const CFGx = require('./src/config').CFG;
+    const savedToken = CFGx.accessToken, savedPhone = CFGx.phoneNumberId;
+    CFGx.accessToken = 'test-token'; CFGx.phoneNumberId = '1234567890';
+    try { return await fn(); }
+    finally { CFGx.accessToken = savedToken; CFGx.phoneNumberId = savedPhone; }
+  };
+
+  testAsync('media outside the window is refused without calling the network', async () => {
+    let called = false;
+    const restore = stubGraph(async () => { called = true; throw new Error('must not send'); });
+    try {
+      testDb.prepare("INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES ('919700000010','Closed',0,1,1)").run();
+      const r = await sendMedia('919700000010', seedAsset().id, 'Price list');
+      assert.equal(r.ok, false,
+        'Meta would reject this as 131047 — refusing locally gives the operator a sentence instead of a code');
+      assert.match(r.error, /24-hour reply window/);
+      assert.equal(called, false, 'and it must not spend a Graph call to find that out');
+    } finally { restore(); }
+  });
+
+  testAsync('an asset that is no longer in the library fails with a sentence, not a throw', async () => {
+    openThread('919700000011', 'Asha');
+    const r = await sendMedia('919700000011', 999999, 'here you go');
+    assert.equal(r.ok, false, 'a deleted asset must not throw past the route');
+    assert.match(r.error, /library/i, 'and must say what to do about it');
+  });
+
+  testAsync('an over-long caption is refused before anything else happens', async () => {
+    openThread('919700000012', 'Rahul');
+    const r = await sendMedia('919700000012', seedAsset().id, 'x'.repeat(CAPTION_LIMIT + 1));
+    assert.equal(r.ok, false);
+    assert.match(r.error, new RegExp(String(CAPTION_LIMIT)),
+      'Meta rejects an over-long caption with a code that never mentions the caption');
+  });
+
+  testAsync('a document send carries the filename and stores asset_id, not a media row', async () => {
+    openThread('919700000013', 'Marco');
+    const asset = seedAsset();
+    let sent = null;
+    const restore = stubGraph(async (url, opts) => {
+      sent = bodyOf(opts);
+      return { ok: true, headers: new Map(), json: async () => ({ messages: [{ id: 'media-out-1' }] }) };
+    });
+    try {
+      await withCreds(async () => {
+        const r = await sendMedia('919700000013', asset.id, 'August price list');
+        assert.equal(r.ok, true, r.error);
+        assert.equal(sent.type, 'document', 'Meta nests the descriptor under a key named after the type');
+        assert.equal(sent.document.caption, 'August price list');
+        assert.equal(sent.document.filename, 'price-list.pdf',
+          'filename is meaningful on a document — without it the dealer sees a random id');
+
+        const row = testDb.prepare("SELECT * FROM messages WHERE wamid = 'media-out-1'").get();
+        assert.equal(row.asset_id, asset.id,
+          'outbound media points at media_assets; the media table is swept at 90 days and would delete it');
+        assert.equal(row.run_id, null, 'an inbox send is not campaign traffic');
+        assert.equal(row.type, 'document');
+        assert.equal(testDb.prepare("SELECT count(*) AS n FROM media WHERE wamid = 'media-out-1'").get().n, 0,
+          'nothing outbound may ever land in the inbound media table');
+      });
+    } finally { restore(); }
+  });
+
+  testAsync('with no caption the filename stands in as the body', async () => {
+    openThread('919700000014', 'Sarah');
+    const asset = seedAsset();
+    const restore = stubGraph(async () => ({
+      ok: true, headers: new Map(), json: async () => ({ messages: [{ id: 'media-out-2' }] }) }));
+    try {
+      await withCreds(async () => {
+        await sendMedia('919700000014', asset.id, '');
+        const row = testDb.prepare("SELECT body FROM messages WHERE wamid = 'media-out-2'").get();
+        assert.match(row.body, /price-list\.pdf/,
+          'a NULL body is a blank line in the transcript, the search index and the thread preview');
+      });
+    } finally { restore(); }
+  });
+
+  testAsync('the sent file appears in the transcript as outbound media', async () => {
+    openThread('919700000015', 'Asha');
+    const asset = seedAsset();
+    const restore = stubGraph(async () => ({
+      ok: true, headers: new Map(), json: async () => ({ messages: [{ id: 'media-out-3' }] }) }));
+    try {
+      await withCreds(async () => {
+        await sendMedia('919700000015', asset.id, 'list');
+        const m = inboxThread('919700000015').messages.find(x => x.id === 'media-out-3');
+        assert.ok(m.outMedia, 'without this the operator cannot see what they sent');
+        assert.equal(m.outMedia.filename, 'price-list.pdf');
+        assert.equal(m.outMedia.kind, 'document');
+        assert.equal(m.media, null,
+          'outMedia is a separate key: inbound carries a risk verdict, an expiry and a ' +
+          'Keep/Discard decision, and none of those mean anything for the operator own file');
+      });
+    } finally { restore(); }
+  });
+
+  test('the inbox never learns about the opt-out list', () => {
+    const src = require('fs').readFileSync('./src/services/inbox.js', 'utf8');
+    assert.ok(!/require\('\.\/contacts'\)/.test(src),
+      'someone who opted out of promotions and then writes in still deserves an answer — ' +
+      'and a reply with a file attached is still a reply, not a marketing message');
+  });
+}
 
 console.log('\nruns');
 test('startRun returns an id and records the label', () => {

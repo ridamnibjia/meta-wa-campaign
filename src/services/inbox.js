@@ -5,7 +5,7 @@ const { log, emit } = require('../state');
 const { normalizePhone } = require('../lib/phone');
 const { graphSend } = require('./graph');
 const { explainError } = require('../lib/errors');
-const { INBOUND_TTL_MS } = require('./media');
+const { INBOUND_TTL_MS, getAsset, ensureMediaId } = require('./media');
 const { effectiveRisk } = require('../lib/filerisk');
 
 // An inbound message opens a 24-hour "customer service window" during which the
@@ -63,8 +63,8 @@ const threadExists = db.prepare('SELECT wa_id FROM threads WHERE wa_id = ?');
 // run_id is left to its NULL default: an inbox reply is not part of any
 // campaign, and the campaign counters must not count it.
 const insertOutbound = db.prepare(`
-  INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
+  INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status, asset_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const touchThread = db.prepare('UPDATE threads SET last_at = max(last_at, ?) WHERE wa_id = ?');
@@ -144,12 +144,93 @@ async function sendReply(waId, text) {
     const entry = { id: data.messages[0].id, dir: 'out', type: 'text', text: body, at: Date.now(), status: 'sent' };
     db.exec('BEGIN');
     try {
-      insertOutbound.run(entry.id, waId, 'out', 'text', body, entry.at, 'sent');
+      insertOutbound.run(entry.id, waId, 'out', 'text', body, entry.at, 'sent', null);
       touchThread.run(entry.at, waId);
       db.exec('COMMIT');
     } catch (e) { db.exec('ROLLBACK'); throw e; }
     emit('inbox', summary());
     log('success', `replied to ${t.name || waId} (+${waId})`);
+    return { ok: true, message: entry };
+  } catch (e) {
+    return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
+  }
+}
+
+// The same send as sendReply, with a file on it. Kept as its own function
+// rather than an optional argument on sendReply: the failure modes genuinely
+// differ — an asset can have been deleted, and Meta's media id can have expired
+// — and folding them in would make one function's error handling answer for two
+// different jobs.
+//
+// This is also the half of the 131049 answer the retry ladder cannot give. The
+// per-user marketing cap does not apply inside the 24-hour service window, so a
+// template that invites a reply followed by a free-form send here reaches people
+// no amount of retrying a marketing template will.
+//
+// Meta caps a media caption well below a text message and rejects an over-long
+// one with a code that never mentions the caption.
+const CAPTION_LIMIT = 1024;
+
+async function sendMedia(waId, assetId, caption = '') {
+  const text = String(caption || '').trim();
+  if (text.length > CAPTION_LIMIT) {
+    return { ok: false, error: `The caption is ${text.length} characters — WhatsApp allows ${CAPTION_LIMIT}. Shorten it, or send the file first and the rest as a separate message.` };
+  }
+  if (!CFG.accessToken || !CFG.phoneNumberId) return { ok: false, error: 'Credentials not configured' };
+
+  const asset = getAsset(assetId);
+  if (!asset) {
+    return { ok: false, error: 'That file is no longer in the library. Upload it again and resend.' };
+  }
+
+  // Re-checked against the clock at send time, not against whatever the browser
+  // last rendered — the picker may have been open for an hour.
+  const t = getThread.get(waId);
+  if (!isWindowOpen(t && { lastInboundAt: t.last_inbound_at })) {
+    return { ok: false, error: 'The 24-hour reply window for this contact has closed. Only an approved template can reopen the conversation.' };
+  }
+
+  // Meta deletes uploaded media at 30 days. ensureMediaId refreshes at 29 and
+  // re-uploads from local disk when the id has gone anyway, so sending a
+  // six-month-old price list works and the operator never learns it expired.
+  const got = await ensureMediaId(assetId);
+  if (!got.ok) return got;
+
+  // Meta nests the descriptor under a key named after the type, so `kind` is
+  // both the type and the key. `filename` is only meaningful on a document — on
+  // an image it is ignored, and on a video it is rejected.
+  const payload = { id: got.mediaId };
+  if (text) payload.caption = text;
+  if (asset.kind === 'document') payload.filename = asset.filename;
+
+  try {
+    const { res, data } = await graphSend('POST', `${CFG.phoneNumberId}/messages`, {
+      messaging_product: 'whatsapp',
+      recipient_type:    'individual',
+      to:                waId,
+      type:              asset.kind,
+      [asset.kind]:      payload,
+    });
+    if (!res.ok || !data.messages?.[0]?.id) {
+      const code = data.error?.code || 0;
+      const hint = explainError(code) || explainError(data.error?.error_subcode);
+      log('error', `media reply to +${waId} failed [${code}] ${data.error?.message || 'unknown'}`);
+      return { ok: false, error: data.error?.message || 'Send failed', hint };
+    }
+    // The body is what the transcript, the search index and every thread preview
+    // read. A media message with a NULL body is a blank line in all three, so
+    // the filename stands in when there is no caption.
+    const body  = text || `[${asset.kind}] ${asset.filename}`;
+    const entry = { id: data.messages[0].id, dir: 'out', type: asset.kind, text: body,
+                    at: Date.now(), status: 'sent' };
+    db.exec('BEGIN');
+    try {
+      insertOutbound.run(entry.id, waId, 'out', asset.kind, body, entry.at, 'sent', asset.id);
+      touchThread.run(entry.at, waId);
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
+    emit('inbox', summary());
+    log('success', `sent ${asset.filename} to ${t.name || waId} (+${waId})`);
     return { ok: true, message: entry };
   } catch (e) {
     return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
@@ -184,9 +265,12 @@ const pageOfMessages = db.prepare(`
   SELECT m.wamid, m.dir, m.type, m.body, m.at, m.rowid AS rid, m.status,
          m.error_code, m.error_title,
          md.media_id, md.mime_type, md.filename, md.file_size, md.path,
-         md.risk, md.risk_reason, md.scan_status, md.scan_signature, md.provisional
+         md.risk, md.risk_reason, md.scan_status, md.scan_signature, md.provisional,
+         ma.id AS asset_id, ma.filename AS asset_filename,
+         ma.mime_type AS asset_mime, ma.file_size AS asset_size, ma.kind AS asset_kind
     FROM messages m
-    LEFT JOIN media md ON md.wamid = m.wamid
+    LEFT JOIN media md        ON md.wamid = m.wamid
+    LEFT JOIN media_assets ma ON ma.id = m.asset_id
    WHERE m.wa_id = ?
      AND (? IS NULL OR m.at < ? OR (m.at = ? AND m.rowid < ?))
    ORDER BY m.at DESC, m.rowid DESC
@@ -219,6 +303,17 @@ const toEntry = (r, now = Date.now()) => ({
     code:  r.error_code ?? null,
     title: r.error_title ?? null,
     hint:  explainError(r.error_code),
+  } : null,
+  // Outbound media the operator sent. A separate key from `media` above, which
+  // is inbound: that one carries a risk verdict, a 30-day expiry and a
+  // Keep/Discard decision, and not one of those means anything for a file the
+  // operator uploaded themselves.
+  outMedia: r.asset_id ? {
+    assetId:  r.asset_id,
+    filename: r.asset_filename,
+    mime:     r.asset_mime,
+    size:     r.asset_size,
+    kind:     r.asset_kind,
   } : null,
   media: r.media_id ? {
     mediaId:  r.media_id,
@@ -356,5 +451,5 @@ function search(q, { waId = null, limit = 50 } = {}) {
   };
 }
 
-module.exports = { WINDOW_MS, PAGE_SIZE, isWindowOpen, recordInbound, markRead, sendReply,
-                   summary, thread, describe, search };
+module.exports = { WINDOW_MS, PAGE_SIZE, CAPTION_LIMIT, isWindowOpen, recordInbound, markRead,
+                   sendReply, sendMedia, summary, thread, describe, search };

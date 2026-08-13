@@ -172,6 +172,8 @@ module.exports = {
   markRead:    require('./src/services/inbox').markRead,
   inboxThread: require('./src/services/inbox').thread,
   sendReply:   require('./src/services/inbox').sendReply,
+  sendMedia:   require('./src/services/inbox').sendMedia,
+  CAPTION_LIMIT: require('./src/services/inbox').CAPTION_LIMIT,
   checkPassword:  auth.checkPassword,
   createSession:  auth.createSession,
   validSession:   auth.validSession,
