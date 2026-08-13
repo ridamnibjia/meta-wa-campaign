@@ -1018,6 +1018,9 @@ console.log('\nschema — media + template tables');
     assert.ok(cols(d, 'media_assets').includes('sha256'));
     assert.ok(cols(d, 'media_assets').includes('meta_handle'));
     assert.ok(cols(d, 'media_assets').includes('media_id_at'));
+    assert.ok(cols(d, 'messages').includes('asset_id'),
+      'outbound media links to media_assets and never to the media table — that one lives in ' +
+      'MEDIA_DIR and is swept at 90 days, which would delete the price list');
     assert.ok(cols(d, 'templates').includes('header_format'));
     assert.ok(cols(d, 'templates').includes('display_name'));
     d.close();
@@ -1095,6 +1098,33 @@ console.log('\nmedia — saveUpload');
     const r = saveUpload(file(Buffer.from('hello'), 'note.txt', 'text/plain; charset=utf-8'));
     assert.equal(r.ok, true, r.error);
     assert.equal(r.asset.kind, 'document');
+  });
+
+  // The classifier gate. saveUpload used to trust the declared mime type, which
+  // was the one path lib/filerisk did not cover — and this path is the one that
+  // reaches every dealer on the list.
+  test('an executable wearing a PDF name and a PDF mime type is refused', () => {
+    const r = saveUpload(file(
+      Buffer.concat([Buffer.from('MZ'), Buffer.alloc(512)]), 'price-list.pdf', 'application/pdf'));
+    assert.equal(r.ok, false,
+      'the operator is authenticated, but an authenticated operator can still be handed a file ' +
+      'and asked to forward it — the bytes are the only signal that does not lie');
+    assert.match(r.error, /refused/i, 'and the refusal has to say what to do next');
+  });
+
+  test('a real PDF still uploads — the gate refuses block, not everything', () => {
+    const r = saveUpload(file(Buffer.from('%PDF-1.7 a genuine document'), 'real.pdf', 'application/pdf'));
+    assert.equal(r.ok, true,
+      'a PDF caps at the ok tier by design, and it is the single most common thing this business sends');
+  });
+
+  test('a macro-capable document is allowed through, not blocked', () => {
+    // 'warn', not 'block'. Refusing every archive and macro-capable document
+    // would stop an operator sending a legitimate spreadsheet, and the operator
+    // is the one person in this system who is already trusted.
+    const r = saveUpload(file(Buffer.from('PK xlsx-ish'), 'prices.xlsx',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'));
+    assert.equal(r.ok, true, r.error);
   });
 
   test('kindFor maps each accepted type to its kind', () => {

@@ -88,6 +88,22 @@ function saveUpload(file) {
     return { ok: false, error: `That ${kind} is ${mb(size)} — Meta's limit for a ${kind} header is ${mb(maxBytes)}` };
   }
 
+  // The last gap in the file-risk engine. saveUpload used to take the browser's
+  // declared mime type on trust — the uploader is the authenticated operator, so
+  // the risk was low, but low is not none: an operator can be handed a file and
+  // asked to forward it, and this path reaches every dealer on the list.
+  //
+  // Only the worst tier is refused. A PDF caps at `ok` by design and is the most
+  // common thing this business sends, so anything stricter would block the job
+  // the app exists to do. ClamAV deliberately does NOT run here — it runs on the
+  // inbound path where the bytes are a stranger's, and adding a clamd dependency
+  // to an operator action would break uploads on every deployment where the
+  // scanner happens to be down, which is a worse failure than the one it stops.
+  const verdict = classify({ mime, filename: file.originalname, bytes: file.buffer });
+  if (verdict.tier === 'block') {
+    return { ok: false, error: `That file was refused. ${verdict.reason} Its name says ${mime}, but its actual contents do not agree — re-export it from the app that made it, or send a PDF instead.` };
+  }
+
   const sha = crypto.createHash('sha256').update(file.buffer).digest('hex');
 
   // The same file dragged in twice is one row, one file on disk, one Resumable

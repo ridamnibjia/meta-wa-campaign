@@ -205,6 +205,12 @@ function openDb(file) {
   addColumn(d, 'campaign_runs', 'template_body', 'TEXT');
   addColumn(d, 'campaign_runs', 'template_lang', 'TEXT');
   addColumn(d, 'campaign_runs', 'header_asset',  'INTEGER REFERENCES media_assets(id)');
+  // Outbound media on an inbox message points at the operator's own upload.
+  // Deliberately NOT the `media` table: that one holds what customers sent us,
+  // lives in MEDIA_DIR and is swept at 90 days by services/retention.js.
+  // Pointing an outbound send at it would put the operator's price list under
+  // that sweep and delete it from disk with nothing anywhere to say why.
+  addColumn(d, 'messages', 'asset_id', 'INTEGER REFERENCES media_assets(id)');
   // Inbound media carries a verdict, not just bytes. `risk` is the
   // worst-of-three-signals tier from lib/filerisk; `scan_status` is ClamAV's
   // answer. Two columns because they answer different questions — "what kind
