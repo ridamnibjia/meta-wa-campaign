@@ -48,19 +48,26 @@ function DiskBar({ d }) {
   );
 }
 
+// A file is selectable if deleting it is possible at all — which includes a file
+// history points at, because that one has a force path. It is NOT selectable
+// when the answer is a flat no: a kept customer file on its retention window, or
+// a row whose bytes are already gone.
+const selectable = row => row.deletable || row.forceable;
+
 function StorageRow({ row, checked, onToggle, onRename, onForce }) {
-  // A real checkbox, disabled, rather than a lock glyph where the checkbox
-  // should be: an emoji standing in for a control reads as a broken row, and an
-  // operator clicks it and concludes the page is stuck. Disabled plus the reason
-  // spelled out beside it reads as a refusal, which is what it is.
+  // Either a working checkbox or no checkbox. A disabled one is the worst of
+  // both: an operator clicks it, nothing happens, and they conclude the page is
+  // broken rather than that the file is protected. The reason is on the row
+  // either way, which is what a refusal actually needs to say.
   return (
     <div className={cn('flex items-center gap-2 border-b border-border px-3 py-2 text-xs last:border-0',
                        row.deletedAt && 'opacity-60')}>
       <div className="w-5 shrink-0">
-        <input type="checkbox" checked={checked} disabled={!row.deletable}
-               onChange={() => onToggle(row)}
-               title={row.deletable ? '' : row.why || 'This file cannot be deleted here'}
-               aria-label={row.deletable ? `Select ${row.filename}` : `${row.filename} — ${row.why || 'cannot be deleted'}`} />
+        {selectable(row)
+          ? <input type="checkbox" checked={checked} onChange={() => onToggle(row)}
+                   aria-label={`Select ${row.filename}`} />
+          : <span className="block text-center text-muted-foreground" title={row.why || 'This file cannot be deleted here'}
+                  aria-label={`${row.filename} — ${row.why || 'cannot be deleted'}`}>–</span>}
       </div>
       <div className="min-w-0 flex-1">
         <p className={cn('truncate font-medium', row.deletedAt && 'line-through')}>{row.filename}</p>
@@ -76,8 +83,9 @@ function StorageRow({ row, checked, onToggle, onRename, onForce }) {
       {row.renameable && (
         <Button variant="ghost" size="sm" onClick={() => onRename(row)} title="Rename">✎</Button>
       )}
-      {/* Its own button, never part of "Delete selected": deleting a file that
-          history points at is a second, deliberate decision. */}
+      {/* The one-file path, with the fuller sentence. Selecting it works too —
+          "Delete selected" then names it in its own second confirm, because
+          deleting a file history points at is always a second decision. */}
       {row.forceable && (
         <Button variant="ghost" size="sm" className="text-destructive" title="Delete anyway"
                 onClick={() => onForce(row)}>Delete anyway</Button>
@@ -133,8 +141,26 @@ function Storage() {
 
   const removeSelected = async () => {
     if (!window.confirm(`Delete ${sel.length} file${sel.length === 1 ? '' : 's'}? This frees about ${bytesOf(selectedBytes)} and cannot be undone.`)) return;
+
+    // Files history still points at are inside the selection, but force is never
+    // implied by it: they are named, one per line, in a second confirm. Saying no
+    // here deletes the rest — a refusal on one row must not cancel the batch.
+    const inUse = matched.filter(r => isSel(r) && !r.deletable && r.forceable);
+    let force = false;
+    if (inUse.length) {
+      force = window.confirm(
+        `${inUse.length} of these ${inUse.length === 1 ? 'is' : 'are'} still in use:\n\n`
+        + inUse.map(r => `• ${r.filename} — ${r.why}`).join('\n')
+        + '\n\nDelete them anyway? The files go; their records are kept so those campaigns and messages '
+        + 'can still say what they sent, and re-uploading the same file restores it.\n\n'
+        + 'Cancel to delete only the files that are not in use.');
+    }
+
+    const items = sel.map(s => (force && inUse.some(r => r.store === s.store && r.id === s.id)
+      ? { ...s, force: true } : s));
+
     setBusy(true); setError(''); setMsg(null);
-    const r = await api.post('/api/media/storage/remove', { items: sel })
+    const r = await api.post('/api/media/storage/remove', { items })
       .catch(() => ({ ok: false, error: 'Network error' }));
     setBusy(false);
     if (!r.ok) return setError(r.error);
