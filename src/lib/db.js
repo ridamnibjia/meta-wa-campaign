@@ -104,6 +104,23 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 CREATE INDEX IF NOT EXISTS idx_contacts_enabled ON contacts(enabled);
 
+-- The opt-out, kept apart from the contact it is about.
+--
+-- contacts.enabled used to be the whole record, which made "delete this
+-- contact" and "forget they opted out" the same action — and the next CSV
+-- upload then re-created them as enabled and messaged them again. A row here
+-- outlives the contacts row on purpose: it is the compliance record, and the
+-- contacts row is only the customer list.
+--
+-- Only an explicit manual re-enable removes a row from this table. Nothing
+-- automatic does, because every automatic path into disabled is a reason to
+-- stay there.
+CREATE TABLE IF NOT EXISTS suppressed (
+  phone  TEXT PRIMARY KEY,   -- normalized dial string, no +
+  reason TEXT,               -- 'manual' | 'opt_out' | 'failed_hard'
+  at     INTEGER NOT NULL
+);
+
 -- Provenance. Which upload introduced which contacts, and what the file was.
 -- skipped_count is the number this app used to throw away in silence.
 CREATE TABLE IF NOT EXISTS csv_uploads (
@@ -243,6 +260,17 @@ function openDb(file) {
   d.exec(`CREATE INDEX IF NOT EXISTS idx_run_recipients_retry
             ON run_recipients(run_id, retry_after)
             WHERE skipped_reason = 'retry' AND wamid IS NULL`);
+  // A file an operator deleted while history still pointed at it. The row stays
+  // so the template and the sent message can still name what they sent; the
+  // bytes are gone. NULL means the file is really here.
+  addColumn(d, 'media_assets', 'deleted_at', 'INTEGER');
+  // Backfill: every contact disabled before the suppressed table existed. An
+  // INSERT OR IGNORE over a table that is usually empty, so it is idempotent and
+  // free on every later boot. Without it, the first CSV re-upload after this
+  // upgrade would re-enable everyone who had ever opted out.
+  d.exec(`INSERT OR IGNORE INTO suppressed (phone, reason, at)
+          SELECT phone, disabled_reason, coalesce(disabled_at, first_seen)
+            FROM contacts WHERE enabled = 0`);
   return d;
 }
 

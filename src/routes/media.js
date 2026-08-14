@@ -30,8 +30,12 @@ router.post('/media/upload', (req, res) => {
     }
     const r = saveUpload(req.file);
     if (!r.ok) return res.json(r);
-    log('info', `Media ${r.deduped ? 'reused' : 'saved'} — ${r.asset.filename} (${r.asset.kind})`);
-    res.json({ ok: true, asset: r.asset, deduped: !!r.deduped });
+    // Three outcomes, not two: a re-upload of bytes that were force-deleted
+    // restores the row history already points at, and an operator who deleted
+    // the wrong file needs to be told that is what just happened.
+    const what = r.revived ? 'restored' : r.deduped ? 'reused' : 'saved';
+    log('info', `Media ${what} — ${r.asset.filename} (${r.asset.kind})`);
+    res.json({ ok: true, asset: r.asset, deduped: !!r.deduped, revived: !!r.revived });
   });
 });
 

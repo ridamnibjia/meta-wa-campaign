@@ -8,22 +8,17 @@ function SettingsView() {
   const [prices,   setPrices]   = useState({ MARKETING: 0, UTILITY: 0, AUTHENTICATION: 0, currency: '₹' });
   const [creds,    setCreds]    = useState({ phoneId: '', token: '', wabaId: '' });
   const [saved,    setSaved]    = useState('');
-  const [optAdd,   setOptAdd]   = useState('');
 
-  // The directory is loaded here rather than held in app state: it is only ever
-  // read on this page, and a campaign of a thousand contacts should not push a
-  // thousand rows through every socket broadcast.
-  const [directory, setDirectory] = useState([]);
-  const [counts,    setCounts]    = useState({ total: 0, enabled: 0, disabled: 0 });
-  const [filter,    setFilter]    = useState('disabled');
+  // Only the counts are read here — the list itself lives on the Contacts page.
+  // size=1 because this asks a question about totals, not about rows: the
+  // response carries `counts` regardless of how many contacts come with it.
+  const [counts, setCounts] = useState({ total: 0, enabled: 0, disabled: 0 });
 
-  const loadDirectory = useCallback(() => {
-    api.get(`/api/contacts/directory${filter === 'disabled' ? '?disabled=1' : ''}`)
-      .then(d => { setDirectory(d.contacts || []); setCounts(d.counts || counts); })
+  useEffect(() => {
+    api.get('/api/contacts/directory?size=1')
+      .then(d => setCounts(d.counts || { total: 0, enabled: 0, disabled: 0 }))
       .catch(() => {});
-  }, [filter]);
-
-  useEffect(() => { loadDirectory(); }, [loadDirectory, ss.disabledCount]);
+  }, [ss.disabledCount]);
 
   useEffect(() => {
     const c = ss.config || {};
@@ -52,14 +47,6 @@ function SettingsView() {
   const saveCreds = async () => {
     const r = await api.post('/api/config', { phoneNumberId: creds.phoneId, accessToken: creds.token, wabaId: creds.wabaId });
     flash(r.configured ? 'Credentials saved' : 'Saved — still incomplete');
-  };
-
-  const editContacts = async patch => {
-    const r = await api.post('/api/contacts/directory', patch).catch(() => null);
-    if (!r?.ok) return alert('Could not update the contact list.');
-    setCounts(r.counts);
-    loadDirectory();
-    if (r.invalid?.length) alert('Not a valid phone number: ' + r.invalid.join(', '));
   };
 
   const eta  = Math.max(1, Math.round((ss.total || 0) * settings.delaySec / 60));
@@ -160,7 +147,10 @@ function SettingsView() {
         </Card>
       )}
 
-      {/* Contacts — one list, one switch */}
+      {/* Contacts — the list itself has its own screen now. This card is the
+          summary and the way there: two copies of the same editable list is two
+          places to fix a bug, and the one with search and paging is the one
+          that survives a real customer list. */}
       <Card>
         <CardHeader>
           <CardTitle>
@@ -171,57 +161,11 @@ function SettingsView() {
             Taps on “Stop promotions” land here automatically, as do numbers Meta reports as undeliverable.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex gap-2">
-            <Input className="flex-1 font-mono" value={optAdd} placeholder="+91 98765 43210"
-                   onChange={e => setOptAdd(e.target.value)}
-                   onKeyDown={e => { if (e.key === 'Enter' && optAdd) { editContacts({ disable: [optAdd] }); setOptAdd(''); } }} />
-            <Button variant="outline" disabled={!optAdd}
-                    onClick={() => { editContacts({ disable: [optAdd] }); setOptAdd(''); }}>Disable</Button>
-          </div>
-
-          <div className="flex gap-1.5 text-xs">
-            {['disabled', 'all'].map(f => (
-              <Button key={f} size="sm" variant={filter === f ? 'secondary' : 'ghost'}
-                      onClick={() => setFilter(f)}>
-                {f === 'disabled' ? `Disabled (${num(counts.disabled)})` : `All (${num(counts.total)})`}
-              </Button>
-            ))}
-          </div>
-
-          {directory.length > 0 ? (
-            <>
-              <div className="max-h-64 divide-y divide-border overflow-y-auto rounded-md border border-border">
-                {directory.map(c => (
-                  <div key={c.phone} className="flex items-center justify-between gap-2 px-3 py-1.5 text-xs">
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate font-medium">{c.name || '—'}</p>
-                      <p className="font-mono text-[11px] text-muted-foreground">+{c.phone}</p>
-                    </div>
-                    {!c.enabled && <Badge variant="outline">{REASON_LABEL[c.disabledReason] || 'disabled'}</Badge>}
-                    {c.enabled ? (
-                      <Button variant="link" size="sm" className="text-destructive"
-                              onClick={() => editContacts({ disable: [c.phone] })}>Disable</Button>
-                    ) : (
-                      <Button variant="link" size="sm" onClick={() => {
-                        const why = c.disabledReason === 'opt_out'
-                          ? `+${c.phone} asked not to be messaged. Only re-enable them if they have asked to come back.`
-                          : `Re-enable +${c.phone}?`;
-                        if (confirm(why)) editContacts({ enable: [c.phone] });
-                      }}>Enable</Button>
-                    )}
-                  </div>
-                ))}
-              </div>
-              <a href="/api/contacts/directory/download" className="inline-block text-xs text-primary underline-offset-4 hover:underline">
-                Download the disabled list
-              </a>
-            </>
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              {filter === 'disabled' ? 'Nobody is disabled.' : 'No contacts yet — upload a CSV on the Campaign page.'}
-            </p>
-          )}
+        <CardContent className="flex flex-wrap items-center gap-3">
+          <Button size="sm" variant="outline" onClick={() => go('contacts')}>Open contacts</Button>
+          <a href="/api/contacts/directory/download" className="text-xs text-primary underline-offset-4 hover:underline">
+            Download the disabled list
+          </a>
         </CardContent>
       </Card>
 

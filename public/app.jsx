@@ -34,6 +34,7 @@ const ROUTES = [
   { path: 'inbox',    label: 'Inbox',     icon: '✉' },
   { path: 'history',  label: 'History',   icon: '▤' },
   { path: 'storage',  label: 'Storage',   icon: '▦' },
+  { path: 'contacts', label: 'Contacts',  icon: '☰' },
   { path: 'settings', label: 'Settings',  icon: '⚙' },
   { path: 'diagnostics', label: 'Diagnostics', icon: '⚕' },
 ];
@@ -45,7 +46,12 @@ function useRoute() {
     window.addEventListener('hashchange', on);
     return () => window.removeEventListener('hashchange', on);
   }, []);
-  return [route.split('/')[0], route];
+  // The query string belongs to the view, not to the router: Contacts keeps its
+  // search, filter and page number in the hash so a link to page 3 of the
+  // disabled contacts is a link somebody can send. Without stripping it here,
+  // "contacts?q=asha" is a tab name nothing matches and the shell falls back to
+  // the dashboard the moment anything is typed.
+  return [route.split('/')[0].split('?')[0], route];
 }
 
 const go = path => { window.location.hash = '#/' + path; };
@@ -329,7 +335,8 @@ function App() {
   }
 
   const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, history: History,
-                 storage: Storage, settings: SettingsView, diagnostics: Diagnostics }[tab] || Dashboard;
+                 storage: Storage, contacts: Contacts, settings: SettingsView,
+                 diagnostics: Diagnostics }[tab] || Dashboard;
 
   return (
     <AppContext.Provider value={ctx}>

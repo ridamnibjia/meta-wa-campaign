@@ -283,9 +283,26 @@ the extra columns and deliberately does not touch `enabled`. Turning someone bac
 on is always a manual, confirmed action, because every automatic path into
 `disabled` is a reason to stay there.
 
+**Deleting a contact does not delete their opt-out.** The **Contacts** page can
+remove a row from the customer list, but the opt-out is recorded in its own
+`suppressed` table and outlives it. If a later CSV contains that number again,
+the contact comes back **disabled**, with the original reason. The only thing
+that clears a suppression is an explicit, confirmed Enable.
+
 `GET /api/contacts/directory/download` exports the disabled list with names,
 reasons and timestamps — the file you hand over when someone asks you to prove
 you stopped messaging them.
+
+### The Contacts page
+
+The customer list itself, searched and paged on the server: type part of a name
+or number, filter by Everyone / Messageable / Disabled, and page through. The
+search, the filter and the page number live in the URL, so a link to page 3 of
+the disabled contacts is a link you can send, and Back does what Back should.
+
+Per row you can rename, disable, enable, or delete. Renaming touches the display
+name only — the phone number is what every message, queue row and thread joins
+on, so a wrong number is a delete and a re-add rather than an edit.
 
 ### The skip report
 
@@ -399,6 +416,19 @@ Renaming changes the display name only. The content hash and the bytes are
 untouched, so deduplication still works and every campaign that reported sending
 that file still reported the truth. Customer files cannot be renamed at all: the
 name is part of what they sent.
+
+**Delete anyway.** A file a template or a sent message still points at is
+refused by the checkbox, and offered its own **Delete anyway** button with its
+own confirmation. Taking it removes the bytes and keeps the record: the row stays
+with a deleted date, struck through on the page, so the campaign that sent it can
+still say what it sent. Re-uploading the same file restores it — the row is
+matched by content hash, so history keeps pointing at the same one. Until then,
+sending it fails with a sentence saying it was deleted rather than a stack trace.
+
+The disk breakdown also shows the filesystem's **root reserve** as its own line.
+ext4 keeps about 5% back, roughly a gigabyte on a 20 GB disk; it is neither free
+space this app may use nor space anything is using, and counting it as OS usage
+overstated the OS by that much.
 
 ### Diagnostics
 

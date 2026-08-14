@@ -56,7 +56,11 @@ const insertAsset = db.prepare(`
 `);
 const byHash   = db.prepare('SELECT * FROM media_assets WHERE sha256 = ?');
 const byId     = db.prepare('SELECT * FROM media_assets WHERE id = ?');
-const allRows  = db.prepare('SELECT * FROM media_assets ORDER BY uploaded_at DESC, id DESC');
+// The library the pickers show. A tombstoned row is a record, not a file: it
+// must not be offerable as a header or an attachment, because the bytes it
+// names are gone and the send would fail at Meta rather than here.
+const allRows  = db.prepare('SELECT * FROM media_assets WHERE deleted_at IS NULL ORDER BY uploaded_at DESC, id DESC');
+const reviveRow = db.prepare('UPDATE media_assets SET deleted_at = NULL, last_used_at = ? WHERE id = ?');
 const touchRow = db.prepare('UPDATE media_assets SET last_used_at = ? WHERE id = ?');
 const setHandle  = db.prepare('UPDATE media_assets SET meta_handle = ? WHERE id = ?');
 const setMediaId = db.prepare('UPDATE media_assets SET media_id = ?, media_id_at = ? WHERE id = ?');
@@ -110,10 +114,26 @@ function saveUpload(file) {
   // Upload and one media id. Dedupe on content, not on name: a renamed copy of
   // last month's price list is still last month's price list.
   const existing = byHash.get(sha);
-  if (existing) {
+  if (existing && !existing.deleted_at) {
     touchRow.run(Date.now(), existing.id);
     log('info', `Upload "${file.originalname}" matched an existing file — reusing asset ${existing.id}`);
     return { ok: true, asset: byId.get(existing.id), deduped: true };
+  }
+
+  // Re-uploading the exact bytes of a force-deleted file revives its row rather
+  // than making a second one: sha256 is UNIQUE, and the tombstone is what the
+  // template and the sent message still point at. The stored filename is kept —
+  // history already reported that name, and the bytes are the same bytes.
+  if (existing) {
+    const free = freeBytes(UPLOAD_DIR);
+    if (free - size < MEDIA_LIMITS.minFreeBytes) {
+      return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Nothing was saved.` };
+    }
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    fs.writeFileSync(assetPath(existing), file.buffer);
+    reviveRow.run(Date.now(), existing.id);
+    log('info', `Upload "${file.originalname}" restored deleted asset ${existing.id} ("${existing.filename}") — history points at it again`);
+    return { ok: true, asset: byId.get(existing.id), revived: true };
   }
 
   // The same floor the inbound path enforces, and for a stronger reason now that
@@ -171,17 +191,27 @@ const assetRefs = {
   messages:      db.prepare('SELECT count(*) AS n FROM messages      WHERE asset_id     = ?'),
 };
 const deleteAssetRow = db.prepare('DELETE FROM media_assets WHERE id = ?');
+// The tombstone. Bytes gone, row kept, so a template that names this file and a
+// message that reported sending it can both still say what it was.
+const tombstoneRow = db.prepare('UPDATE media_assets SET deleted_at = ? WHERE id = ?');
 
-function deleteAsset(id) {
+// `force` is the operator saying "delete it anyway" to a file history points at.
+// It is never what a plain delete does: SQLite does not enforce the REFERENCES
+// on these columns (foreign_keys is off), so a forced delete silently orphans
+// three tables unless the row survives to be found. That is what the tombstone
+// is — deliberately not a recycle bin, because the bytes really are gone.
+function deleteAsset(id, { force = false } = {}) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: 'That file is not in the library.' };
+  if (asset.deleted_at) return { ok: false, error: `"${asset.filename}" was already deleted — only its record is kept, so history can still say what was sent.` };
 
   const used = {
     templates: assetRefs.templates.get(asset.id).n,
     runs:      assetRefs.campaign_runs.get(asset.id).n,
     messages:  assetRefs.messages.get(asset.id).n,
   };
-  if (used.templates || used.runs || used.messages) {
+  const referenced = used.templates || used.runs || used.messages;
+  if (referenced && !force) {
     // Named parts, not a count: "in use" tells an operator nothing about what
     // they would have to undo, and they will just try again.
     const parts = [
@@ -212,6 +242,12 @@ function deleteAsset(id) {
     return { ok: false, error: `Could not remove the file from disk: ${e.message}` };
   }
 
+  if (referenced) {
+    tombstoneRow.run(Date.now(), asset.id);
+    log('warn', `Force-deleted "${asset.filename}" — still referenced, record kept so history can name it. Freed ${mb(freed)}`);
+    return { ok: true, freed, filename: asset.filename, tombstoned: true };
+  }
+
   deleteAssetRow.run(asset.id);
   log('info', `Deleted "${asset.filename}" from the library — freed ${mb(freed)}`);
   return { ok: true, freed, filename: asset.filename };
@@ -227,6 +263,13 @@ const MEDIA_ID_TTL_MS = 29 * 24 * 60 * 60 * 1000;
 
 const readBytes = row => fs.readFileSync(assetPath(row));
 
+// A tombstoned row reaches every send path — a template still names it, an
+// inbox message still links to it. Refusing here, by name, is the difference
+// between an operator reading "that file was deleted, upload it again" and
+// reading an ENOENT stack trace from a readFileSync.
+const deletedMsg = a =>
+  `"${a.filename}" was deleted from this server on ${new Date(a.deleted_at).toLocaleDateString('en-IN')}. Upload the same file again to restore it, or pick another.`;
+
 // Template CREATION wants an h:… handle from the Resumable Upload API, which
 // keys on the APP id — not the WABA id, not the business id. It is a two-call
 // protocol: open a session, then push the bytes into it. The handle is single
@@ -236,6 +279,7 @@ const readBytes = row => fs.readFileSync(assetPath(row));
 async function ensureHandle(id) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: `Media asset ${id} not found` };
+  if (asset.deleted_at) return { ok: false, error: deletedMsg(asset) };
   if (asset.meta_handle) return { ok: true, handle: asset.meta_handle, asset };
   if (!CFG.accessToken) return { ok: false, error: 'Access Token not configured' };
   if (!CFG.appId) {
@@ -282,6 +326,7 @@ async function ensureHandle(id) {
 async function ensureMediaId(id, { force = false } = {}) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: `Media asset ${id} not found` };
+  if (asset.deleted_at) return { ok: false, error: deletedMsg(asset) };
 
   const fresh = asset.media_id && asset.media_id_at
     && (Date.now() - asset.media_id_at) < MEDIA_ID_TTL_MS;

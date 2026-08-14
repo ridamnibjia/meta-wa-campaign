@@ -47,6 +47,7 @@ const {
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
   overview, listStored, renameAsset, removeMany,
+  contacts,
 } = require('./server');
 
 let passed = 0;
@@ -975,7 +976,8 @@ test('the schema creates every table', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
   assert.deepEqual(names, ['campaign_runs', 'contacts', 'csv_uploads', 'media', 'media_assets',
-                           'messages', 'run_recipients', 'templates', 'threads', 'webhook_events']);
+                           'messages', 'run_recipients', 'suppressed', 'templates', 'threads',
+                           'webhook_events']);
 });
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
@@ -4801,6 +4803,202 @@ console.log('\nclamav scanning');
         assert.match(r.signature, /timed out/i);
       });
     } finally { CLAMAV.timeoutMs = saved; }
+  });
+}
+
+// ── The contact directory: search, paging, and an opt-out that outlives the row ─
+// The suppression table exists because "delete this contact" and "forget they
+// opted out" used to be the same action, and the next CSV upload then re-created
+// them as enabled and messaged them again. Every test here is about that gap.
+console.log('\ncontacts — directory paging, rename, delete, suppression');
+{
+  const seed = (phone, name) => contacts.upsertFromCsv([{ dialStr: phone, name }]);
+  let n = 0;
+  const nextPhone = () => `9199000${String(++n).padStart(5, '0')}`;
+
+  test('an opt-out survives deleting the contact, and a later CSV brings them back disabled', () => {
+    const p = nextPhone();
+    seed(p, 'Asha');
+    contacts.disable(p, 'opt_out');
+    assert.equal(contacts.remove(p).ok, true);
+    assert.equal(contacts.getRow(p), undefined, 'the customer-list row really is gone');
+    assert.equal(contacts.isDisabled(p), true,
+      'the compliance record is not the customer list — deleting one must not clear the other');
+
+    seed(p, 'Asha');
+    const back = contacts.getRow(p);
+    assert.equal(back.enabled, 0,
+      're-uploading a CSV must never message someone who opted out, row or no row');
+    assert.equal(back.disabled_reason, 'opt_out', 'and it says why, not just that');
+  });
+
+  test('an explicit re-enable is not undone by the next CSV upload', () => {
+    const p = nextPhone();
+    seed(p, 'Rahul');
+    contacts.disable(p, 'manual');
+    assert.equal(contacts.enable(p), true);
+    seed(p, 'Rahul');
+    assert.equal(contacts.isDisabled(p), false,
+      'an operator who deliberately re-enabled someone must not be overruled by an upload');
+  });
+
+  test('a number suppressed with no contacts row at all is still disabled', () => {
+    const p = nextPhone();
+    contacts.disable(p, 'opt_out');       // creates the row
+    contacts.remove(p);                    // operator deletes it
+    assert.equal(contacts.isEnabled(p), false,
+      'the campaign gate reads both tables, and fails closed when either says stop');
+  });
+
+  test('search escapes LIKE wildcards instead of matching everything', () => {
+    const p = nextPhone();
+    seed(p, '50% off shop');
+    seed(nextPhone(), 'Somebody Else');
+    const hit = contacts.page({ q: '50%' });
+    assert.equal(hit.total, 1, 'unescaped, "50%" is a wildcard and matches the whole table');
+    assert.equal(hit.rows[0].name, '50% off shop');
+    assert.equal(contacts.page({ q: '_' }).total, 0, 'and _ is a single-character wildcard');
+  });
+
+  test('paging returns a window and the total it came from', () => {
+    const marker = `Pager${Date.now()}`;
+    for (let i = 0; i < 5; i++) seed(nextPhone(), `${marker} ${i}`);
+    const first = contacts.page({ q: marker, limit: 2, offset: 0 });
+    const last  = contacts.page({ q: marker, limit: 2, offset: 4 });
+    assert.equal(first.total, 5, 'the pager needs the count, not the size of the page it got');
+    assert.equal(first.rows.length, 2);
+    assert.equal(last.rows.length, 1, 'the final page is short, not empty');
+    assert.equal(contacts.page({ q: marker, limit: 2, offset: 99 }).rows.length, 0,
+      'and paging past the end is empty rather than an error');
+  });
+
+  test('a hand-edited limit cannot ask for the whole table', () => {
+    assert.equal(contacts.page({ limit: 1000000 }).limit, 200, 'the ceiling is the server\'s, not the query string\'s');
+    assert.equal(contacts.page({ limit: 0 }).limit, 50);
+  });
+
+  test('the status filter is a whitelist', () => {
+    assert.equal(contacts.page({ status: 'nonsense' }).status, 'all',
+      'an unknown filter shows everything rather than silently hiding rows');
+    const off = contacts.page({ status: 'disabled' });
+    assert.ok(off.rows.every(r => r.enabled === 0));
+  });
+
+  test('renaming a contact touches the name and nothing else', () => {
+    const p = nextPhone();
+    seed(p, 'Typo Naem');
+    const r = contacts.rename(p, 'Priya Nair');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(contacts.getRow(p).name, 'Priya Nair');
+    assert.equal(contacts.getRow(p).phone, p, 'the phone number is the key every message joins on');
+  });
+
+  test('a blank or control-character name is refused', () => {
+    const p = nextPhone();
+    seed(p, 'Fine');
+    assert.equal(contacts.rename(p, '   ').ok, false);
+    assert.equal(contacts.rename(p, 'bad\u0000name').ok, false,
+      'this string is interpolated into a template and sent to Meta');
+    assert.equal(contacts.rename(p, 'x'.repeat(200)).ok, false);
+    assert.equal(contacts.getRow(p).name, 'Fine', 'and a refusal changes nothing');
+  });
+
+  test('editing someone who is not there is a sentence, not a crash', () => {
+    assert.match(contacts.rename('919999999999', 'Ghost').error, /No contact/);
+    assert.match(contacts.remove('919999999999').error, /No contact/);
+    assert.equal(contacts.rename('not a number', 'x').ok, false);
+  });
+}
+
+// ── Force delete and the tombstone ────────────────────────────────────────────
+// SQLite does not enforce the REFERENCES on messages.asset_id or
+// templates.header_asset — foreign_keys is off — so deleting a referenced asset
+// row would silently orphan history. The tombstone is the answer: bytes gone,
+// row kept, history can still say what it sent.
+console.log('\nstorage — force delete keeps the record, re-upload restores the file');
+{
+  const fsy = require('fs');
+  const upload = name => saveUpload({
+    buffer: Buffer.from(`%PDF-1.7 tombstone ${name}`),
+    originalname: name, mimetype: 'application/pdf' });
+
+  const reference = assetId => db
+    .prepare('INSERT INTO campaign_runs (started_at, label, header_asset) VALUES (?,?,?)')
+    .run(Date.now(), 'tombstone-ref', assetId);
+
+  test('a referenced asset is still refused without an explicit force', () => {
+    const a = upload('kes-series.pdf');
+    reference(a.asset.id);
+    const r = deleteAsset(a.asset.id);
+    assert.equal(r.ok, false, 'a plain delete must never be able to break history');
+    assert.ok(fsy.existsSync(assetPath(a.asset)), 'and the bytes are untouched');
+  });
+
+  test('force delete removes the bytes and keeps the record', () => {
+    const a = upload('force-me.pdf');
+    reference(a.asset.id);
+    const r = deleteAsset(a.asset.id, { force: true });
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.tombstoned, true);
+    assert.equal(fsy.existsSync(assetPath(a.asset)), false, 'the file really is gone');
+
+    const row = getAsset(a.asset.id);
+    assert.ok(row, 'the row stays, or the campaign that sent it can no longer name it');
+    assert.ok(row.deleted_at > 0);
+    assert.equal(row.filename, 'force-me.pdf', 'and it still says what was sent');
+  });
+
+  test('a tombstoned file is not offered in the library or counted as disk', () => {
+    const a = upload('hidden-after-delete.pdf');
+    reference(a.asset.id);
+    const bytes = overview().breakdown.uploads.bytes;
+    deleteAsset(a.asset.id, { force: true });
+
+    assert.equal(listAssets().some(x => x.id === a.asset.id), false,
+      'picking it would build a send that fails at Meta instead of failing here');
+    assert.equal(overview().breakdown.uploads.bytes, bytes - a.asset.file_size,
+      'a record with no bytes is not disk usage');
+
+    const listed = listStored().uploads.find(x => x.id === String(a.asset.id));
+    assert.ok(listed, 'it stays visible on the page that explains where files went');
+    assert.ok(listed.deletedAt > 0);
+    assert.equal(listed.deletable, false, 'there is nothing left to delete');
+    assert.match(listed.why, /deleted/);
+  });
+
+  test('deleting an already-deleted file, or renaming one, is refused', () => {
+    const a = upload('twice.pdf');
+    reference(a.asset.id);
+    deleteAsset(a.asset.id, { force: true });
+    assert.equal(deleteAsset(a.asset.id, { force: true }).ok, false);
+    assert.equal(renameAsset(a.asset.id, 'new-name.pdf').ok, false,
+      'the record is what history reads — renaming it would make it say something that never went out');
+  });
+
+  test('re-uploading the same bytes restores the tombstoned row rather than making a second one', () => {
+    const bytes = Buffer.from('%PDF-1.7 revive me');
+    const first  = saveUpload({ buffer: bytes, originalname: 'revive.pdf', mimetype: 'application/pdf' });
+    reference(first.asset.id);
+    deleteAsset(first.asset.id, { force: true });
+
+    const again = saveUpload({ buffer: bytes, originalname: 'revive-renamed.pdf', mimetype: 'application/pdf' });
+    assert.equal(again.ok, true, again.error);
+    assert.equal(again.revived, true);
+    assert.equal(again.asset.id, first.asset.id,
+      'sha256 is UNIQUE and the tombstone is what history points at — a second row would orphan it');
+    assert.equal(again.asset.deleted_at, null);
+    assert.equal(again.asset.filename, 'revive.pdf',
+      'the stored name stays: history already reported sending that name');
+    assert.ok(fsy.existsSync(assetPath(again.asset)), 'and the bytes are back on disk');
+  });
+
+  test('the root reserve is its own line, not part of "everything else"', () => {
+    const v = overview().volume;
+    if (v.total === null) return;             // a filesystem that cannot answer
+    assert.ok(v.reserved === null || v.reserved >= 0);
+    const ours = overview().ours;
+    assert.equal(v.other, Math.max(0, v.total - v.free - (v.reserved || 0) - ours),
+      'ext4 keeps 5% for root — counting it as OS usage overstated the OS by about a gigabyte');
   });
 }
 

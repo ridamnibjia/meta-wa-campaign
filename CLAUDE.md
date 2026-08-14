@@ -70,6 +70,7 @@ webhook cannot be re-fetched from Meta's push-only API, which would make the
 | `media_assets` | Operator uploads — template headers and inbox sends, deduped on sha256. Never swept. |
 | `templates` | What we submitted. Meta stays the source of truth for `status`. |
 | `contacts` | The customer list and the one `enabled` switch. |
+| `suppressed` | The opt-out, kept apart from the contact it is about, so it outlives a deleted row. |
 | `csv_uploads` | Provenance: what each upload did, including rows it could not read. |
 | `campaign_runs` | One per upload/start. Scopes every derived counter. |
 | `run_recipients` | The send queue on disk. Resume point is derived from it. |
@@ -191,6 +192,32 @@ Meta's reference, which will never list it.
 resurrect someone who opted out. The requirement is an *absence* in the
 `ON CONFLICT DO UPDATE` set list, which is exactly the kind of thing a future
 contributor "fixes" by adding `enabled = excluded.enabled`. There is a test.
+
+**The opt-out is a second table, and it outlives the contact.** `contacts.enabled`
+used to be the whole record, which made "delete this contact" and "forget they
+opted out" the same action — and the next CSV upload then re-created them as
+`enabled = 1` and messaged them again. `disable()` writes both rows, `enable()`
+deletes the `suppressed` row (an explicit re-enable must not be undone by the
+next upload), `remove()` deletes only the contact, and `upsertFromCsv` re-applies
+every suppression **inside the same transaction** as the inserts. `isDisabled()`
+reads both tables with an OR and so fails closed. The reason the re-apply is a
+statement after the loop rather than part of the upsert: the upsert cannot
+re-enable anyone (`enabled` is absent from its SET list), but it can INSERT, and
+an insert arrives with the column default. There is a test that deletes an
+opted-out contact, re-uploads the CSV, and asserts they come back disabled.
+
+**A deleted asset that history points at becomes a tombstone, not a gap.**
+SQLite does not enforce the `REFERENCES` on `messages.asset_id` or
+`templates.header_asset` — `foreign_keys` is never turned on — so a forced delete
+would silently orphan three tables. `deleteAsset(id, { force: true })` unlinks
+the bytes and stamps `media_assets.deleted_at` instead of deleting the row, so a
+campaign report can still name what it sent. A plain delete still refuses. The
+tombstone is invisible to `listAssets()` (picking it would build a send that
+fails at Meta rather than here), weighs zero in the storage totals, is not
+renameable, and every send path refuses it by name through `deletedMsg()`.
+Re-uploading the same bytes **revives** the row rather than making a second one,
+because `sha256` is UNIQUE and the tombstone is what history points at. It is
+deliberately not a recycle bin: the bytes really are gone.
 
 **Disabled blocks campaigns only.** `services/inbox.js` does not import
 `services/contacts.js` and a test asserts it never will. Someone who opted out of
@@ -325,6 +352,11 @@ exist. Do not add a non-idempotent write to `processEnvelope`.
   the whole Graph surface.
 - **Template creation needs an `h:…` handle; sending needs a `media_id`.** Same
   bytes, two identifiers, not interchangeable. Meta deletes media at 30 days.
+- **`statfs` reports three numbers, not two.** `bavail` is what a non-root
+  process may use; `bfree - bavail` is the filesystem's root reserve (ext4 keeps
+  5%, about 1 GB on a 20 GB disk). It is neither free nor used by anything, so
+  subtracting only `free` folded it into "everything else" and overstated the OS
+  by a gigabyte. `volume()` returns it and `overview()` subtracts it separately.
 - **Frontend scripts share one global scope** and load in the order listed in
   `index.html`. A `const` used by two views belongs in `ui.jsx`, which loads
   first.

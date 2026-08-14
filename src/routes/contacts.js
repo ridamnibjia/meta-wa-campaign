@@ -92,16 +92,48 @@ router.get('/contacts', (req, res) => {
 
 // The DIRECTORY — every contact this server has ever seen, whether or not they
 // are in the current CSV. This is the list that survives an upload.
+//
+// Searched and paged in SQL. It used to answer with every row: fine for the
+// disabled list, and a several-megabyte response for a business with a real
+// customer list. `disabled=1` still means the disabled page, because that is
+// what the older Settings screen asks for.
+const shape = r => ({
+  phone: r.phone, name: r.name,
+  enabled: !!r.enabled, disabledReason: r.disabled_reason, disabledAt: r.disabled_at,
+  firstSeen: r.first_seen, lastMessaged: r.last_messaged,
+});
+
 router.get('/contacts/directory', (req, res) => {
-  const rows = req.query.disabled === '1' ? contacts.disabledRows() : contacts.list();
+  const size   = Math.min(200, Math.max(1, parseInt(req.query.size, 10) || 50));
+  const pageNo = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const status = req.query.disabled === '1' ? 'disabled' : (req.query.status || 'all');
+  const p = contacts.page({ q: req.query.q || '', status, limit: size, offset: (pageNo - 1) * size });
   res.json({
     counts: contacts.counts(),
-    contacts: rows.map(r => ({
-      phone: r.phone, name: r.name,
-      enabled: !!r.enabled, disabledReason: r.disabled_reason, disabledAt: r.disabled_at,
-      firstSeen: r.first_seen, lastMessaged: r.last_messaged,
-    })),
+    contacts: p.rows.map(shape),
+    total: p.total, page: pageNo, size: p.limit, q: p.q, status: p.status,
+    pages: Math.max(1, Math.ceil(p.total / p.limit)),
   });
+});
+
+// One row at a time. The name only — phone is the primary key every message,
+// queue row and thread joins on, so a wrong number is a delete and a re-add.
+router.patch('/contacts/directory/:phone', (req, res) => {
+  const r = contacts.rename(req.params.phone, req.body?.name);
+  if (!r.ok) return res.status(400).json(r);
+  log('info', `Contacts — renamed +${r.contact.phone} to "${r.contact.name}"`);
+  res.json({ ok: true, contact: shape(r.contact) });
+});
+
+// Removing a contact removes them from the customer list and from nothing else.
+// An opt-out outlives the row it was recorded against — that is what the
+// suppressed table is for — so a later CSV brings them back disabled.
+router.delete('/contacts/directory/:phone', (req, res) => {
+  const r = contacts.remove(req.params.phone);
+  if (!r.ok) return res.status(400).json(r);
+  log('info', `Contacts — deleted +${r.phone}${r.stillSuppressed ? ' (their opt-out is kept)' : ''}`);
+  broadcast();
+  res.json({ ok: true, counts: contacts.counts(), stillSuppressed: r.stillSuppressed });
 });
 
 // Manual edits. People phone up and ask to be put back on the list, and numbers

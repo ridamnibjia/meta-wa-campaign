@@ -37,11 +37,20 @@ function volume(dir) {
     const st = fs.statfsSync(fs.existsSync(dir) ? dir : path.dirname(dir));
     // bsize * blocks is the whole filesystem; bavail is what a non-root process
     // may actually use, which is the honest "free" for this server.
-    return { total: st.bsize * st.blocks, free: st.bsize * st.bavail };
+    //
+    // bfree - bavail is the root reserve — ext4 keeps 5% by default, about a
+    // gigabyte on a 20 GB disk. It is neither free (this process cannot have
+    // it) nor used by anything, so counting it into "everything else" made the
+    // OS look a gigabyte fatter than it is. It gets its own line instead.
+    return {
+      total: st.bsize * st.blocks,
+      free:  st.bsize * st.bavail,
+      reserved: st.bsize * Math.max(0, Number(st.bfree - st.bavail)),
+    };
   } catch {
     // ponytail: a filesystem that cannot answer gets nulls and the UI says
     // "unavailable". Guessing a size would be worse than admitting it.
-    return { total: null, free: null };
+    return { total: null, free: null, reserved: null };
   }
 }
 
@@ -53,8 +62,10 @@ function fileBytes(...files) {
   return total;
 }
 
+// deleted_at IS NULL throughout: a tombstoned row is a record with no bytes, so
+// counting its file_size would report disk this app is not using.
 const assetTotals = db.prepare(
-  'SELECT count(*) AS files, coalesce(sum(file_size), 0) AS bytes FROM media_assets');
+  'SELECT count(*) AS files, coalesce(sum(file_size), 0) AS bytes FROM media_assets WHERE deleted_at IS NULL');
 const inboundTotals = db.prepare(`
   SELECT sum(CASE WHEN provisional = 0 THEN 1 ELSE 0 END)           AS keptFiles,
          coalesce(sum(CASE WHEN provisional = 0 THEN file_size ELSE 0 END), 0) AS keptBytes,
@@ -90,7 +101,12 @@ function overview({ now = Date.now() } = {}) {
       // itself, and worth showing so "20 GB total, 4 GB ours, 15 GB free" adds
       // up on screen instead of looking like a rounding error.
       used:  vol.total === null ? null : vol.total - vol.free,
-      other: vol.total === null ? null : Math.max(0, vol.total - vol.free - ours),
+      // Subtracted here as well as shown: without it the reserve is invisible
+      // and lands inside "everything else", which then overstates the OS by
+      // about a gigabyte on every ext4 volume this app runs on.
+      reserved: vol.reserved,
+      other: vol.total === null ? null
+        : Math.max(0, vol.total - vol.free - (vol.reserved || 0) - ours),
       minFree: MEDIA_LIMITS.minFreeBytes,
       belowFloor: vol.free !== null && vol.free < MEDIA_LIMITS.minFreeBytes,
     },
@@ -114,7 +130,7 @@ function overview({ now = Date.now() } = {}) {
 // path drives them. `kind` is the discriminator, and it is also what decides
 // whether a row may be removed at all.
 const assetRows = db.prepare(`
-  SELECT id, filename, mime_type, file_size, kind, uploaded_at, last_used_at, path
+  SELECT id, filename, mime_type, file_size, kind, uploaded_at, last_used_at, path, deleted_at
     FROM media_assets ORDER BY uploaded_at DESC, id DESC`);
 
 // Referenced-by counts come back with the row rather than being asked per file
@@ -143,21 +159,29 @@ function listStored({ now = Date.now() } = {}) {
   const uploads = assetRows.all().map(r => {
     const ref = refs.get(r.id) || { templates: 0, runs: 0, messages: 0 };
     const used = ref.templates + ref.runs + ref.messages;
+    const usedBy = `Used by ${[
+      ref.templates && `${ref.templates} template${ref.templates === 1 ? '' : 's'}`,
+      ref.runs      && `${ref.runs} campaign${ref.runs === 1 ? '' : 's'}`,
+      ref.messages  && `${ref.messages} sent message${ref.messages === 1 ? '' : 's'}`,
+    ].filter(Boolean).join(', ')}`;
+    const gone = !!r.deleted_at;
     return {
       store: 'upload', id: String(r.id),
-      filename: r.filename, mime: r.mime_type, size: r.file_size, kind: r.kind,
+      filename: r.filename, mime: r.mime_type, size: gone ? 0 : r.file_size, kind: r.kind,
       at: r.uploaded_at, lastUsedAt: r.last_used_at,
-      onDisk: fs.existsSync(assetPath(r)),
-      deletable: used === 0,
-      renameable: true,
+      deletedAt: r.deleted_at || null,
+      onDisk: !gone && fs.existsSync(assetPath(r)),
+      deletable: !gone && used === 0,
+      // A referenced file can still be deleted, but only by an operator who
+      // says so a second time. The flag is what lets the UI offer that as its
+      // own action rather than smuggling it into "Delete selected".
+      forceable: !gone && used > 0,
+      renameable: !gone,
       // The reason travels with the row so the UI never has to compose one, and
       // so a disabled checkbox can always say why it is disabled.
-      why: used === 0 ? null
-        : `Used by ${[
-            ref.templates && `${ref.templates} template${ref.templates === 1 ? '' : 's'}`,
-            ref.runs      && `${ref.runs} campaign${ref.runs === 1 ? '' : 's'}`,
-            ref.messages  && `${ref.messages} sent message${ref.messages === 1 ? '' : 's'}`,
-          ].filter(Boolean).join(', ')}`,
+      why: gone
+        ? `File deleted on ${new Date(r.deleted_at).toLocaleDateString('en-IN')} — this record is kept so ${used ? usedBy.replace('Used by ', '') : 'history'} can still name it`
+        : used === 0 ? null : usedBy,
     };
   });
 
@@ -199,6 +223,9 @@ const renameRow = db.prepare('UPDATE media_assets SET filename = ? WHERE id = ?'
 function renameAsset(id, filename) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: 'That file is not in the library.' };
+  // The row of a deleted file is the only remaining record of what was sent.
+  // Renaming it would make that record say something that never went out.
+  if (asset.deleted_at) return { ok: false, error: 'That file was deleted — its record is what history reads, so the name stays as it was sent.' };
 
   const name = String(filename || '').trim();
   if (!name) return { ok: false, error: 'Give the file a name.' };
@@ -235,9 +262,12 @@ function removeMany(items) {
     const id    = item && item.id;
 
     if (store === 'upload') {
-      const r = deleteAsset(id);
+      // force travels per item, not per request: a batch is a list of separate
+      // decisions, and "delete this one anyway" must not become "delete all of
+      // them anyway" because one row in the selection needed it.
+      const r = deleteAsset(id, { force: item.force === true });
       if (r.ok) { removed++; freed += r.freed || 0; }
-      results.push({ store, id, ok: r.ok, error: r.error || null, freed: r.freed || 0 });
+      results.push({ store, id, ok: r.ok, error: r.error || null, freed: r.freed || 0, tombstoned: !!r.tombstoned });
     } else if (store === 'inbound') {
       // discardInbound refuses a kept file outright, which is exactly the
       // behaviour wanted here — the check does not need repeating, and
