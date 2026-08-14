@@ -88,6 +88,22 @@ function saveUpload(file) {
     return { ok: false, error: `That ${kind} is ${mb(size)} — Meta's limit for a ${kind} header is ${mb(maxBytes)}` };
   }
 
+  // The last gap in the file-risk engine. saveUpload used to take the browser's
+  // declared mime type on trust — the uploader is the authenticated operator, so
+  // the risk was low, but low is not none: an operator can be handed a file and
+  // asked to forward it, and this path reaches every dealer on the list.
+  //
+  // Only the worst tier is refused. A PDF caps at `ok` by design and is the most
+  // common thing this business sends, so anything stricter would block the job
+  // the app exists to do. ClamAV deliberately does NOT run here — it runs on the
+  // inbound path where the bytes are a stranger's, and adding a clamd dependency
+  // to an operator action would break uploads on every deployment where the
+  // scanner happens to be down, which is a worse failure than the one it stops.
+  const verdict = classify({ mime, filename: file.originalname, bytes: file.buffer });
+  if (verdict.tier === 'block') {
+    return { ok: false, error: `That file was refused. ${verdict.reason} Its name says ${mime}, but its actual contents do not agree — re-export it from the app that made it, or send a PDF instead.` };
+  }
+
   const sha = crypto.createHash('sha256').update(file.buffer).digest('hex');
 
   // The same file dragged in twice is one row, one file on disk, one Resumable
@@ -96,7 +112,26 @@ function saveUpload(file) {
   const existing = byHash.get(sha);
   if (existing) {
     touchRow.run(Date.now(), existing.id);
+    log('info', `Upload "${file.originalname}" matched an existing file — reusing asset ${existing.id}`);
     return { ok: true, asset: byId.get(existing.id), deduped: true };
+  }
+
+  // The same floor the inbound path enforces, and for a stronger reason now that
+  // the inbox writes here too: this used to be a handful of template headers a
+  // month, and it is now every file an operator sends to anyone. A disk that
+  // fills takes the SQLite database down with it, and wa.db is the message
+  // history — so refusing an upload is by far the cheaper failure.
+  //
+  // Checked after the dedupe, because a byte-identical re-upload writes nothing
+  // and refusing it on space grounds would be a lie.
+  // `free - size`, not `free`: this is the only space check in the app that
+  // knows how big the incoming file is, and a 90 MB video landing on a disk
+  // exactly at the floor should be refused before it is written, not after.
+  // freeBytes answers Infinity when statfs cannot, which passes by design.
+  const free = freeBytes(UPLOAD_DIR);
+  if (free - size < MEDIA_LIMITS.minFreeBytes) {
+    log('warn', `Upload "${file.originalname}" refused — ${mb(free)} free, reserve is ${mb(MEDIA_LIMITS.minFreeBytes)}`);
+    return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Delete a file you no longer send from the library, then try again. Nothing was saved.` };
   }
 
   const ext  = (path.extname(file.originalname || '') || '').slice(0, 10).toLowerCase();
@@ -108,7 +143,78 @@ function saveUpload(file) {
   const id  = Number(insertAsset.run(
     sha, name, file.originalname || name, mime, size, kind, now, now,
   ).lastInsertRowid);
+  // Every other path that puts bytes on this disk says so in the operator log.
+  // Without this, a library that has quietly grown to 4 GB has no history
+  // explaining how, and no way to tell an upload from a dedupe.
+  log('info', `Uploaded "${file.originalname}" (${kind}, ${mb(size)}) — asset ${id}, risk ${verdict.tier}`);
   return { ok: true, asset: byId.get(id) };
+}
+
+// ── Deleting an asset ──────────────────────────────────────────────────────────
+// The library only ever grew. Nothing swept it, which was right while it held a
+// handful of template headers — and wrong once the inbox started writing every
+// file an operator sends to anyone.
+//
+// This is a DELIBERATE refusal to auto-sweep. An operator's file is not like
+// inbound bytes: nobody else can re-send it, Meta has no copy after 30 days, and
+// deleting one silently is exactly the unrecoverable failure the two-store rule
+// exists to prevent. So storage is managed by the operator, with the server
+// refusing any delete that would break history.
+//
+// Three tables reference an asset, and all three are checked by name rather than
+// by a foreign-key sweep: SQLite does not enforce REFERENCES unless
+// foreign_keys is ON, and a silently-orphaned row here shows up months later as
+// a campaign report that cannot say what it sent.
+const assetRefs = {
+  templates:     db.prepare('SELECT count(*) AS n FROM templates     WHERE header_asset = ?'),
+  campaign_runs: db.prepare('SELECT count(*) AS n FROM campaign_runs WHERE header_asset = ?'),
+  messages:      db.prepare('SELECT count(*) AS n FROM messages      WHERE asset_id     = ?'),
+};
+const deleteAssetRow = db.prepare('DELETE FROM media_assets WHERE id = ?');
+
+function deleteAsset(id) {
+  const asset = getAsset(id);
+  if (!asset) return { ok: false, error: 'That file is not in the library.' };
+
+  const used = {
+    templates: assetRefs.templates.get(asset.id).n,
+    runs:      assetRefs.campaign_runs.get(asset.id).n,
+    messages:  assetRefs.messages.get(asset.id).n,
+  };
+  if (used.templates || used.runs || used.messages) {
+    // Named parts, not a count: "in use" tells an operator nothing about what
+    // they would have to undo, and they will just try again.
+    const parts = [
+      used.templates && `${used.templates} template${used.templates === 1 ? '' : 's'}`,
+      used.runs      && `${used.runs} campaign${used.runs === 1 ? '' : 's'}`,
+      used.messages  && `${used.messages} sent message${used.messages === 1 ? '' : 's'}`,
+    ].filter(Boolean).join(', ');
+    return { ok: false, error: `"${asset.filename}" is still referenced by ${parts}. Deleting it would leave that history unable to say what was sent, so it is kept.` };
+  }
+
+  // Same guard dropBytes holds, and for the same reason: `path` is a column, and
+  // a column is data. Resolving it and checking it still lands inside UPLOAD_DIR
+  // is what stops a crafted or corrupted row unlinking something else.
+  const full = path.resolve(assetPath(asset));
+  const root = path.resolve(UPLOAD_DIR);
+  if (full !== root && !full.startsWith(root + path.sep)) {
+    log('error', `Refused to delete asset ${asset.id}: ${asset.path} resolves outside UPLOAD_DIR`);
+    return { ok: false, error: 'That file is stored outside the uploads directory and was not deleted.' };
+  }
+
+  let freed = 0;
+  try {
+    if (fs.existsSync(full)) { freed = fs.statSync(full).size; fs.unlinkSync(full); }
+  } catch (e) {
+    // The row stays. A row with no bytes is recoverable by re-uploading; bytes
+    // with no row are invisible and leak the disk this function exists to free.
+    log('error', `Could not delete "${asset.filename}": ${e.message}`);
+    return { ok: false, error: `Could not remove the file from disk: ${e.message}` };
+  }
+
+  deleteAssetRow.run(asset.id);
+  log('info', `Deleted "${asset.filename}" from the library — freed ${mb(freed)}`);
+  return { ok: true, freed, filename: asset.filename };
 }
 
 // ── Meta's two identifiers ─────────────────────────────────────────────────────
@@ -556,7 +662,7 @@ async function rescanIfNeeded(row) {
 }
 
 module.exports = {
-  MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath,
+  MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath, deleteAsset,
   ensureHandle, ensureMediaId, headerComponent,
   INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound, rescanIfNeeded,
   pathIsShared, clearInboundFile, dropBytes, keepInbound, discardInbound, sha256Hex,

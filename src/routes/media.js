@@ -4,7 +4,7 @@ const fs      = require('fs');
 const multer  = require('multer');
 const { MEDIA_KINDS, saveUpload, listAssets, getAsset, assetPath,
         getInbound, inboundPath, saveInbound, rescanIfNeeded,
-        keepInbound, discardInbound } = require('../services/media');
+        keepInbound, discardInbound, deleteAsset } = require('../services/media');
 const { effectiveRisk } = require('../lib/filerisk');
 const { log } = require('../state');
 
@@ -34,6 +34,17 @@ router.post('/media/upload', (req, res) => {
 });
 
 router.get('/media', (req, res) => res.json({ assets: listAssets() }));
+
+// Operator-controlled storage management. There is no auto-sweep of UPLOAD_DIR
+// on purpose: nobody but the operator has a copy of their own file, Meta drops
+// its copy at 30 days, and deleting one on a timer is the unrecoverable failure
+// the two-store rule exists to prevent. The service refuses any delete that
+// would leave a template, a campaign or a sent message unable to say what it
+// sent, so this cannot be used to rewrite history either.
+router.delete('/media/:id', (req, res) => {
+  const r = deleteAsset(req.params.id);
+  res.status(r.ok ? 200 : 409).json(r);
+});
 
 // Streamed from disk behind the same auth as everything else, rather than
 // mounted statically: a static mount would make every uploaded file readable by

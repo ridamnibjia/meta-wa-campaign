@@ -67,7 +67,7 @@ webhook cannot be re-fetched from Meta's push-only API, which would make the
 | `threads` | One per `wa_id`. `last_inbound_at` drives the 24-hour window. |
 | `messages` | Both directions. `wamid` primary key is the dedupe. |
 | `media` | Inbound descriptors, and bytes once an operator asks. `provisional` = previewed, not yet kept. |
-| `media_assets` | Outbound template header files, deduped on sha256. |
+| `media_assets` | Operator uploads — template headers and inbox sends, deduped on sha256. Never swept. |
 | `templates` | What we submitted. Meta stays the source of truth for `status`. |
 | `contacts` | The customer list and the one `enabled` switch. |
 | `csv_uploads` | Provenance: what each upload did, including rows it could not read. |
@@ -79,6 +79,28 @@ webhook cannot be re-fetched from Meta's push-only API, which would make the
 **Counters are derived, never incremented.** `countsForRun()` is a `GROUP BY`
 over `messages`. There is no integer anywhere that can disagree with the rows it
 counts. Do not add one back.
+
+**`campaign_runs` has no `ended_at` and no `status` column, deliberately.**
+Ended-at is `max(attempted_at)` over that run's `run_recipients`; status is
+derived from what is left pending — `in-progress`, `completed`, `incomplete`. A
+stored `ended_at` would need writing on the normal finish, on Stop, on the ladder
+exhausting and after a crash-and-resume: four places to forget, and a forgotten
+one shows a campaign that never ended. Same rule as the counters, and there is a
+test asserting neither column ever appears. `ponytail:` "incomplete" cannot tell
+a campaign the operator stopped from one a crash abandoned — both leave pending
+rows on a run nothing points at. The label is honest either way; if that
+distinction ever drives a decision, add a `stopped_at` written by `/stop` alone.
+
+**`runDetail` returns null for an unknown id, never the current run.** A stale
+bookmark that quietly renders a different campaign reads as an answer, and the
+operator acts on it. The route turns null into a 404.
+
+**The read count undercounts, and the UI must keep saying so.** WhatsApp only
+sends a `read` status when the recipient has read receipts switched on. Presented
+as a plain open rate it is a number an operator would make real decisions on, and
+it is not that number — delivered is. `STATUS_RANK` already counts a `read` that
+arrives with no preceding `delivered` as both, because Meta does not promise
+status order. Do not remove the caveat from the History view to tidy it up.
 
 **`countsForRun(null)` returns zeroes.** `run_id IS NULL` is not "no campaign" —
 it is the bucket inbox replies and migrated legacy rows deliberately land in.
@@ -96,10 +118,43 @@ calls `retry` gets `skipped_reason = 'retry'` plus `retry_after`, and becomes
 pending again by widening the query above — not by a second queue the loop has to
 merge, and not by a `setTimeout` that a restart forgets. `attempts` is
 incremented in SQL for the same reason: read-modify-write in JS hands the contact
-a free extra attempt on every crash. Three waits, 1h → 2h → 4h, so four attempts.
+a free extra attempt on every crash. Five waits of three hours, so six attempts.
 `retrying` is counted apart from `skipped` — folding it in would report a run
 finished with people still owed a message, which is the leak the ladder exists to
 close.
+
+**Five rungs, not three, and never zero failures.** It was 1h → 2h → 4h. That is
+too short for the failure it mostly absorbs: **131049 is Meta's per-user
+marketing cap — a rolling, per-person window counted across every business that
+messages that person**, not a counter that resets at midnight. Seven hours of
+retries closed runs with hundreds still owed a message, and the only way to reach
+them was re-uploading the CSV, which opens a new run and messages everyone twice.
+It is not longer than five because **no ladder reaches zero on 131049**: the cap
+belongs to the recipient, not to the attempt. Reaching those people reliably
+means the 24-hour service window — a template that invites a reply, then a
+free-form send — which is what `sendMedia` exists for. Do not re-shorten this
+ladder, and do not expect it to zero the failures on its own.
+
+**Quiet hours are a deferral, applied before the row is written.**
+`lib/schedule.js` pushes any deadline landing 23:00–07:00 IST to 08:00. Night
+notifications are what recipients block and report, and that feeds the quality
+rating which gates the messaging tier. It is applied inside `scheduleRetry`
+before `retry_after` is stored, because that column is both what `nextPending`
+compares against and what the operator is shown — nudging the deadline anywhere
+else leaves the queue and the screen disagreeing. The 07:00–08:00 gap is grace,
+not an oversight: a whole night of deferred retries comes due at one instant, and
+releasing that herd at 07:00 sharp releases it while people are still asleep. The
+wrap-across-midnight branch is load-bearing — a plain range check is wrong, and
+there is a test for a non-wrapping window that proves it.
+
+**The phase string is `waiting`; every label says "In progress".** State and
+presentation are allowed to differ. `ACTIVE_PHASES`, `campaignBlocker()` and
+`resumeIfInterrupted()` all match on the string. Renaming it to match the label
+silently changes what a second Start is refused on, which is how the
+two-loops-on-one-queue double send got in before. The label changed because the
+ladder now runs for up to a day, and an operator who reads "waiting" assumes the
+campaign is stuck and presses Stop — abandoning exactly the contacts it exists to
+recover.
 
 **`flags.running` is owned by the loop.** It means "a loop is executing", and only
 `startLoop()` and the loop's own exit may write it. Routes set `stopFlag` /
@@ -163,6 +218,34 @@ that unlinks inbound bytes, and it holds both guards — the sibling check and t
 "does this path resolve inside MEDIA_DIR" check. Three callers need them (the
 90-day sweep, the preview sweep, Discard); a second copy is a second thing to
 get wrong.
+
+**Two media stores, two lifetimes, never mixed.** `media` holds what customers
+sent us, lives in `MEDIA_DIR`, and is swept at 90 days. `media_assets` holds what
+the operator uploaded, lives in `UPLOAD_DIR`, and is **never** swept. An outbound
+message links through `messages.asset_id` to `media_assets` — never through the
+`media` table, which would put the operator's price list under the retention
+sweep and delete it from disk with nothing anywhere to say why. There is a test
+that ages an inbound file past the cutoff, runs the sweep for real, and asserts
+`UPLOAD_DIR` is untouched.
+
+**`saveUpload` runs `classify()` and refuses the `block` tier only.** The
+uploader is the authenticated operator, but an authenticated operator can be
+handed a file and asked to forward it, and this path reaches every dealer on the
+list. Only the worst tier is refused because a PDF caps at `ok` by design and is
+the most common thing this business sends — anything stricter blocks the job the
+app exists to do. ClamAV deliberately does **not** run here: it runs on the
+inbound path where the bytes are a stranger's, and a clamd outage must not stop
+an operator sending a price list.
+
+**`sendMedia` is a sibling of `sendReply`, not a flag on it.** Same 24-hour
+window gate, same `{ ok, error }` contract, but the failure modes differ — an
+asset can have been deleted and Meta's media id can have expired — and folding
+them together makes one function's error handling answer for two jobs. It is
+also the half of the 131049 answer the retry ladder cannot give: the per-user
+marketing cap does not apply inside the service window. Outbound media is its own
+key (`outMedia`) in the transcript, because inbound carries a risk verdict, a
+30-day expiry and a Keep/Discard decision, and not one of those means anything
+for a file the operator uploaded themselves.
 
 **Preview and Save are the same fetch on different clocks.** `saveInbound(id,
 { provisional: true })` runs every check a Save runs — size cap, free space,
@@ -259,7 +342,8 @@ rewritten once with `git filter-repo` to purge real data.
 - `scanBuffer` holds the whole file in memory. Backpressure is handled, so the
   cost is one copy rather than two, but true streaming to clamd is still future
   work.
-- Outbound uploads in `saveUpload` trust the browser-supplied mime type and do
-  not run `classify()`. The uploader is the authenticated operator and the mime
-  allowlist excludes script-capable types, so this is low risk — but it is the
-  one path the file-risk engine does not cover.
+- Inbox media sends one thread at a time. Sending one file to several
+  conversations at once needs its own queue, per-recipient reporting and
+  per-contact window filtering, which starts to be the campaign loop's job. The
+  library already makes the file free to reuse, so the saving would only be in
+  clicks.

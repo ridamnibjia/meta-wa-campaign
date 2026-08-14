@@ -1,6 +1,6 @@
 'use strict';
 const { db } = require('../lib/db');
-const { S, log } = require('../state');
+const { S, flags, log } = require('../state');
 const { explainError } = require('../lib/errors');
 
 // An unknown ID means a message this server never sent — traffic from another
@@ -390,8 +390,91 @@ function lastRunSummary() {
   };
 }
 
+// ── History ────────────────────────────────────────────────────────────────────
+// Everything below is derived. campaign_runs deliberately gains no ended_at and
+// no status column: ended-at is the last attempt on the queue, and status is a
+// property of what is left in it. A stored ended_at would need writing on the
+// normal finish, on Stop, on the ladder exhausting and after a crash-and-resume
+// — four places to forget, and a forgotten one shows a campaign that never
+// ended. Exactly the rule the counters already follow.
+const runsQ = db.prepare(`
+  SELECT r.id, r.started_at, r.label, r.template_lang, r.template_body, r.header_asset,
+         (SELECT max(attempted_at) FROM run_recipients rr WHERE rr.run_id = r.id) AS ended_at,
+         (SELECT count(*)          FROM run_recipients rr WHERE rr.run_id = r.id) AS queued
+    FROM campaign_runs r
+   ORDER BY r.id DESC
+   LIMIT ?
+`);
+
+const runRowQ = db.prepare(`
+  SELECT r.id, r.started_at, r.label, r.template_lang, r.template_body, r.header_asset,
+         (SELECT max(attempted_at) FROM run_recipients rr WHERE rr.run_id = r.id) AS ended_at
+    FROM campaign_runs r
+   WHERE r.id = ?
+`);
+
+// Three words an operator can act on, none of them stored.
+//
+// ponytail: 'incomplete' cannot tell a campaign the operator stopped from one a
+// crash abandoned — both leave pending rows on a run nothing points at. The
+// label is honest either way ("Incomplete — 640 of 800 sent") and it costs no
+// column. If that distinction ever drives a decision, add a stopped_at written
+// by the /stop route alone and leave every other status derived.
+function statusForRun(runId, pending) {
+  const isCurrent = runId === S.currentRunId;
+  if (isCurrent && (flags.running || ACTIVE_PHASES.includes(S.phase))) return 'in-progress';
+  return pending > 0 ? 'incomplete' : 'completed';
+}
+
+// Duplicated from services/campaign.js rather than imported: services/campaign
+// requires this file, and importing it back would be a cycle. Three strings.
+const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
+
+// ponytail: LIMIT 100, no cursor. One campaign per CSV upload means a hundred
+// rows is a year of history for one business. If it ever needs paging, the
+// cursor is (started_at, id) and never started_at alone — timestamps tie.
+function listRuns({ limit = 100 } = {}) {
+  return runsQ.all(Math.min(Math.max(Number(limit) || 100, 1), 500))
+    // A run staged and never started has no recipients. It is noise, not history.
+    .filter(r => r.queued > 0)
+    .map(r => {
+      const progress = progressForRun(r.id);
+      return {
+        id: r.id, label: r.label, startedAt: r.started_at, endedAt: r.ended_at,
+        status: statusForRun(r.id, progress.pending),
+        counts: countsForRun(r.id), progress,
+      };
+    });
+}
+
+function runDetail(runId) {
+  const id = Number(runId);
+  // Null, never a quiet fall back to the current run. A stale bookmark that
+  // renders a different campaign reads as an answer, and the operator would act
+  // on it — which is strictly worse than a 404.
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const r = runRowQ.get(id);
+  if (!r) return null;
+
+  const progress = progressForRun(id);
+  return {
+    id: r.id, label: r.label,
+    startedAt: r.started_at, endedAt: r.ended_at,
+    status: statusForRun(id, progress.pending),
+    language: r.template_lang, body: r.template_body, headerAsset: r.header_asset,
+    counts: countsForRun(id), progress,
+    billable: billableForRun(id), nextRetry: nextRetryForRun(id),
+    recipients: recipientsForRun(id),
+    // The explanation is attached here rather than in the view, because
+    // lib/errors.js is the one table that turns a Meta code into "what happened
+    // — what to do" and it lives on this side. A second copy in the browser
+    // would be a second thing to update when Meta adds a code.
+    skips: skippedForRun(id).map(s => ({ ...s, explanation: explainError(s.error_code) })),
+  };
+}
+
 module.exports = {
-  applyStatus, STATUS_RANK, countsForRun,
+  applyStatus, STATUS_RANK, countsForRun, listRuns, runDetail,
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,

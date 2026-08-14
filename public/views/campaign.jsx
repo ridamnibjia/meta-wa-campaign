@@ -210,7 +210,7 @@ const SKIP_GROUPS = [
   // The only group whose meaning depends on whether the campaign is still going:
   // the same rows are "queued for another go" during a run and "left un-messaged"
   // after a Stop. Same data, opposite thing for the operator to do about it.
-  { key: 'waiting',   title: 'Waiting to retry',
+  { key: 'waiting',   title: 'In progress — retrying',
     blurb: 'Still in this campaign. A failure that was about the moment put them back in the queue — the run picks them up again at the time shown and does not finish until it has.',
     stoppedTitle: 'Left un-messaged when you stopped',
     stoppedBlurb: 'These were queued for another attempt when the campaign was stopped, so it never came. They are still on the queue: pressing Resume picks them up at their scheduled time. Starting a fresh run from a new CSV messages everyone on it, including the people already reached by this one.' },
@@ -384,7 +384,7 @@ function Campaign() {
     // The same rule the server enforces in campaignBlocker(), said earlier. The
     // server is the one that counts: a second tab could otherwise start a
     // parallel walk over one queue and message people twice.
-    isWaiting          ? `Still finishing — ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'} waiting to retry${ss.nextRetry ? `, next at ${clockOf(ss.nextRetry.at)}` : ''}. Stop it, or let it finish, before starting another.` :
+    isWaiting          ? `In progress — retrying ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'}${ss.nextRetry ? `, next attempt ${clockOf(ss.nextRetry.at)}` : ''}. Stop it, or let it finish, before starting another.` :
     isActive           ? 'A campaign is already running — stop it, or let it finish, first' : null;
 
   // ── Actions ─────────────────────────────────────────────────────
@@ -730,7 +730,7 @@ function Campaign() {
             </Button>
           )}
           {isWaiting && (
-            <Alert variant="warning" title={`Waiting to retry — ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'}`}>
+            <Alert variant="warning" title={`In progress — retrying ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'}`}>
               {ss.nextRetry ? `Next attempt at ${clockOf(ss.nextRetry.at)}. ` : ''}
               These failed for a reason that may pass — a network blip, a Meta hiccup, or the
               per-person marketing cap. Each gets up to three more tries, an hour, two and four

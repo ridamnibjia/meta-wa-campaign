@@ -10,6 +10,7 @@ const { recordOutbound, countsForRun, startRun, buildRun, nextPending,
         nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition } = require('../lib/errors');
+const { deferPastQuietHours } = require('../lib/schedule');
 const { graphHeaders } = require('./graph');
 const { headerComponent } = require('./media');
 
@@ -181,14 +182,26 @@ async function sendTemplate(contact) {
 // — which opens a new run and messages everyone a second time. That is the leak
 // this closes.
 //
-// Three waits, so four attempts in total: the original send, then one an hour
-// later, one two hours after that, one four hours after that. A contact still
-// failing at the end of that ladder is reported rather than retried again —
-// there is nothing left for another attempt to discover.
+// Five waits, so six attempts in total: the original send, then one every three
+// hours. Any deadline landing in the night is pushed to 08:00 IST by
+// deferPastQuietHours, so the ladder is 15 hours of send time spread over at
+// most about a day.
+//
+// It was three waits — 1h, 2h, 4h — and that was too short for the failure it
+// mostly absorbs. 131049 is Meta's per-user marketing cap: a ROLLING per-person
+// window counted across every business that messages that person, not a counter
+// that resets. Seven hours of retries closed runs with hundreds still owed a
+// message, and the only way to reach them was re-uploading the CSV — which
+// opens a new run and messages everyone a second time.
+//
+// It is not longer than five because no ladder reaches zero on 131049: the cap
+// belongs to the recipient, not to the attempt. Reaching those people reliably
+// means the 24-hour service window — a template that invites a reply, then a
+// free-form send — which is what services/inbox.js sendMedia exists for.
 //
 // WHICH failures come back here is lib/errors.js:skipDisposition, not a list
 // kept here. A code has to be named 'retry' there to get a second attempt.
-const RETRY_BACKOFF_MS = [3600000, 7200000, 14400000];   // 1h → 2h → 4h
+const RETRY_BACKOFF_MS = [3, 3, 3, 3, 3].map(h => h * 3600000);
 
 const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
   { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
@@ -203,7 +216,11 @@ function scheduleRetry(contact, row, result, n) {
     log('warn', `${n} ${contact.name} — still failing after ${made + 1} attempts, reporting it [${result.errorCode}]`);
     return false;
   }
-  const at = Date.now() + RETRY_BACKOFF_MS[made];
+  // Deferred before it is stored, not before it is read: retry_after is both
+  // what nextPending compares against and what the "next attempt" sentence shows
+  // the operator, so nudging the deadline anywhere else would leave the queue
+  // and the screen disagreeing about when this contact is due.
+  const at = deferPastQuietHours(Date.now() + RETRY_BACKOFF_MS[made]);
   recordRecipientRetry(S.currentRunId, contact.dialStr, result.errorCode, at);
   log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
   return true;
@@ -237,6 +254,11 @@ async function sleepUntil(at) {
 // await for up to a second afterwards. Trusting the phase alone let a Start in
 // that window spawn a SECOND loop over the same queue, and two loops walking one
 // run message whoever they both reach twice.
+// 'waiting' is the retry phase. Every label the operator sees for it says "In
+// progress" instead — this string is state, that string is presentation, and
+// they are allowed to differ. Renaming this one to match the label silently
+// changes what campaignBlocker() refuses and what resumeIfInterrupted() picks
+// back up, which is how the two-loops-on-one-queue double send got in before.
 const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
 const campaignActive = () => flags.running || ACTIVE_PHASES.includes(S.phase);
 
@@ -251,7 +273,7 @@ function campaignBlocker() {
   }
   const p = progressForRun(S.currentRunId);
   const what = S.phase === 'waiting'
-      ? `waiting to retry ${p.retrying} contact${p.retrying === 1 ? '' : 's'}`
+      ? `in progress — retrying ${p.retrying} contact${p.retrying === 1 ? '' : 's'}`
     : S.phase === 'paused' ? 'paused part-way through'
     : 'still sending';
   return `A campaign is ${what} — ${p.sent + p.skipped} of ${p.total} done, ${p.pending} left. Stop it, or let it finish, before starting another.`;
@@ -282,7 +304,10 @@ async function campaignLoop() {
       const retry = nextRetryForRun(S.currentRunId);
       if (retry) {
         S.phase = 'waiting';
-        S.pauseReason = `Waiting to retry — ${retry.count} contact${retry.count === 1 ? '' : 's'}, next attempt ${clockIST(retry.at)}`;
+        // "In progress", not "Waiting". The ladder runs for up to a day now, and
+        // an operator who reads this as stalled presses Stop — which abandons
+        // precisely the contacts the ladder exists to recover.
+        S.pauseReason = `In progress — retrying ${retry.count} contact${retry.count === 1 ? '' : 's'}, next attempt ${clockIST(retry.at)}`;
         log('info', S.pauseReason);
         saveCampaignNow(); broadcast();
         await sleepUntil(retry.at);

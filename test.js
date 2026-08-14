@@ -30,7 +30,7 @@ const {
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
-  markRead, inboxThread, inboxSearch, sendReply,
+  markRead, inboxThread, inboxSearch, sendReply, sendMedia, CAPTION_LIMIT,
   checkPassword, createSession, validSession, destroySession,
   PRICES,
   nodeVersionOk, openDb, SCHEMA,
@@ -38,7 +38,7 @@ const {
   startRun, recordOutbound,
   buildState, app,
   migrateJsonToSql, db,
-  MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
+  MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath, deleteAsset,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
   saveInbound, inboundPath, getInbound, INBOUND_TTL_MS, rescanIfNeeded, sweepMedia,
   keepInbound, discardInbound, sha256Hex,
@@ -1018,6 +1018,9 @@ console.log('\nschema — media + template tables');
     assert.ok(cols(d, 'media_assets').includes('sha256'));
     assert.ok(cols(d, 'media_assets').includes('meta_handle'));
     assert.ok(cols(d, 'media_assets').includes('media_id_at'));
+    assert.ok(cols(d, 'messages').includes('asset_id'),
+      'outbound media links to media_assets and never to the media table — that one lives in ' +
+      'MEDIA_DIR and is swept at 90 days, which would delete the price list');
     assert.ok(cols(d, 'templates').includes('header_format'));
     assert.ok(cols(d, 'templates').includes('display_name'));
     d.close();
@@ -1095,6 +1098,92 @@ console.log('\nmedia — saveUpload');
     const r = saveUpload(file(Buffer.from('hello'), 'note.txt', 'text/plain; charset=utf-8'));
     assert.equal(r.ok, true, r.error);
     assert.equal(r.asset.kind, 'document');
+  });
+
+  // The classifier gate. saveUpload used to trust the declared mime type, which
+  // was the one path lib/filerisk did not cover — and this path is the one that
+  // reaches every dealer on the list.
+  test('an executable wearing a PDF name and a PDF mime type is refused', () => {
+    const r = saveUpload(file(
+      Buffer.concat([Buffer.from('MZ'), Buffer.alloc(512)]), 'price-list.pdf', 'application/pdf'));
+    assert.equal(r.ok, false,
+      'the operator is authenticated, but an authenticated operator can still be handed a file ' +
+      'and asked to forward it — the bytes are the only signal that does not lie');
+    assert.match(r.error, /refused/i, 'and the refusal has to say what to do next');
+  });
+
+  test('a real PDF still uploads — the gate refuses block, not everything', () => {
+    const r = saveUpload(file(Buffer.from('%PDF-1.7 a genuine document'), 'real.pdf', 'application/pdf'));
+    assert.equal(r.ok, true,
+      'a PDF caps at the ok tier by design, and it is the single most common thing this business sends');
+  });
+
+  test('a macro-capable document is allowed through, not blocked', () => {
+    // 'warn', not 'block'. Refusing every archive and macro-capable document
+    // would stop an operator sending a legitimate spreadsheet, and the operator
+    // is the one person in this system who is already trusted.
+    const r = saveUpload(file(Buffer.from('PK xlsx-ish'), 'prices.xlsx',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'));
+    assert.equal(r.ok, true, r.error);
+  });
+
+  // Storage management. The library only ever grew, which was fine for a few
+  // template headers a month and is not fine now that every inbox send writes
+  // here. Deletion is the operator's call, never a timer's — and the server
+  // refuses any delete that would leave history unable to say what it sent.
+  test('an unused file can be deleted and the bytes actually leave the disk', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 disposable ${Math.random()}`),
+                              'old-list.pdf', 'application/pdf'));
+    assert.equal(r.ok, true, r.error);
+    const p = assetPath(r.asset);
+    assert.ok(fsx.existsSync(p));
+
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, true, d.error);
+    assert.ok(!fsx.existsSync(p), 'freeing disk is the entire point — a row-only delete leaks it');
+    assert.equal(getAsset(r.asset.id), undefined, 'and the library must not list a file that is gone');
+  });
+
+  test('a file a sent message points at is refused, naming what uses it', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 in-use ${Math.random()}`),
+                              'sent-list.pdf', 'application/pdf'));
+    db.prepare('INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status, asset_id) VALUES (?,?,?,?,?,?,?,?)')
+      .run(`del-guard-${r.asset.id}`, '919000000009', 'out', 'document', 'x', Date.now(), 'sent', r.asset.id);
+
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, false,
+      'deleting it would leave a thread showing a file nothing can identify');
+    assert.match(d.error, /sent message/,
+      'and the refusal has to name what is holding it, or the operator just tries again');
+    assert.ok(fsx.existsSync(assetPath(r.asset)), 'a refused delete must not have removed the bytes');
+  });
+
+  test('a file a campaign used as its header is refused', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 header ${Math.random()}`),
+                              'header.pdf', 'application/pdf'));
+    db.prepare('INSERT INTO campaign_runs (started_at, label, header_asset) VALUES (?,?,?)')
+      .run(Date.now(), 'used-header', r.asset.id);
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, false, 'a campaign report must always be able to say what it sent');
+    assert.match(d.error, /campaign/);
+  });
+
+  test('deleting a file that is not there is a sentence, not a crash', () => {
+    const d = deleteAsset(999999);
+    assert.equal(d.ok, false);
+    assert.match(d.error, /not in the library/);
+  });
+
+  test('a row whose path escapes UPLOAD_DIR is refused, not followed', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 traversal ${Math.random()}`),
+                              'ok.pdf', 'application/pdf'));
+    // `path` is a column, and a column is data. A corrupted or crafted row must
+    // not be able to unlink something outside the uploads directory.
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run('../../../../etc/passwd', r.asset.id);
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, false, 'the guard is the whole reason this delete is safe to expose');
+    assert.match(d.error, /outside the uploads directory/);
   });
 
   test('kindFor maps each accepted type to its kind', () => {
@@ -1261,6 +1350,138 @@ testAsync('a reply inside the window is stored with no run_id', async () => {
     require('./src/config').CFG.phoneNumberId = savedPhone;
   }
 });
+
+// ── Sending a file into the service window ────────────────────────────────────
+// The half of the 131049 answer the retry ladder cannot give: the per-user
+// marketing cap does not apply inside the 24-hour window, so a free-form send
+// here reaches people no amount of retrying a marketing template will.
+console.log('\ninbox — sendMedia');
+{
+  const openThread = (waId, name) => {
+    const now = Date.now();
+    testDb.prepare('INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES (?,?,0,?,?)')
+      .run(waId, name, now, now);
+  };
+  // media_id is stamped fresh so ensureMediaId answers from the row instead of
+  // uploading. These tests are about sendMedia; the 29-day refresh has its own.
+  const seedAsset = () => {
+    const a = saveUpload({
+      buffer: Buffer.from(`%PDF-1.7 price list ${Math.random()}`),
+      originalname: 'price-list.pdf', mimetype: 'application/pdf' }).asset;
+    testDb.prepare('UPDATE media_assets SET media_id = ?, media_id_at = ? WHERE id = ?')
+      .run(`mid-${a.id}`, Date.now(), a.id);
+    return a;
+  };
+
+  // stubGraph swaps global.fetch, so the arguments are (url, opts) — the JSON
+  // body Meta receives is opts.body, already serialised.
+  const bodyOf = opts => JSON.parse(opts.body);
+
+  const withCreds = async fn => {
+    const CFGx = require('./src/config').CFG;
+    const savedToken = CFGx.accessToken, savedPhone = CFGx.phoneNumberId;
+    CFGx.accessToken = 'test-token'; CFGx.phoneNumberId = '1234567890';
+    try { return await fn(); }
+    finally { CFGx.accessToken = savedToken; CFGx.phoneNumberId = savedPhone; }
+  };
+
+  testAsync('media outside the window is refused without calling the network', async () => {
+    let called = false;
+    const restore = stubGraph(async () => { called = true; throw new Error('must not send'); });
+    try {
+      testDb.prepare("INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES ('919700000010','Closed',0,1,1)").run();
+      const r = await sendMedia('919700000010', seedAsset().id, 'Price list');
+      assert.equal(r.ok, false,
+        'Meta would reject this as 131047 — refusing locally gives the operator a sentence instead of a code');
+      assert.match(r.error, /24-hour reply window/);
+      assert.equal(called, false, 'and it must not spend a Graph call to find that out');
+    } finally { restore(); }
+  });
+
+  testAsync('an asset that is no longer in the library fails with a sentence, not a throw', async () => {
+    openThread('919700000011', 'Asha');
+    const r = await sendMedia('919700000011', 999999, 'here you go');
+    assert.equal(r.ok, false, 'a deleted asset must not throw past the route');
+    assert.match(r.error, /library/i, 'and must say what to do about it');
+  });
+
+  testAsync('an over-long caption is refused before anything else happens', async () => {
+    openThread('919700000012', 'Rahul');
+    const r = await sendMedia('919700000012', seedAsset().id, 'x'.repeat(CAPTION_LIMIT + 1));
+    assert.equal(r.ok, false);
+    assert.match(r.error, new RegExp(String(CAPTION_LIMIT)),
+      'Meta rejects an over-long caption with a code that never mentions the caption');
+  });
+
+  testAsync('a document send carries the filename and stores asset_id, not a media row', async () => {
+    openThread('919700000013', 'Marco');
+    const asset = seedAsset();
+    let sent = null;
+    const restore = stubGraph(async (url, opts) => {
+      sent = bodyOf(opts);
+      return { ok: true, headers: new Map(), json: async () => ({ messages: [{ id: 'media-out-1' }] }) };
+    });
+    try {
+      await withCreds(async () => {
+        const r = await sendMedia('919700000013', asset.id, 'August price list');
+        assert.equal(r.ok, true, r.error);
+        assert.equal(sent.type, 'document', 'Meta nests the descriptor under a key named after the type');
+        assert.equal(sent.document.caption, 'August price list');
+        assert.equal(sent.document.filename, 'price-list.pdf',
+          'filename is meaningful on a document — without it the dealer sees a random id');
+
+        const row = testDb.prepare("SELECT * FROM messages WHERE wamid = 'media-out-1'").get();
+        assert.equal(row.asset_id, asset.id,
+          'outbound media points at media_assets; the media table is swept at 90 days and would delete it');
+        assert.equal(row.run_id, null, 'an inbox send is not campaign traffic');
+        assert.equal(row.type, 'document');
+        assert.equal(testDb.prepare("SELECT count(*) AS n FROM media WHERE wamid = 'media-out-1'").get().n, 0,
+          'nothing outbound may ever land in the inbound media table');
+      });
+    } finally { restore(); }
+  });
+
+  testAsync('with no caption the filename stands in as the body', async () => {
+    openThread('919700000014', 'Sarah');
+    const asset = seedAsset();
+    const restore = stubGraph(async () => ({
+      ok: true, headers: new Map(), json: async () => ({ messages: [{ id: 'media-out-2' }] }) }));
+    try {
+      await withCreds(async () => {
+        await sendMedia('919700000014', asset.id, '');
+        const row = testDb.prepare("SELECT body FROM messages WHERE wamid = 'media-out-2'").get();
+        assert.match(row.body, /price-list\.pdf/,
+          'a NULL body is a blank line in the transcript, the search index and the thread preview');
+      });
+    } finally { restore(); }
+  });
+
+  testAsync('the sent file appears in the transcript as outbound media', async () => {
+    openThread('919700000015', 'Asha');
+    const asset = seedAsset();
+    const restore = stubGraph(async () => ({
+      ok: true, headers: new Map(), json: async () => ({ messages: [{ id: 'media-out-3' }] }) }));
+    try {
+      await withCreds(async () => {
+        await sendMedia('919700000015', asset.id, 'list');
+        const m = inboxThread('919700000015').messages.find(x => x.id === 'media-out-3');
+        assert.ok(m.outMedia, 'without this the operator cannot see what they sent');
+        assert.equal(m.outMedia.filename, 'price-list.pdf');
+        assert.equal(m.outMedia.kind, 'document');
+        assert.equal(m.media, null,
+          'outMedia is a separate key: inbound carries a risk verdict, an expiry and a ' +
+          'Keep/Discard decision, and none of those mean anything for the operator own file');
+      });
+    } finally { restore(); }
+  });
+
+  test('the inbox never learns about the opt-out list', () => {
+    const src = require('fs').readFileSync('./src/services/inbox.js', 'utf8');
+    assert.ok(!/require\('\.\/contacts'\)/.test(src),
+      'someone who opted out of promotions and then writes in still deserves an answer — ' +
+      'and a reply with a file attached is still a reply, not a marketing message');
+  });
+}
 
 console.log('\nruns');
 test('startRun returns an id and records the label', () => {
@@ -1698,6 +1919,80 @@ console.log('\nskipDisposition — the classifier the report groups by');
   });
 }
 
+// ── Quiet hours ───────────────────────────────────────────────────────────────
+// The retry ladder now runs for up to a day, so a rung can land at 3am. Delivery
+// would work; what breaks is the quality rating, because a night notification is
+// what a dealer blocks and reports — and the quality rating gates the messaging
+// tier. Every assertion below is on a fixed timestamp, so none of them wait.
+console.log('\nlib/schedule — retries do not fire in the middle of the night');
+{
+  const { deferPastQuietHours, IST_OFFSET_MS } = require('./server');
+
+  // IST instants built out of UTC, so these mean the same thing on a laptop in
+  // IST and on a server in UTC. 18:30 UTC is 00:00 IST the following day.
+  const ist = (y, m, d, h, min = 0) => Date.UTC(y, m - 1, d, h - 5, min - 30);
+
+  test('a daytime deadline is left exactly where it is', () => {
+    const at = ist(2026, 8, 14, 14, 0);
+    assert.equal(deferPastQuietHours(at), at,
+      'deferring a 2pm retry would delay every rung in the working day for no reason');
+  });
+
+  test('a deadline just before the window is left alone', () => {
+    const at = ist(2026, 8, 14, 22, 59);
+    assert.equal(deferPastQuietHours(at), at,
+      '22:59 is outside a 23:00-07:00 window and must fire on time');
+  });
+
+  test('a late-evening deadline moves to 8am the NEXT morning', () => {
+    assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 30)), ist(2026, 8, 15, 8, 0),
+      'the next morning after the 14th is the 15th — landing back on the 14th would be in the past');
+  });
+
+  test('an after-midnight deadline moves to 8am the SAME morning', () => {
+    assert.equal(deferPastQuietHours(ist(2026, 8, 15, 2, 0)), ist(2026, 8, 15, 8, 0),
+      '02:00 IST is already the 15th, and pushing it to the 16th would cost the contact a whole day');
+  });
+
+  test('the window is closed at its start and open at its end', () => {
+    assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 0)), ist(2026, 8, 15, 8, 0),
+      '23:00:00 exactly is inside the quiet window');
+    const seven = ist(2026, 8, 15, 7, 0);
+    assert.equal(deferPastQuietHours(seven), seven,
+      '07:00:00 exactly is outside it — the window is [23:00, 07:00)');
+  });
+
+  test('the hour between 07:00 and 08:00 is grace, not a gap', () => {
+    const halfSeven = ist(2026, 8, 15, 7, 30);
+    assert.equal(deferPastQuietHours(halfSeven), halfSeven,
+      'a deadline that reached 07:30 on its own is a morning deadline; 08:00 is only where a ' +
+      "deferred night's worth of retries is released, staggered off the moment people wake");
+  });
+
+  test('quiet hours are IST whatever timezone the server runs in', () => {
+    const saved = process.env.TZ;
+    try {
+      process.env.TZ = 'America/New_York';
+      assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 30)), ist(2026, 8, 15, 8, 0),
+        'the deployment host may not run in IST, and the dealers always do');
+    } finally { process.env.TZ = saved; }
+  });
+
+  test('a non-wrapping window would still be handled correctly', () => {
+    // Nothing configures this today. It is asserted because the wrap-aware
+    // branch is the kind of code a later reader "simplifies" to a plain range
+    // check, and this is the case that would then break silently.
+    const noon = ist(2026, 8, 14, 12, 0);
+    assert.equal(deferPastQuietHours(noon, { start: 11, end: 14, resumeAt: 14 }),
+      ist(2026, 8, 14, 14, 0), 'a window inside one day defers forward within that day');
+  });
+
+  test('IST_OFFSET_MS is the whole zone, with no daylight saving to track', () => {
+    assert.equal(IST_OFFSET_MS, 5.5 * 3600000,
+      'India has one offset year-round, which is why this is a constant and not a lookup');
+  });
+}
+
 // ── The retry ladder ──────────────────────────────────────────────────────────
 // A failure that was about the MOMENT goes back on the queue with a deadline
 // instead of being dropped. Everything below asserts that the deadline lives in
@@ -1708,7 +2003,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   const { buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
           recordRecipientRetry, nextRetryForRun, progressForRun, billableForRun,
           skippedForRun, lastRunSummary, campaignActive, campaignBlocker,
-          scheduleRetry, RETRY_BACKOFF_MS } = M;
+          scheduleRetry, RETRY_BACKOFF_MS, IST_OFFSET_MS } = M;
 
   let runSeq = 0;
   const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
@@ -1788,7 +2083,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     assert.deepEqual(skippedForRun(run), [], 'and they do not appear in the skip report');
   });
 
-  test('the ladder is three waits, then the failure is reported rather than retried', () => {
+  test('the ladder is five waits, then the failure is reported rather than retried', () => {
     const run = newRun();
     const p = people(1);
     const saved = S.currentRunId;
@@ -1810,7 +2105,33 @@ console.log('\nrun_recipients — retrying a moment-based failure');
 
       const exhausted = nextPending(run, Date.now() + 99 * HOUR_MS);
       assert.equal(scheduleRetry(contact, exhausted, fail, '[t]'), false,
-        'four attempts is the whole ladder — a fifth would discover nothing new');
+        'six attempts is the whole ladder — a seventh would discover nothing new, and a run ' +
+        'that never stops retrying is a run that never closes');
+    } finally { S.currentRunId = saved; }
+  });
+
+  test('the ladder is five even rungs of three hours', () => {
+    assert.equal(RETRY_BACKOFF_MS.length, 5,
+      'three rungs over seven hours closed runs with people still owed a message, because ' +
+      '131049 is a rolling per-person cap and not a counter that resets');
+    assert.ok(RETRY_BACKOFF_MS.every(ms => ms === 3 * HOUR_MS),
+      'even spacing is what makes the ladder explainable to an operator');
+  });
+
+  test('a stored retry deadline never lands in the middle of the night', () => {
+    const run = newRun();
+    const p = people(1);
+    const saved = S.currentRunId;
+    S.currentRunId = run;
+    try {
+      buildRun(run, p);
+      scheduleRetry({ name: p[0].name, dialStr: p[0].dialStr }, { attempts: 0 },
+        { errorCode: 131049, error: 'cap' }, '[t]');
+      const at = rowFor(run, p[0].dialStr).retry_after;
+      const hourIST = new Date(at + IST_OFFSET_MS).getUTCHours();
+      assert.ok(hourIST >= 7 && hourIST < 23,
+        `a retry was stored for ${hourIST}:00 IST — the deferral has to happen before the ` +
+        'row is written, or the queue and the operator disagree about when this contact is due');
     } finally { S.currentRunId = saved; }
   });
 
@@ -1845,8 +2166,9 @@ console.log('\nrun_recipients — retrying a moment-based failure');
           'and the operator is told what is in the way, not just refused');
       }
       S.phase = 'waiting';
-      assert.match(campaignBlocker(), /waiting to retry/,
-        'the reason names the retry ladder rather than saying "running"');
+      assert.match(campaignBlocker(), /in progress — retrying/,
+        'the ladder now runs for up to a day, and an operator who reads "waiting" assumes the ' +
+        'campaign is stuck and presses Stop — abandoning exactly the contacts it exists to recover');
 
       S.phase = 'idle';
       assert.equal(campaignActive(), false);
@@ -1954,6 +2276,182 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     assert.equal(last.unfinished, true,
       'unfinished is derived from the queue, so it survives the process forgetting the run');
     assert.equal(last.nextRetry.count, 1);
+  });
+}
+
+// ── Campaign history ──────────────────────────────────────────────────────────
+// Read-only, and every field derived. The point of these assertions is that
+// campaign_runs gains no ended_at and no status column: both are properties of
+// the queue, and a stored copy is a number that can disagree with the rows.
+console.log('\nhistory — listRuns and runDetail');
+{
+  const M = require('./server');
+  const { listRuns, runDetail, buildRun, recordRecipientSent, recordRecipientSkipped,
+          recordRecipientRetry } = M;
+
+  let hseq = 0;
+  const person = name => ({ name, dialStr: `9198800${String(++hseq).padStart(5, '0')}` });
+  const newRun = (label, body) => Number(db.prepare(
+    'INSERT INTO campaign_runs (started_at, label, template_body, template_lang) VALUES (?,?,?,?)')
+    .run(Date.now(), label, body ?? null, 'en').lastInsertRowid);
+
+  // Every test here reads a run that is NOT the current one, which is what the
+  // History page always does. Pinning currentRunId to null keeps 'in-progress'
+  // out of the answer unless a test asks for it.
+  const detached = fn => {
+    const savedRun = S.currentRunId, savedPhase = S.phase;
+    S.currentRunId = null; S.phase = 'idle';
+    try { return fn(); } finally { S.currentRunId = savedRun; S.phase = savedPhase; }
+  };
+
+  test('a run staged and never started is hidden from history', () => {
+    const empty = newRun('staged_never_started');
+    const real  = newRun('karnataka_price_list');
+    buildRun(real, [person('Asha')]);
+    detached(() => {
+      const runs = listRuns();
+      assert.equal(runs[0].id, real, 'newest first — the campaign just run is the one being looked for');
+      assert.ok(!runs.some(r => r.id === empty),
+        'a run with no recipients is noise; showing it makes the list untrustworthy');
+    });
+  });
+
+  test('ended-at is the last attempt on the queue, not a stored column', () => {
+    const run = newRun('ended_at');
+    const p = person('Rahul');
+    buildRun(run, [p]);
+    recordRecipientSent(run, p.dialStr, 'w-hist-1');
+    const row = db.prepare('SELECT attempted_at FROM run_recipients WHERE run_id = ?').get(run);
+    detached(() => {
+      assert.equal(runDetail(run).endedAt, row.attempted_at,
+        'a stored ended_at needs writing on finish, on Stop, on ladder exhaustion and after a ' +
+        'crash — four places to forget, and a forgotten one shows a campaign that never ended');
+    });
+    const cols = db.prepare('PRAGMA table_info(campaign_runs)').all().map(c => c.name);
+    assert.ok(!cols.includes('ended_at') && !cols.includes('status'),
+      'neither may ever become a column — that is the whole decision');
+  });
+
+  test('a run with everyone resolved reads completed', () => {
+    const run = newRun('all_done');
+    const a = person('Asha'), b = person('Marco');
+    buildRun(run, [a, b]);
+    recordRecipientSent(run, a.dialStr, 'w-hist-2');
+    recordRecipientSkipped(run, b.dialStr, 'skipped', 131026);
+    detached(() => assert.equal(runDetail(run).status, 'completed',
+      'sent and skipped are both resolved — nothing is owed'));
+  });
+
+  test('a run with pending rows that is not current reads incomplete', () => {
+    const run = newRun('stopped_halfway');
+    const a = person('Sarah'), b = person('Priya');
+    buildRun(run, [a, b]);
+    recordRecipientSent(run, a.dialStr, 'w-hist-3');
+    detached(() => {
+      const d = runDetail(run);
+      assert.equal(d.status, 'incomplete',
+        'reporting a stopped campaign as complete hides the people it never reached');
+      assert.equal(d.progress.pending, 1, 'and the count says how many');
+    });
+  });
+
+  test('the current run being walked reads in-progress, retry ladder included', () => {
+    const run = newRun('live_one');
+    const p = person('Asha');
+    buildRun(run, [p]);
+    recordRecipientRetry(run, p.dialStr, 131049, Date.now() + 3 * 3600000);
+    const savedRun = S.currentRunId, savedPhase = S.phase;
+    S.currentRunId = run; S.phase = 'waiting';
+    try {
+      assert.equal(runDetail(run).status, 'in-progress',
+        'a campaign still working its retry ladder is not finished, and history must not say it is');
+    } finally { S.currentRunId = savedRun; S.phase = savedPhase; }
+  });
+
+  test('the body shown is the one that run sent, not the template as it reads now', () => {
+    const run = newRun('body_snapshot', 'Old price list for {{1}}');
+    buildRun(run, [person('Rahul')]);
+    const savedBody = S.config.templateBody;
+    S.config.templateBody = 'A completely different message';
+    try {
+      detached(() => assert.equal(runDetail(run).body, 'Old price list for {{1}}',
+        'editing a template must never rewrite what last month\'s campaign said'));
+    } finally { S.config.templateBody = savedBody; }
+  });
+
+  test('an unknown id is null rather than the current run', () => {
+    detached(() => {
+      assert.equal(runDetail(999999), null,
+        'a stale bookmark that renders a different campaign reads as an answer, which is ' +
+        'worse than a 404 because the operator acts on it');
+      assert.equal(runDetail('nonsense'), null);
+      assert.equal(runDetail(0), null);
+      assert.equal(runDetail(null), null);
+    });
+  });
+
+  test('an inbox reply is never counted against a campaign', () => {
+    const run = newRun('no_leak');
+    const p = person('Asha');
+    buildRun(run, [p]);
+    // run_id left NULL, exactly as services/inbox.js writes it.
+    db.prepare('INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status) VALUES (?,?,?,?,?,?,?)')
+      .run('reply-hist-1', p.dialStr, 'out', 'text', 'a free-form reply', Date.now(), 'delivered');
+    detached(() => assert.equal(runDetail(run).counts.delivered, 0,
+      'run_id IS NULL is the bucket inbox replies land in — counting it inflates every report ' +
+      'and prices free-form replies at the template rate'));
+  });
+
+  // Both halves matter, as with every other route test here. The 401 alone
+  // would pass even if the routes were never mounted, because requireAuth
+  // rejects every /api path before routing; the signed-in answer is what proves
+  // they exist AND sit below the gate.
+  testAsync('the history routes are mounted below the password gate and are read-only', async () => {
+    const run = newRun('routed', 'Body as sent');
+    buildRun(run, [person('Asha')]);
+    const savedPw = CFG.appPassword;
+    CFG.appPassword = 'test-password';
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const cookie = { cookie: `wa_session=${createSession()}` };
+
+      assert.equal((await fetch(`${base}/api/runs`)).status, 401,
+        'campaign history names customers and what was sent to them — it is not public');
+
+      const list = await fetch(`${base}/api/runs`, { headers: cookie });
+      assert.equal(list.status, 200);
+      assert.ok((await list.json()).runs.some(r => r.id === run),
+        'a signed-in caller must reach the router, not just the auth gate');
+
+      const detail = await fetch(`${base}/api/runs/${run}`, { headers: cookie });
+      assert.equal(detail.status, 200);
+      assert.equal((await detail.json()).body, 'Body as sent');
+
+      const missing = await fetch(`${base}/api/runs/999999`, { headers: cookie });
+      assert.equal(missing.status, 404,
+        'an unknown id must 404 rather than render whatever campaign is current');
+
+      // Read-only is the whole contract of this feature: nothing here writes.
+      const posted = await fetch(`${base}/api/runs/${run}`, { method: 'POST', headers: cookie });
+      assert.ok(posted.status === 404 || posted.status === 405,
+        'there is no POST on a history route, and there must never be one');
+    } finally { s.close(); CFG.appPassword = savedPw; }
+  });
+
+  test('the skip report travels with the run, codes and attempts included', () => {
+    const run = newRun('with_skips');
+    const a = person('Marco'), b = person('Priya');
+    buildRun(run, [a, b]);
+    recordRecipientSent(run, a.dialStr, 'w-hist-4');
+    recordRecipientSkipped(run, b.dialStr, 'skipped', 131049);
+    detached(() => {
+      const d = runDetail(run);
+      assert.equal(d.skips.length, 1, 'the operator has to be able to see who was not reached');
+      assert.equal(d.skips[0].error_code, 131049, 'and why, in Meta\'s own terms');
+      assert.equal(d.recipients.length, 2, 'while the full list still shows everyone');
+    });
   });
 }
 
@@ -2481,6 +2979,39 @@ console.log('\nmedia routes');
         { headers: { cookie: `wa_session=${createSession()}` } });
       assert.equal(signedIn.status, 200, 'a signed-in caller must reach the media router');
       assert.ok(Array.isArray((await signedIn.json()).assets));
+    } finally { s.close(); CFG.appPassword = savedPw; }
+  });
+
+  // Same two halves as above. The 400 proves the route exists and reached the
+  // service; the 401 proves an anonymous caller cannot send a file to a customer.
+  testAsync('the media reply route is mounted below the password gate', async () => {
+    const savedPw = CFG.appPassword;
+    CFG.appPassword = 'test-password';
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const post = (headers) => fetch(`${base}/api/inbox/919700000099/media`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({ assetId: 1, caption: 'hi' }),
+      });
+
+      assert.equal((await post()).status, 401,
+        'an anonymous caller must not be able to send a file to a customer');
+
+      const signedIn = await post({ cookie: `wa_session=${createSession()}` });
+      assert.equal(signedIn.status, 400,
+        'a signed-in caller reaches the service, which refuses because that thread has no open window');
+      assert.equal((await signedIn.json()).ok, false);
+
+      const noAsset = await fetch(`${base}/api/inbox/919700000099/media`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: `wa_session=${createSession()}` },
+        body: JSON.stringify({ caption: 'no file' }),
+      });
+      assert.equal(noAsset.status, 400, 'a post with no assetId is refused before the service is called');
+      assert.match((await noAsset.json()).error, /Pick a file/);
     } finally { s.close(); CFG.appPassword = savedPw; }
   });
 }
@@ -3458,6 +3989,32 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(row.path, null, 'path clears so the bubble reverts to a Save button');
       assert.ok(row.media_id, 'the row itself survives — message history is not media');
       assert.equal(row.risk, 'safe', 'the verdict survives too, so a re-save need not re-derive it');
+    });
+
+    // The two stores have two lifetimes and must never be confused. `media` is
+    // what customers sent us, lives in MEDIA_DIR and is on a 90-day clock;
+    // `media_assets` is what the operator uploaded, lives in UPLOAD_DIR and is
+    // never swept. This guards a property that already holds — it exists so a
+    // later change to retention.js cannot quietly break it, because deleting an
+    // operator's price list is silent and unrecoverable.
+    testAsync('the sweep never touches an operator upload', async () => {
+      const up = saveUpload({ buffer: Buffer.from(`%PDF-1.7 keep me ${Math.random()}`),
+                              originalname: 'price-list.pdf', mimetype: 'application/pdf' });
+      assert.equal(up.ok, true, up.error);
+      const file = assetPath(up.asset);
+      assert.ok(fsm.existsSync(file), 'the fixture has to exist before the sweep to prove anything');
+
+      // An inbound file old enough to actually make the sweep do work, so this
+      // is not passing merely because nothing was swept at all.
+      const id = await saveOne();
+      age(id, 400 * DAY);
+      const r = sweepMedia();
+      assert.ok(r.swept >= 1, 'the sweep must have run for real');
+
+      assert.ok(fsm.existsSync(file),
+        'UPLOAD_DIR holds files the operator owns and is still sending — only MEDIA_DIR is on a clock');
+      assert.ok(getAsset(up.asset.id),
+        'and the row survives too, or the library would lose a file whose bytes are still there');
     });
 
     testAsync('a file inside the window is left alone', async () => {
