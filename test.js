@@ -38,7 +38,7 @@ const {
   startRun, recordOutbound,
   buildState, app,
   migrateJsonToSql, db,
-  MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath,
+  MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath, deleteAsset,
   ensureHandle, ensureMediaId, MEDIA_ID_TTL_MS, headerComponent, sendTemplate,
   saveInbound, inboundPath, getInbound, INBOUND_TTL_MS, rescanIfNeeded, sweepMedia,
   keepInbound, discardInbound, sha256Hex,
@@ -1125,6 +1125,65 @@ console.log('\nmedia — saveUpload');
     const r = saveUpload(file(Buffer.from('PK xlsx-ish'), 'prices.xlsx',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'));
     assert.equal(r.ok, true, r.error);
+  });
+
+  // Storage management. The library only ever grew, which was fine for a few
+  // template headers a month and is not fine now that every inbox send writes
+  // here. Deletion is the operator's call, never a timer's — and the server
+  // refuses any delete that would leave history unable to say what it sent.
+  test('an unused file can be deleted and the bytes actually leave the disk', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 disposable ${Math.random()}`),
+                              'old-list.pdf', 'application/pdf'));
+    assert.equal(r.ok, true, r.error);
+    const p = assetPath(r.asset);
+    assert.ok(fsx.existsSync(p));
+
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, true, d.error);
+    assert.ok(!fsx.existsSync(p), 'freeing disk is the entire point — a row-only delete leaks it');
+    assert.equal(getAsset(r.asset.id), undefined, 'and the library must not list a file that is gone');
+  });
+
+  test('a file a sent message points at is refused, naming what uses it', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 in-use ${Math.random()}`),
+                              'sent-list.pdf', 'application/pdf'));
+    db.prepare('INSERT OR IGNORE INTO messages (wamid, wa_id, dir, type, body, at, status, asset_id) VALUES (?,?,?,?,?,?,?,?)')
+      .run(`del-guard-${r.asset.id}`, '919000000009', 'out', 'document', 'x', Date.now(), 'sent', r.asset.id);
+
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, false,
+      'deleting it would leave a thread showing a file nothing can identify');
+    assert.match(d.error, /sent message/,
+      'and the refusal has to name what is holding it, or the operator just tries again');
+    assert.ok(fsx.existsSync(assetPath(r.asset)), 'a refused delete must not have removed the bytes');
+  });
+
+  test('a file a campaign used as its header is refused', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 header ${Math.random()}`),
+                              'header.pdf', 'application/pdf'));
+    db.prepare('INSERT INTO campaign_runs (started_at, label, header_asset) VALUES (?,?,?)')
+      .run(Date.now(), 'used-header', r.asset.id);
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, false, 'a campaign report must always be able to say what it sent');
+    assert.match(d.error, /campaign/);
+  });
+
+  test('deleting a file that is not there is a sentence, not a crash', () => {
+    const d = deleteAsset(999999);
+    assert.equal(d.ok, false);
+    assert.match(d.error, /not in the library/);
+  });
+
+  test('a row whose path escapes UPLOAD_DIR is refused, not followed', () => {
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 traversal ${Math.random()}`),
+                              'ok.pdf', 'application/pdf'));
+    // `path` is a column, and a column is data. A corrupted or crafted row must
+    // not be able to unlink something outside the uploads directory.
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run('../../../../etc/passwd', r.asset.id);
+    const d = deleteAsset(r.asset.id);
+    assert.equal(d.ok, false, 'the guard is the whole reason this delete is safe to expose');
+    assert.match(d.error, /outside the uploads directory/);
   });
 
   test('kindFor maps each accepted type to its kind', () => {

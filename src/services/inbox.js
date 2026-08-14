@@ -203,14 +203,32 @@ async function sendMedia(waId, assetId, caption = '') {
   if (text) payload.caption = text;
   if (asset.kind === 'document') payload.filename = asset.filename;
 
+  const post = body => graphSend('POST', `${CFG.phoneNumberId}/messages`, {
+    messaging_product: 'whatsapp',
+    recipient_type:    'individual',
+    to:                waId,
+    type:              asset.kind,
+    [asset.kind]:      body,
+  });
+
   try {
-    const { res, data } = await graphSend('POST', `${CFG.phoneNumberId}/messages`, {
-      messaging_product: 'whatsapp',
-      recipient_type:    'individual',
-      to:                waId,
-      type:              asset.kind,
-      [asset.kind]:      payload,
-    });
+    let { res, data } = await post(payload);
+
+    // Meta deletes media at 30 days and our 29-day refresh clock is not their
+    // clock — they can drop it early, and a media id can also be invalidated by
+    // things we never see. The campaign path already re-uploads and retries once
+    // for exactly this; without the same here, a price list uploaded five weeks
+    // ago fails at the moment a dealer is waiting for it.
+    //
+    // Keyed on data.error rather than res.ok: Graph answers this class of
+    // failure with HTTP 200 carrying an error object.
+    if (/media/i.test(data.error?.message || '')) {
+      log('warn', `Send rejected over the media id for "${asset.filename}" — re-uploading it and retrying once`);
+      const again = await ensureMediaId(assetId, { force: true });
+      if (!again.ok) return again;
+      ({ res, data } = await post({ ...payload, id: again.mediaId }));
+    }
+
     if (!res.ok || !data.messages?.[0]?.id) {
       const code = data.error?.code || 0;
       const hint = explainError(code) || explainError(data.error?.error_subcode);

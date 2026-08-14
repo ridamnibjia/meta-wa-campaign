@@ -348,6 +348,19 @@ function MediaPicker({ waId, onSent, onClose }) {
     setPicked(r.asset.id);
   };
 
+  // Storage management lives here because this is where an operator can see
+  // what the library actually holds. Nothing sweeps UPLOAD_DIR on a timer: only
+  // the operator has a copy of their own file.
+  const remove = async a => {
+    if (!window.confirm(`Delete "${a.filename}" from the library?\n\nThis frees disk space. Files still used by a template, a campaign or a sent message cannot be deleted.`)) return;
+    setBusy(true); setError('');
+    const r = await api.del(`/api/media/${a.id}`).catch(() => ({ ok: false, error: 'Network error' }));
+    setBusy(false);
+    if (!r.ok) return setError(r.error);
+    setAssets(list => (list || []).filter(x => x.id !== a.id));
+    if (picked === a.id) setPicked(null);
+  };
+
   const send = async () => {
     setBusy(true); setError('');
     const r = await api.post(`/api/inbox/${waId}/media`, { assetId: picked, caption })
@@ -381,13 +394,22 @@ function MediaPicker({ waId, onSent, onClose }) {
       ) : (
         <div className="mb-2 max-h-44 space-y-1 overflow-y-auto">
           {assets.map(a => (
-            <button key={a.id} type="button" onClick={() => setPicked(a.id)}
-              className={cn('flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs',
+            <div key={a.id}
+              className={cn('flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs',
                 picked === a.id ? 'bg-secondary text-secondary-foreground' : 'hover:bg-accent')}>
-              <span className="opacity-70">{KIND_ICON[a.kind] || '▤'}</span>
-              <span className="min-w-0 flex-1 truncate">{a.filename}</span>
-              <span className="shrink-0 text-muted-foreground">{mb(a.file_size)}</span>
-            </button>
+              <button type="button" onClick={() => setPicked(a.id)}
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left">
+                <span className="opacity-70">{KIND_ICON[a.kind] || '▤'}</span>
+                <span className="min-w-0 flex-1 truncate">{a.filename}</span>
+                <span className="shrink-0 text-muted-foreground">{mb(a.file_size)}</span>
+              </button>
+              {/* The server refuses this for anything a template, a campaign or
+                  a sent message still points at, and says which — so the confirm
+                  is about intent, not about safety. */}
+              <button type="button" title="Delete from library" disabled={busy}
+                      className="shrink-0 px-1 text-muted-foreground hover:text-destructive"
+                      onClick={() => remove(a)}>✕</button>
+            </div>
           ))}
         </div>
       )}
