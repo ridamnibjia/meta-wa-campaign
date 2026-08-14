@@ -5,7 +5,8 @@ const { S, flags, log, todayKey } = require('../state');
 const { broadcast } = require('../services/status');
 const { isDisabled, markMessaged, getRow } = require('../services/contacts');
 const { W, effectiveCap } = require('../services/warmup');
-const { recordOutbound, progressForRun, skippedForRun } = require('../services/messages');
+const { recordOutbound, progressForRun, skippedForRun,
+        listRuns, runDetail } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
 const { validateTemplate, adoptTemplate, renderBody } = require('../services/templates');
 const { fetchAccountInfo } = require('../services/graph');
@@ -222,6 +223,20 @@ router.get('/campaign/skips', (req, res) => {
       unclassified: groups.unclassified || [],
     },
   });
+});
+
+// ── History ────────────────────────────────────────────────────────────────────
+// Read-only, both of them. Mounted after /webhook like everything else here, so
+// requireAuth already covers them without saying so.
+router.get('/runs', (req, res) => res.json({ runs: listRuns({ limit: req.query.limit }) }));
+
+// 404, never the current run. A bookmark to a campaign that no longer exists
+// must not quietly render a different one — the operator would read that as an
+// answer and act on it.
+router.get('/runs/:id', (req, res) => {
+  const detail = runDetail(req.params.id);
+  if (!detail) return res.status(404).json({ error: 'No campaign with that id' });
+  res.json(detail);
 });
 
 module.exports = router;

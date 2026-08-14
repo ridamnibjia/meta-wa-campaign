@@ -2343,6 +2343,44 @@ console.log('\nhistory — listRuns and runDetail');
       'and prices free-form replies at the template rate'));
   });
 
+  // Both halves matter, as with every other route test here. The 401 alone
+  // would pass even if the routes were never mounted, because requireAuth
+  // rejects every /api path before routing; the signed-in answer is what proves
+  // they exist AND sit below the gate.
+  testAsync('the history routes are mounted below the password gate and are read-only', async () => {
+    const run = newRun('routed', 'Body as sent');
+    buildRun(run, [person('Asha')]);
+    const savedPw = CFG.appPassword;
+    CFG.appPassword = 'test-password';
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const cookie = { cookie: `wa_session=${createSession()}` };
+
+      assert.equal((await fetch(`${base}/api/runs`)).status, 401,
+        'campaign history names customers and what was sent to them — it is not public');
+
+      const list = await fetch(`${base}/api/runs`, { headers: cookie });
+      assert.equal(list.status, 200);
+      assert.ok((await list.json()).runs.some(r => r.id === run),
+        'a signed-in caller must reach the router, not just the auth gate');
+
+      const detail = await fetch(`${base}/api/runs/${run}`, { headers: cookie });
+      assert.equal(detail.status, 200);
+      assert.equal((await detail.json()).body, 'Body as sent');
+
+      const missing = await fetch(`${base}/api/runs/999999`, { headers: cookie });
+      assert.equal(missing.status, 404,
+        'an unknown id must 404 rather than render whatever campaign is current');
+
+      // Read-only is the whole contract of this feature: nothing here writes.
+      const posted = await fetch(`${base}/api/runs/${run}`, { method: 'POST', headers: cookie });
+      assert.ok(posted.status === 404 || posted.status === 405,
+        'there is no POST on a history route, and there must never be one');
+    } finally { s.close(); CFG.appPassword = savedPw; }
+  });
+
   test('the skip report travels with the run, codes and attempts included', () => {
     const run = newRun('with_skips');
     const a = person('Marco'), b = person('Priya');
