@@ -228,6 +228,27 @@ sweep and delete it from disk with nothing anywhere to say why. There is a test
 that ages an inbound file past the cutoff, runs the sweep for real, and asserts
 `UPLOAD_DIR` is untouched.
 
+**Storage is managed by the operator, and the two stores are not symmetrical.**
+`services/storage.js` lists both, but what it will *do* to them differs by owner.
+An upload is ours: deletable when nothing references it, renameable. A customer
+file an operator chose to **Save** cannot be deleted from the Storage page at
+all — the UI promised a retention window, and a promise that can be cancelled
+early on a whim is not a retention window. It goes when the sweep says. The only
+lever offered is running that sweep early, which removes solely what is already
+past its cutoff. A **previewed** file is deletable because nothing ever committed
+to it. Bulk selection is a convenience, never a way past a refusal: `removeMany`
+puts every item through the same per-item guard a single delete uses and reports
+per-item outcomes. Nothing in `storage.js` unlinks anything itself — it delegates
+to `deleteAsset` and `discardInbound`, which hold the containment and sibling
+guards.
+
+**Renaming touches the display name and nothing else.** `sha256`, `path` and the
+bytes are untouched, so dedupe still works and every campaign that already
+reported sending an asset still reported the truth. Slashes and control
+characters are refused because that string is sent to Meta as a document
+filename. Inbound files are not renameable at all: the name is part of what the
+customer sent.
+
 **`saveUpload` runs `classify()` and refuses the `block` tier only.** The
 uploader is the authenticated operator, but an authenticated operator can be
 handed a file and asked to forward it, and this path reaches every dealer on the

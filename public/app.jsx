@@ -18,6 +18,7 @@ const api = {
   get:    p       => req(p),
   post:   (p, d)  => req(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d || {}) }),
   del:    p       => req(p, { method: 'DELETE' }),
+  patch:  (p, d)  => req(p, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d || {}) }),
   upload: (p, fd) => req(p, { method: 'POST', body: fd }),
 };
 
@@ -32,6 +33,7 @@ const ROUTES = [
   { path: 'campaign', label: 'Campaign',  icon: '➤' },
   { path: 'inbox',    label: 'Inbox',     icon: '✉' },
   { path: 'history',  label: 'History',   icon: '▤' },
+  { path: 'storage',  label: 'Storage',   icon: '▦' },
   { path: 'settings', label: 'Settings',  icon: '⚙' },
   { path: 'diagnostics', label: 'Diagnostics', icon: '⚕' },
 ];
@@ -317,7 +319,7 @@ function App() {
   }
 
   const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, history: History,
-                 settings: SettingsView, diagnostics: Diagnostics }[tab] || Dashboard;
+                 storage: Storage, settings: SettingsView, diagnostics: Diagnostics }[tab] || Dashboard;
 
   return (
     <AppContext.Provider value={ctx}>

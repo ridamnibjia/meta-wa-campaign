@@ -6,6 +6,8 @@ const { MEDIA_KINDS, saveUpload, listAssets, getAsset, assetPath,
         getInbound, inboundPath, saveInbound, rescanIfNeeded,
         keepInbound, discardInbound, deleteAsset } = require('../services/media');
 const { effectiveRisk } = require('../lib/filerisk');
+const storage = require('../services/storage');
+const { sweepMedia } = require('../services/retention');
 const { log } = require('../state');
 
 const router = express.Router();
@@ -35,6 +37,35 @@ router.post('/media/upload', (req, res) => {
 
 router.get('/media', (req, res) => res.json({ assets: listAssets() }));
 
+// ── Storage management ─────────────────────────────────────────────────────────
+// Mounted BEFORE /media/:id would ever see them: "/media/storage" is two
+// segments and would otherwise be read as an asset id called "storage".
+router.get('/media/storage', (req, res) => {
+  res.json({ ...storage.overview(), ...storage.listStored() });
+});
+
+router.patch('/media/storage/rename/:id', (req, res) => {
+  const r = storage.renameAsset(req.params.id, req.body?.filename);
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+// Bulk. Each item is still checked one at a time by the same guards a single
+// delete uses, and the response reports per-item outcomes — a selection is a
+// convenience, never a way past a refusal.
+router.post('/media/storage/remove', (req, res) => {
+  const r = storage.removeMany(req.body?.items);
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+// Runs the retention sweep early. It removes only what is ALREADY past its
+// cutoff, so this changes nothing about the retention promise — it just means
+// not waiting for the timer when the disk is filling now.
+router.post('/media/storage/sweep', (req, res) => {
+  const r = sweepMedia();
+  log('info', `Sweep run from the Storage page — ${r.swept} file(s), ${r.freed} bytes`);
+  res.json({ ok: true, ...r });
+});
+
 // Operator-controlled storage management. There is no auto-sweep of UPLOAD_DIR
 // on purpose: nobody but the operator has a copy of their own file, Meta drops
 // its copy at 30 days, and deleting one on a timer is the unrecoverable failure
@@ -45,6 +76,7 @@ router.delete('/media/:id', (req, res) => {
   const r = deleteAsset(req.params.id);
   res.status(r.ok ? 200 : 409).json(r);
 });
+
 
 // Streamed from disk behind the same auth as everything else, rather than
 // mounted statically: a static mount would make every uploaded file readable by
@@ -86,7 +118,6 @@ const INLINE_SAFE = new Set([
 // WhatsApp voice notes arrive as "audio/ogg; codecs=opus". The allowlist holds
 // bare types, so the parameters come off before the lookup.
 const bareMime = m => String(m || '').split(';')[0].trim().toLowerCase();
-
 
 // Explicitly operator-triggered. Nothing downloads customer media automatically,
 // so the bytes only ever land on this server because someone asked for them.

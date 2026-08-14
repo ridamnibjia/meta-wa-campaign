@@ -46,6 +46,7 @@ const {
   scanBuffer, parseReply, scannerConfigured, EICAR,
   BUTTON_LIMITS, saveTemplateRow, getTemplateRow, OPT_OUT_LABEL,
   saveCampaignNow, loadCampaign, resumeIfInterrupted, clearCampaignFile,
+  overview, listStored, renameAsset, removeMany,
 } = require('./server');
 
 let passed = 0;
@@ -2276,6 +2277,175 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     assert.equal(last.unfinished, true,
       'unfinished is derived from the queue, so it survives the process forgetting the run');
     assert.equal(last.nextRetry.count, 1);
+  });
+}
+
+// ── Storage management ────────────────────────────────────────────────────────
+// Two stores with two different owners, and the asymmetry between them is the
+// whole feature: our uploads can be deleted and renamed, a customer's KEPT file
+// cannot be deleted here at all. The UI promised a retention window, and a
+// promise an operator can cancel early on a whim is not a retention window.
+console.log('\nstorage — overview, listing, rename, bulk removal');
+{
+  const fsx = require('fs');
+  const up = (name = 'lib.pdf') => saveUpload({
+    buffer: Buffer.from(`%PDF-1.7 storage ${Math.random()}`),
+    originalname: name, mimetype: 'application/pdf' });
+
+  // A local seeder rather than the one in the retention block: that one is
+  // defined further down the file and these tests run before it. Only the row
+  // matters here — listStored reads the table, and no bytes are ever fetched.
+  let sn = 0;
+  const seedKept = (bytesLen = 1234) => {
+    const id = `mid.storage.${++sn}.${Date.now()}`;
+    recordInbound({
+      id, from: '910000000007', timestamp: String(Math.floor(Date.now() / 1000)), type: 'image',
+      image: { id, mime_type: 'image/jpeg', file_size: bytesLen },
+    }, 'Storage Tester');
+    db.prepare('UPDATE media SET path = ?, downloaded_at = ?, provisional = 0, file_size = ? WHERE media_id = ?')
+      .run(`kept-${id}.jpg`, Date.now(), bytesLen, id);
+    return id;
+  };
+
+  test('the overview reports the whole volume, not just what this app wrote', () => {
+    const o = overview();
+    assert.ok(o.volume.total === null || o.volume.total > 0,
+      'an operator reading "uploads: 44 MB" cannot tell if that is a problem without the disk size');
+    assert.ok(o.volume.free === null || o.volume.free >= 0);
+    assert.equal(typeof o.ours, 'number', 'the app total is what the breakdown has to add up to');
+    assert.ok(o.breakdown.database.bytes > 0, 'the database is always on this disk');
+  });
+
+  test('the breakdown marks which categories can actually be freed', () => {
+    const b = overview().breakdown;
+    assert.equal(b.uploads.deletable, true,  'our own uploads are ours to remove');
+    assert.equal(b.previews.deletable, true, 'a previewed file was never committed to');
+    assert.equal(b.kept.deletable, false,
+      'a saved customer file goes at the end of its retention window, not when someone wants space');
+    assert.equal(b.database.deletable, false, 'and the message history is never a storage lever');
+  });
+
+  test('an unreferenced upload is listed as deletable, a referenced one is not', () => {
+    const free = up('free-to-go.pdf');
+    const used = up('in-use.pdf');
+    db.prepare('INSERT INTO campaign_runs (started_at, label, header_asset) VALUES (?,?,?)')
+      .run(Date.now(), 'storage-ref', used.asset.id);
+
+    const rows = listStored().uploads;
+    const f = rows.find(r => r.id === String(free.asset.id));
+    const u = rows.find(r => r.id === String(used.asset.id));
+    assert.equal(f.deletable, true);
+    assert.equal(u.deletable, false, 'deleting it would leave a campaign unable to say what it sent');
+    assert.match(u.why, /campaign/,
+      'a disabled checkbox has to say why, or the operator just clicks it again');
+  });
+
+  test('a kept customer file is listed but never deletable, and says when it goes', () => {
+    const id = seedKept();
+    const row = listStored().inbound.find(r => r.id === id);
+    assert.ok(row, 'a file taking up disk has to appear on the page that manages disk');
+    assert.equal(row.kept, true);
+    assert.equal(row.deletable, false,
+      'this is the invariant the whole store rests on — retention is not cancellable per file');
+    assert.equal(row.renameable, false, "the name is part of what the customer sent");
+    assert.ok(row.expiresAt > Date.now(), 'and the operator can plan around the date it frees up');
+  });
+
+  test('bulk removal refuses a kept customer file while removing what it can', () => {
+    const ok = up('bulk-ok.pdf');
+    const keptId = seedKept();
+
+    const r = removeMany([
+      { store: 'upload',  id: ok.asset.id },
+      { store: 'inbound', id: keptId },
+    ]);
+    assert.equal(r.ok, true, 'a batch reports per-item outcomes rather than failing whole');
+    assert.equal(r.removed, 1, 'the upload goes');
+    assert.equal(r.failed, 1, 'the kept customer file does not');
+    assert.equal(getAsset(ok.asset.id), undefined);
+    assert.ok(db.prepare('SELECT path FROM media WHERE media_id = ?').get(keptId).path,
+      'selecting a file in bulk must never be a way past a refusal a single delete would give');
+  });
+
+  test('bulk removal rejects an unknown store rather than guessing', () => {
+    const r = removeMany([{ store: 'nonsense', id: '1' }]);
+    assert.equal(r.results[0].ok, false);
+    assert.match(r.results[0].error, /Unknown store/);
+  });
+
+  test('an empty or oversized selection is refused', () => {
+    assert.equal(removeMany([]).ok, false, 'a no-op delete should say so, not report success');
+    assert.equal(removeMany(null).ok, false);
+    const huge = Array.from({ length: 501 }, () => ({ store: 'upload', id: '1' }));
+    assert.equal(removeMany(huge).ok, false, 'an unbounded batch is a mistake waiting to happen');
+  });
+
+  test('renaming changes the display name and nothing about the bytes', () => {
+    const a = up('ugly-name-2026.pdf');
+    const before = db.prepare('SELECT sha256, path, file_size FROM media_assets WHERE id = ?').get(a.asset.id);
+
+    const r = renameAsset(a.asset.id, 'Karnataka price list Aug 2026.pdf');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.asset.filename, 'Karnataka price list Aug 2026.pdf');
+
+    const after = db.prepare('SELECT sha256, path, file_size FROM media_assets WHERE id = ?').get(a.asset.id);
+    assert.deepEqual(after, before,
+      'sha256 and path must not move — dedupe depends on them, and so does every campaign ' +
+      'that already reported sending this asset');
+    assert.ok(fsx.existsSync(assetPath(r.asset)), 'and the bytes are still where they were');
+  });
+
+  test('a rename with a path separator or control character is refused', () => {
+    const a = up('rename-guard.pdf');
+    for (const bad of ['../../etc/passwd', 'a/b.pdf', 'back\\slash.pdf', 'null byte.pdf']) {
+      const r = renameAsset(a.asset.id, bad);
+      assert.equal(r.ok, false, `"${bad}" must be refused — this string is sent to Meta as a filename`);
+    }
+    const empty = renameAsset(a.asset.id, '   ');
+    assert.equal(empty.ok, false, 'and a blank name leaves the recipient looking at nothing');
+  });
+
+  test('an ordinary name with spaces and dashes still renames', () => {
+    const a = up('plain.pdf');
+    const r = renameAsset(a.asset.id, 'Price list - August 2026 (final).pdf');
+    assert.equal(r.ok, true,
+      'the guard is about separators and control characters, not about punctuation people use');
+  });
+
+  test('renaming something that is not there is a sentence, not a crash', () => {
+    const r = renameAsset(999999, 'whatever.pdf');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /not in the library/);
+  });
+
+  // The storage endpoints list every customer who ever sent a file and what it
+  // was called. That is exactly the kind of thing that must not be readable
+  // without a session, and "/media/storage" must not be parsed as an asset id.
+  testAsync('the storage endpoints sit below the password gate and outrank /media/:id', async () => {
+    const savedPw = CFG.appPassword;
+    CFG.appPassword = 'test-password';
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const cookie = { cookie: `wa_session=${createSession()}` };
+
+      assert.equal((await fetch(`${base}/api/media/storage`)).status, 401,
+        'this lists customer names and filenames — it is not public');
+
+      const ok = await fetch(`${base}/api/media/storage`, { headers: cookie });
+      assert.equal(ok.status, 200,
+        'a 404 here would mean /media/:id swallowed "storage" as an asset id');
+      const body = await ok.json();
+      assert.ok(Array.isArray(body.uploads) && Array.isArray(body.inbound));
+      assert.ok(body.volume && 'total' in body.volume, 'the overview travels with the listing');
+
+      const bulk = await fetch(`${base}/api/media/storage/remove`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...cookie },
+        body: JSON.stringify({ items: [] }),
+      });
+      assert.equal(bulk.status, 400, 'an empty selection is a refusal, not a silent success');
+    } finally { s.close(); CFG.appPassword = savedPw; }
   });
 }
 
