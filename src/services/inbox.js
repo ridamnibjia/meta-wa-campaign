@@ -5,7 +5,7 @@ const { log, emit } = require('../state');
 const { normalizePhone } = require('../lib/phone');
 const { graphSend } = require('./graph');
 const { explainError } = require('../lib/errors');
-const { INBOUND_TTL_MS, getAsset, ensureMediaId } = require('./media');
+const { INBOUND_TTL_MS, getAsset, ensureMediaId, holdAsset } = require('./media');
 const { effectiveRisk } = require('../lib/filerisk');
 
 // An inbound message opens a 24-hour "customer service window" during which the
@@ -171,7 +171,17 @@ async function sendReply(waId, text) {
 // one with a code that never mentions the caption.
 const CAPTION_LIMIT = 1024;
 
-async function sendMedia(waId, assetId, caption = '') {
+// The hold is a wrapper rather than a try/finally around the body: it has to
+// cover the WHOLE send, including the re-upload-and-retry below, and wrapping is
+// the version that cannot be defeated by adding an early return later.
+// deleteAsset refuses while the hold is out, so a file cannot vanish between the
+// media id being minted and the message that carries it being accepted.
+const sendMedia = (waId, assetId, caption = '') => {
+  const release = holdAsset(assetId);
+  return sendMediaNow(waId, assetId, caption).finally(release);
+};
+
+async function sendMediaNow(waId, assetId, caption = '') {
   const text = String(caption || '').trim();
   if (text.length > CAPTION_LIMIT) {
     return { ok: false, error: `The caption is ${text.length} characters — WhatsApp allows ${CAPTION_LIMIT}. Shorten it, or send the file first and the rest as a separate message.` };

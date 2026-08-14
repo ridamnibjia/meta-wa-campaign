@@ -166,8 +166,12 @@ function Storage() {
     if (!r.ok) return setError(r.error);
     // Refusals are reported, not swallowed: a bulk action that silently skips
     // rows teaches an operator that the numbers on this page are approximate.
+    // The reasons come from the response rather than from the row, because the
+    // most important one — "it is being sent right now" — is true of this
+    // moment and was not true when the page last loaded.
+    const why = [...new Set((r.results || []).filter(x => !x.ok).map(x => x.error))];
     setMsg(`Removed ${r.removed} file${r.removed === 1 ? '' : 's'}, freeing ${bytesOf(r.freed)}.`
-      + (r.failed ? ` ${r.failed} could not be removed — see the reason on each row.` : ''));
+      + (r.failed ? ` ${r.failed} could not be removed. ${why.join(' ')}` : ''));
     load();
   };
 

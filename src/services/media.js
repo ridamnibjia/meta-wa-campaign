@@ -8,7 +8,7 @@ const path   = require('path');
 const crypto = require('node:crypto');
 const { CFG, UPLOAD_DIR, MEDIA_DIR, MEDIA_LIMITS } = require('../config');
 const { db }  = require('../lib/db');
-const { log } = require('../state');
+const { S, campaignActive, log } = require('../state');
 const { classify, extOf } = require('../lib/filerisk');
 const { scanBuffer, scannerConfigured } = require('../lib/clamav');
 
@@ -191,6 +191,60 @@ const assetRefs = {
   messages:      db.prepare('SELECT count(*) AS n FROM messages      WHERE asset_id     = ?'),
 };
 const deleteAssetRow = db.prepare('DELETE FROM media_assets WHERE id = ?');
+
+// ── "Not while it is in use" ───────────────────────────────────────────────────
+// Referenced-by is about the PAST — a campaign that already went out. This is
+// about right now: bytes on their way to Meta, or a live campaign that still has
+// this file to send. Deleting in that window does not fail cleanly. The upload
+// half-reads a file that is no longer there, the run records a failure that says
+// ENOENT to a dealer's row, and the operator has no way to tell that from a
+// genuine Meta refusal.
+//
+// This outranks `force`. Force is the operator overruling "history points at
+// it", which is a judgement call about the past. Nobody can overrule a send that
+// is already in flight, so there is deliberately no flag that skips this.
+//
+// A count rather than a boolean: one asset can be inside a campaign send and an
+// inbox send at the same moment, and the first to finish must not clear the
+// second's hold.
+const inFlight = new Map();
+
+function holdAsset(id) {
+  const key = Number(id);
+  if (!key) return () => {};
+  inFlight.set(key, (inFlight.get(key) || 0) + 1);
+  // Returns its own release rather than exposing one: a caller cannot then
+  // release a hold it does not have, and `finally` is the only sane place to
+  // put it. Idempotent, because a double release would zero a live hold.
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    const left = (inFlight.get(key) || 1) - 1;
+    if (left > 0) inFlight.set(key, left); else inFlight.delete(key);
+  };
+}
+
+const isHeld = id => (inFlight.get(Number(id)) || 0) > 0;
+
+// The run's own header, read from the row rather than from S.config: the config
+// is what the NEXT campaign would send, and those two differ the moment an
+// operator picks a new template while the current one is still going.
+const runHeaderAsset = db.prepare('SELECT header_asset FROM campaign_runs WHERE id = ?');
+
+function busyNow(asset) {
+  if (isHeld(asset.id)) {
+    return `"${asset.filename}" is being sent right now. Wait for that send to finish, then delete it.`;
+  }
+  if (!campaignActive()) return null;
+  // Only if the live campaign is actually sending THIS file. A campaign that
+  // has nothing to do with it is not a reason to refuse.
+  const runAsset = S.currentRunId ? runHeaderAsset.get(S.currentRunId)?.header_asset : null;
+  if (runAsset === asset.id || S.config.headerAssetId === asset.id) {
+    return `A campaign is running right now and is sending "${asset.filename}" as its header. Stop it, or let it finish, before deleting the file.`;
+  }
+  return null;
+}
 // The tombstone. Bytes gone, row kept, so a template that names this file and a
 // message that reported sending it can both still say what it was.
 const tombstoneRow = db.prepare('UPDATE media_assets SET deleted_at = ? WHERE id = ?');
@@ -204,6 +258,10 @@ function deleteAsset(id, { force = false } = {}) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: 'That file is not in the library.' };
   if (asset.deleted_at) return { ok: false, error: `"${asset.filename}" was already deleted — only its record is kept, so history can still say what was sent.` };
+
+  // Checked before anything is unlinked, and before `force` is even read.
+  const busy = busyNow(asset);
+  if (busy) return { ok: false, error: busy, busy: true };
 
   const used = {
     templates: assetRefs.templates.get(asset.id).n,
@@ -286,6 +344,10 @@ async function ensureHandle(id) {
     return { ok: false, error: 'APP_ID is not set. A media header needs Meta\'s Resumable Upload API, which keys on the app id — copy it from Meta for Developers → your app → Settings → Basic, put it in .env as APP_ID, and restart.' };
   }
 
+  // Held for the whole two-call protocol, not just the byte read: the session is
+  // opened with this file's length, and a delete between the two calls leaves
+  // Meta waiting for bytes that no longer exist.
+  const release = holdAsset(asset.id);
   try {
     const start = await fetch(
       `https://graph.facebook.com/${CFG.apiVersion}/${CFG.appId}/uploads`
@@ -317,6 +379,8 @@ async function ensureHandle(id) {
     return { ok: true, handle: done.h, asset: getAsset(asset.id) };
   } catch (e) {
     return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
+  } finally {
+    release();
   }
 }
 
@@ -336,6 +400,10 @@ async function ensureMediaId(id, { force = false } = {}) {
     return { ok: false, error: 'Credentials not configured' };
   }
 
+  // From the byte read to Meta's answer. A 90 MB video is a real number of
+  // seconds on this link, and that is exactly the window an operator tidying up
+  // the Storage page would otherwise delete it in.
+  const release = holdAsset(asset.id);
   try {
     const form = new FormData();
     form.append('messaging_product', 'whatsapp');
@@ -358,6 +426,8 @@ async function ensureMediaId(id, { force = false } = {}) {
     return { ok: true, mediaId: String(data.id), asset: getAsset(asset.id) };
   } catch (e) {
     return { ok: false, error: `Could not reach graph.facebook.com: ${e.message}` };
+  } finally {
+    release();
   }
 }
 
@@ -708,6 +778,7 @@ async function rescanIfNeeded(row) {
 
 module.exports = {
   MEDIA_KINDS, MEDIA_ID_TTL_MS, kindFor, saveUpload, listAssets, getAsset, assetPath, deleteAsset,
+  holdAsset, isHeld, busyNow,
   ensureHandle, ensureMediaId, headerComponent,
   INBOUND_TTL_MS, getInbound, inboundPath, inboundExpired, saveInbound, rescanIfNeeded,
   pathIsShared, clearInboundFile, dropBytes, keepInbound, discardInbound, sha256Hex,

@@ -39,6 +39,18 @@ const S = {
 // importing the loop itself.
 const flags = { running: false, stopFlag: false, pauseFlag: false };
 
+// Which phases mean "a campaign is under way". It lives here, next to S.phase,
+// because three modules ask the question and two of them had grown their own
+// copy of the list — and this list is load-bearing: 'waiting' is the retry
+// phase, it is what campaignBlocker() refuses a second Start on, and dropping
+// it from one copy is how a second loop gets onto one queue.
+const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
+
+// `flags.running` is in the test deliberately, and it is the half that matters:
+// a Stop sets the phase to idle immediately, but the loop is still inside an
+// await for up to a second afterwards.
+const campaignActive = () => flags.running || ACTIVE_PHASES.includes(S.phase);
+
 // ── Socket registry ────────────────────────────────────────────────────────────
 // server.js hands the io instance over once it exists. Every module emits
 // through here rather than importing express/socket.io, which keeps the service
@@ -68,4 +80,4 @@ function checkDaily() {
   }
 }
 
-module.exports = { S, flags, setIO, emit, log, sleep, todayKey, checkDaily };
+module.exports = { S, flags, ACTIVE_PHASES, campaignActive, setIO, emit, log, sleep, todayKey, checkDaily };

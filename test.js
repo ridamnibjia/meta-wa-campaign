@@ -5002,6 +5002,178 @@ console.log('\nstorage — force delete keeps the record, re-upload restores the
   });
 }
 
+// ── Nothing is deleted while it is in use ─────────────────────────────────────
+// "Referenced by" is about the past. This is about right now: bytes on their way
+// to Meta, or a live campaign that still has this file to send. Deleting in that
+// window does not fail cleanly — the run records an ENOENT against a dealer's
+// row, which is indistinguishable from a genuine Meta refusal.
+console.log('\nstorage — a file in use is never deleted');
+{
+  const fsz = require('fs');
+  const { holdAsset, flags: liveFlags } = require('./server');
+
+  const upload = name => saveUpload({
+    buffer: Buffer.from(`%PDF-1.7 busy ${name} ${Math.random()}`),
+    originalname: name, mimetype: 'application/pdf' }).asset;
+
+  // Restores every piece of campaign state these tests move. S is the real
+  // module-level object the loop reads, so leaking a phase here would make an
+  // unrelated later test think a campaign was running.
+  const withCampaign = (runId, phase, fn) => {
+    const saved = { phase: S.phase, run: S.currentRunId, header: S.config.headerAssetId,
+                    running: liveFlags.running };
+    S.phase = phase; S.currentRunId = runId; S.config.headerAssetId = null;
+    try { return fn(); }
+    finally {
+      S.phase = saved.phase; S.currentRunId = saved.run;
+      S.config.headerAssetId = saved.header; liveFlags.running = saved.running;
+    }
+  };
+
+  const runWithHeader = assetId => Number(db
+    .prepare('INSERT INTO campaign_runs (started_at, label, header_asset) VALUES (?,?,?)')
+    .run(Date.now(), 'busy-test', assetId).lastInsertRowid);
+
+  test('a file being sent right now cannot be deleted, and force does not override it', () => {
+    const a = upload('in-flight.pdf');
+    const release = holdAsset(a.id);
+    try {
+      const plain = deleteAsset(a.id);
+      assert.equal(plain.ok, false, 'the bytes are on their way to Meta');
+      assert.match(plain.error, /being sent right now/);
+
+      const forced = deleteAsset(a.id, { force: true });
+      assert.equal(forced.ok, false,
+        'force overrules "history points at it" — a judgement about the past. Nobody can overrule a send already in flight');
+      assert.ok(fsz.existsSync(assetPath(a)), 'and the file is still on disk');
+    } finally { release(); }
+
+    assert.equal(deleteAsset(a.id).ok, true, 'once the send is done it deletes normally');
+  });
+
+  test('two concurrent sends need two releases', () => {
+    const a = upload('two-holds.pdf');
+    const first = holdAsset(a.id);
+    const second = holdAsset(a.id);
+    first();
+    assert.equal(deleteAsset(a.id).ok, false,
+      'a campaign send and an inbox send can hold the same file — the first to finish must not clear the second');
+    second();
+    assert.equal(deleteAsset(a.id).ok, true);
+  });
+
+  test('releasing twice cannot clear somebody else\'s hold', () => {
+    const a = upload('double-release.pdf');
+    const first = holdAsset(a.id);
+    const second = holdAsset(a.id);
+    first(); first(); first();
+    assert.equal(deleteAsset(a.id).ok, false, 'the second send is still running');
+    second();
+    assert.equal(deleteAsset(a.id).ok, true);
+  });
+
+  test('the live campaign\'s own header file cannot be deleted while it runs', () => {
+    const a = upload('live-header.pdf');
+    const runId = runWithHeader(a.id);
+    withCampaign(runId, 'running', () => {
+      const r = deleteAsset(a.id, { force: true });
+      assert.equal(r.ok, false, 'the run still has contacts to send this header to');
+      assert.match(r.error, /campaign is running/);
+      assert.ok(fsz.existsSync(assetPath(a)));
+    });
+    // force, because the run row that made it "live" is also a reference to it:
+    // the campaign it belonged to is over, but its history still names the file.
+    assert.equal(deleteAsset(a.id, { force: true }).ok, true,
+      'and it deletes once the campaign is not running');
+  });
+
+  test('the retry phase counts as running — that is what the ladder is', () => {
+    const a = upload('waiting-header.pdf');
+    const runId = runWithHeader(a.id);
+    withCampaign(runId, 'waiting', () => {
+      assert.equal(deleteAsset(a.id).ok, false,
+        '"waiting" is contacts still owed a message, not a finished campaign');
+    });
+    deleteAsset(a.id, { force: true });
+  });
+
+  test('a campaign that has nothing to do with the file does not protect it', () => {
+    const header = upload('other-header.pdf');
+    const spare  = upload('unrelated.pdf');
+    const runId  = runWithHeader(header.id);
+    withCampaign(runId, 'running', () => {
+      assert.equal(deleteAsset(spare.id).ok, true,
+        'a running campaign is a reason to refuse THIS file, not every file');
+    });
+    deleteAsset(header.id, { force: true });
+  });
+
+  test('the header the operator has just picked is protected too', () => {
+    const a = upload('picked-header.pdf');
+    // No run row points at it yet — this is the file the campaign about to send
+    // is configured to use, which is the window between Start and the first send.
+    const saved = { phase: S.phase, header: S.config.headerAssetId };
+    S.phase = 'running'; S.config.headerAssetId = a.id;
+    try {
+      assert.equal(deleteAsset(a.id, { force: true }).ok, false,
+        'the loop reads S.config.headerAssetId on its very next send');
+    } finally { S.phase = saved.phase; S.config.headerAssetId = saved.header; }
+    assert.equal(deleteAsset(a.id).ok, true);
+  });
+
+  test('bulk removal reports the refusal per item and leaves the bytes alone', () => {
+    const busy = upload('bulk-busy.pdf');
+    const free = upload('bulk-free.pdf');
+    const release = holdAsset(busy.id);
+    try {
+      const r = removeMany([
+        { store: 'upload', id: busy.id, force: true },
+        { store: 'upload', id: free.id },
+      ]);
+      assert.equal(r.removed, 1, 'the idle file goes');
+      assert.equal(r.failed, 1, 'the one being sent does not');
+      assert.match(r.results.find(x => String(x.id) === String(busy.id)).error, /being sent right now/);
+      assert.ok(fsz.existsSync(assetPath(busy)), 'and its bytes are untouched');
+    } finally { release(); }
+  });
+
+  // The whole point of the hold: the window it covers is an await, and an
+  // operator on the Storage page is a different request that can land inside it.
+  testAsync('a delete landing mid-send is refused, and works once the send returns', async () => {
+    const CFGx = require('./src/config').CFG;
+    const savedToken = CFGx.accessToken, savedPhone = CFGx.phoneNumberId;
+    CFGx.accessToken = 'test-token'; CFGx.phoneNumberId = '1234567890';
+
+    const asset = upload('mid-send.pdf');
+    db.prepare('UPDATE media_assets SET media_id = ?, media_id_at = ? WHERE id = ?')
+      .run(`mid-${asset.id}`, Date.now(), asset.id);
+    const now = Date.now();
+    db.prepare('INSERT OR REPLACE INTO threads (wa_id, name, unread, last_inbound_at, last_at) VALUES (?,?,0,?,?)')
+      .run('919700000099', 'Busy Tester', now, now);
+
+    let duringSend = null;
+    const restore = stubGraph(async () => {
+      // Meta has the request; the message is not accepted yet. This is exactly
+      // the moment the file must not disappear.
+      duringSend = deleteAsset(asset.id, { force: true });
+      return { ok: true, headers: new Map(), json: async () => ({ messages: [{ id: 'busy-out-1' }] }) };
+    });
+
+    try {
+      const sent = await sendMedia('919700000099', asset.id, 'price list');
+      assert.equal(sent.ok, true, sent.error);
+      assert.equal(duringSend.ok, false, 'the delete arrived while the send was in flight');
+      assert.match(duringSend.error, /being sent right now/);
+      assert.ok(fsz.existsSync(assetPath(asset)), 'so the bytes survived the send');
+      assert.equal(deleteAsset(asset.id, { force: true }).ok, true,
+        'and the hold is released when the send returns, not left behind');
+    } finally {
+      restore();
+      CFGx.accessToken = savedToken; CFGx.phoneNumberId = savedPhone;
+    }
+  });
+}
+
 Promise.all(pending).then(() => {
   console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);
 });

@@ -417,6 +417,12 @@ untouched, so deduplication still works and every campaign that reported sending
 that file still reported the truth. Customer files cannot be renamed at all: the
 name is part of what they sent.
 
+**A file in use is never deleted, however you ask.** If the bytes are on their
+way to Meta at that moment, or a campaign is running right now with that file as
+its header, the delete is refused with a sentence saying which — and "Delete
+anyway" does not override it. That override is about history pointing at a file;
+it is not a way to pull a file out of a send that is already happening.
+
 **Delete anyway.** A file a template or a sent message still points at is
 refused by the checkbox, and offered its own **Delete anyway** button with its
 own confirmation. Taking it removes the bytes and keeps the record: the row stays

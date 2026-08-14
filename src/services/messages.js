@@ -1,6 +1,6 @@
 'use strict';
 const { db } = require('../lib/db');
-const { S, flags, log } = require('../state');
+const { S, flags, campaignActive, log } = require('../state');
 const { explainError } = require('../lib/errors');
 
 // An unknown ID means a message this server never sent — traffic from another
@@ -422,13 +422,9 @@ const runRowQ = db.prepare(`
 // by the /stop route alone and leave every other status derived.
 function statusForRun(runId, pending) {
   const isCurrent = runId === S.currentRunId;
-  if (isCurrent && (flags.running || ACTIVE_PHASES.includes(S.phase))) return 'in-progress';
+  if (isCurrent && campaignActive()) return 'in-progress';
   return pending > 0 ? 'incomplete' : 'completed';
 }
-
-// Duplicated from services/campaign.js rather than imported: services/campaign
-// requires this file, and importing it back would be a cycle. Three strings.
-const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
 
 // ponytail: LIMIT 100, no cursor. One campaign per CSV upload means a hundred
 // rows is a year of history for one business. If it ever needs paging, the

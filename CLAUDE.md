@@ -158,8 +158,9 @@ wrap-across-midnight branch is load-bearing — a plain range check is wrong, an
 there is a test for a non-wrapping window that proves it.
 
 **The phase string is `waiting`; every label says "In progress".** State and
-presentation are allowed to differ. `ACTIVE_PHASES`, `campaignBlocker()` and
-`resumeIfInterrupted()` all match on the string. Renaming it to match the label
+presentation are allowed to differ. `ACTIVE_PHASES` (in `src/state.js`),
+`campaignBlocker()`, `resumeIfInterrupted()`, `statusForRun()` and the
+delete-while-in-use check all match on the string. Renaming it to match the label
 silently changes what a second Start is refused on, which is how the
 two-loops-on-one-queue double send got in before. The label changed because the
 ladder now runs for up to a day, and an operator who reads "waiting" assumes the
@@ -205,6 +206,28 @@ statement after the loop rather than part of the upsert: the upsert cannot
 re-enable anyone (`enabled` is absent from its SET list), but it can INSERT, and
 an insert arrives with the column default. There is a test that deletes an
 opted-out contact, re-uploads the CSV, and asserts they come back disabled.
+
+**Nothing is deleted while it is in use, and `force` does not override that.**
+Referenced-by is a fact about the past; `busyNow()` in `services/media.js` is
+about this second. It refuses when either (a) a hold is out on the asset —
+`holdAsset()` is taken for the whole of `ensureHandle`, `ensureMediaId` and
+`sendMedia`, so it spans the awaits where bytes are actually travelling — or (b)
+a campaign is live (`campaignActive()`) and that run's `header_asset`, or
+`S.config.headerAssetId`, is this file. Force is the operator overruling a
+judgement about history; nobody can overrule a send already in flight, so there
+is deliberately no flag that skips this check. The hold is a **count**, not a
+boolean: one asset can be inside a campaign send and an inbox send at once, and
+the first to finish must not clear the second's hold. `sendMedia` wraps rather
+than try/finally-s its body so a later early return cannot escape the release.
+Deleting mid-send does not fail cleanly — the run writes an ENOENT against a
+dealer's row, indistinguishable from a real Meta refusal.
+
+**`ACTIVE_PHASES` lives in `src/state.js`, next to `S.phase`.** It had grown a
+second copy in `services/messages.js` with a comment explaining the cycle that
+forced it; a third consumer (`media.js`, for the check above) made that
+untenable. `campaignActive()` — `flags.running || ACTIVE_PHASES.includes(phase)`
+— lives there too, because the `flags.running` half is the one that matters and
+it was being re-typed at each call site.
 
 **A deleted asset that history points at becomes a tombstone, not a gap.**
 SQLite does not enforce the `REFERENCES` on `messages.asset_id` or

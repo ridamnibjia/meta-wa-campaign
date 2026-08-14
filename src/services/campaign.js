@@ -1,7 +1,7 @@
 'use strict';
 const { CFG, FILES } = require('../config');
 const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
-const { S, flags, log, sleep, todayKey, checkDaily } = require('../state');
+const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep, todayKey, checkDaily } = require('../state');
 const { broadcast } = require('./status');
 const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
 const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
@@ -256,11 +256,10 @@ async function sleepUntil(at) {
 // run message whoever they both reach twice.
 // 'waiting' is the retry phase. Every label the operator sees for it says "In
 // progress" instead — this string is state, that string is presentation, and
-// they are allowed to differ. Renaming this one to match the label silently
-// changes what campaignBlocker() refuses and what resumeIfInterrupted() picks
-// back up, which is how the two-loops-on-one-queue double send got in before.
-const ACTIVE_PHASES = ['running', 'waiting', 'paused'];
-const campaignActive = () => flags.running || ACTIVE_PHASES.includes(S.phase);
+// they are allowed to differ. Renaming it to match the label silently changes
+// what campaignBlocker() refuses and what resumeIfInterrupted() picks back up,
+// which is how the two-loops-on-one-queue double send got in before. The list
+// itself lives in state.js: three modules ask this question.
 
 // The sentence a route hands the operator, or null when nothing is in the way.
 function campaignBlocker() {
