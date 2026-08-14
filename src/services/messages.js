@@ -38,8 +38,17 @@ const markFailed = db.prepare(`
    WHERE wamid = ?
 `);
 
-const exists = db.prepare('SELECT wa_id, status FROM messages WHERE wamid = ?');
+// run_id travels back with the row because a delivery failure has to be handed
+// to the queue it belongs to, and the wamid is the only thing the webhook
+// carries — see the `failed` branch below.
+const exists = db.prepare('SELECT wa_id, run_id, status FROM messages WHERE wamid = ?');
 
+// Returns a descriptor on the transition INTO 'failed', so the caller can put
+// the contact back on the retry ladder; undefined for every other status and
+// for a redelivery of a failure already recorded. Meta accepts most sends and
+// reports the refusal minutes or hours later over this webhook, so this is the
+// path most 131049s actually take — the send-time ladder in services/campaign.js
+// never sees them.
 function applyStatus(status) {
   const id = status.id;
   const st = status.status;
@@ -67,7 +76,12 @@ function applyStatus(status) {
       log('warn', `delivery failed — +${row.wa_id} [${code}] ${title || ''}`);
       if (hint) log('warn', `   ↳ ${hint}`);
     }
-    return;
+    // Gated on the same transition as the log for the same reason: replay and
+    // Meta's own redeliveries must not each hand the contact another attempt.
+    // Only the descriptor is returned — what to DO about a failure is a
+    // campaign decision, and services/messages.js does not import the loop.
+    return alreadyFailed ? undefined
+      : { failed: true, waId: row.wa_id, runId: row.run_id, wamid: id, code, title };
   }
 
   const rank = STATUS_RANK[st];
@@ -77,13 +91,33 @@ function applyStatus(status) {
 
 // Counters are derived, not incremented. This removes the drift class of bug
 // entirely: there is no number that can disagree with the messages it counts.
+//
+// Counted per CONTACT, not per row. A delivery failure that comes back over the
+// webhook puts the contact back on the ladder, and the next attempt writes a
+// SECOND outbound row for the same person — so `count(*)` reported six accepted
+// on a run of five, and a contact reached on attempt two stayed in `failed`
+// forever beside their own `delivered`. The inner query collapses each contact
+// to their best outcome, which is also the only reading an operator has: one
+// person either heard from us or did not.
+//
+// 'failed' ranks BELOW every other status rather than above it, the opposite of
+// STATUS_RANK. That rank is about one wamid, where a failure is terminal;
+// this one is about one person across several attempts, where any attempt that
+// landed is the answer.
 const runCounts = db.prepare(`
-  SELECT count(*)                                                     AS accepted,
-         sum(CASE WHEN status IN ('delivered','read') THEN 1 ELSE 0 END) AS delivered,
-         sum(CASE WHEN status = 'read'   THEN 1 ELSE 0 END)           AS read,
-         sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)           AS failed
-    FROM messages
-   WHERE dir = 'out' AND run_id IS ?
+  SELECT count(*)                                        AS accepted,
+         sum(CASE WHEN best >= 2 THEN 1 ELSE 0 END)      AS delivered,
+         sum(CASE WHEN best  = 3 THEN 1 ELSE 0 END)      AS read,
+         sum(CASE WHEN best  < 0 THEN 1 ELSE 0 END)      AS failed
+    FROM (
+      SELECT max(CASE status
+                   WHEN 'read'      THEN 3 WHEN 'delivered' THEN 2
+                   WHEN 'sent'      THEN 1 WHEN 'accepted'  THEN 0
+                   WHEN 'failed'    THEN -1 ELSE 0 END)  AS best
+        FROM messages
+       WHERE dir = 'out' AND run_id IS ?
+       GROUP BY wa_id
+    )
 `);
 
 const ZERO_COUNTS = { accepted: 0, delivered: 0, read: 0, failed: 0 };
@@ -251,6 +285,29 @@ const markRetry = db.prepare(`
    WHERE run_id = ? AND phone = ?
 `);
 
+// The same ladder, entered from the other end. Meta accepted the send — so this
+// row already carries a wamid and the queue reads it as done — and only failed
+// it later, over a webhook. Un-stamping the wamid is what puts the contact back
+// in front of nextPending; without it the run closes with them never reached,
+// which is the whole bug this closes.
+//
+// `AND wamid = ?` is the idempotency guard, and it is load-bearing twice over.
+// Meta redelivers statuses and the Diagnostics replay button re-runs stored
+// envelopes, so this statement must be safe to run again: a second webhook for
+// a wamid the row no longer carries matches nothing. It also protects against
+// the out-of-order case — a stale failure for attempt two arriving after
+// attempt three has already gone out must not un-send attempt three.
+const requeueAfterDelivery = db.prepare(`
+  UPDATE run_recipients
+     SET wamid = NULL, skipped_reason = 'retry', error_code = ?,
+         attempted_at = ?, retry_after = ?, attempts = attempts + 1
+   WHERE run_id = ? AND phone = ? AND wamid = ?
+`);
+
+const recipientQ = db.prepare(
+  'SELECT phone, name, seq, wamid, skipped_reason, error_code, attempts, retry_after '
+  + 'FROM run_recipients WHERE run_id = ? AND phone = ?');
+
 // `disabled` is broken out from `skipped` because it is the only skip that
 // costs nothing and was known in advance: pricing subtracts it to get the
 // billable count, and the operator reads it as "these people are on your list
@@ -303,9 +360,17 @@ const skippedQ = db.prepare(`
    ORDER BY seq
 `);
 
+// The message status is joined in rather than inferred from the queue row. A
+// row with a wamid means "Meta accepted this", which the list rendered as
+// "sent" — and went on saying it about a contact Meta had since refused to
+// deliver to. The join is on the wamid the row currently carries, so a contact
+// waiting on the ladder (wamid NULL) matches nothing and reads as retrying.
 const recipientsQ = db.prepare(
-  `SELECT phone, name, seq, wamid, skipped_reason, error_code, attempts, retry_after
-     FROM run_recipients WHERE run_id = ? ORDER BY seq`);
+  `SELECT r.phone, r.name, r.seq, r.wamid, r.skipped_reason, r.error_code,
+          r.attempts, r.retry_after, m.status
+     FROM run_recipients r
+     LEFT JOIN messages m ON m.wamid = r.wamid
+    WHERE r.run_id = ? ORDER BY r.seq`);
 
 // Building a run twice for the same id replaces it: /upload-csv opens a fresh
 // run for every upload, so this only ever fires if a caller reuses one.
@@ -347,6 +412,18 @@ const recordRecipientSkipped = (runId, phone, reason, errorCode = null) =>
 // Puts a contact back in the queue at a stated time instead of dropping them.
 const recordRecipientRetry = (runId, phone, errorCode, retryAfter) =>
   markRetry.run(errorCode, Date.now(), retryAfter, runId, phone);
+
+// Same, for a send Meta accepted and then failed hours later. True when the row
+// was actually put back — false means the webhook was a redelivery, or was
+// about an attempt this contact has already moved past.
+const requeueFailedRecipient = (runId, phone, wamid, errorCode, retryAfter) =>
+  (runId == null || !wamid ? false
+    : requeueAfterDelivery.run(errorCode, Date.now(), retryAfter, runId, phone, wamid).changes > 0);
+
+// One queue row, or null. The caller needs `attempts` to know which rung of the
+// ladder this contact is on, and `wamid` to know the webhook is not stale.
+const recipientFor = (runId, phone) =>
+  (runId == null ? null : recipientQ.get(runId, phone) || null);
 
 // { at, count } for the rows waiting on backoff, or null when there are none.
 function nextRetryForRun(runId) {
@@ -474,6 +551,7 @@ module.exports = {
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
-  recordRecipientRetry, nextRetryForRun, lastRunSummary,
+  recordRecipientRetry, requeueFailedRecipient, recipientFor,
+  nextRetryForRun, lastRunSummary,
   progressForRun, skippedForRun, recipientsForRun, billableForRun,
 };

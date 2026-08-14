@@ -103,10 +103,21 @@ it is not that number — delivered is. `STATUS_RANK` already counts a `read` th
 arrives with no preceding `delivered` as both, because Meta does not promise
 status order. Do not remove the caveat from the History view to tidy it up.
 
-**Never add a message count to a queue count.** `countsForRun` counts rows in
+**`countsForRun` counts people, not rows.** It used to be `count(*)` over
+`messages`, which was the same thing while one contact meant one outbound row per
+run. The webhook retry ladder below breaks that: a contact Meta accepted and then
+refused gets a second send, so `accepted` read 6 on a run of 5 and the recovered
+contact sat in `failed` beside their own `delivered`. The query groups by `wa_id`
+and takes each contact's best outcome, with `failed` ranked *below* every other
+status — the opposite of `STATUS_RANK`, deliberately. That rank is about one
+wamid, where a failure is terminal and a later `delivered` for it is a stale
+redelivery; this one is about one person across several attempts, where any
+attempt that landed is the answer.
+
+**Never add a message count to a queue count.** `countsForRun` counts contacts in
 `messages`; `progressForRun` counts contacts in `run_recipients`. The same
-failure appears in both — a webhook failure is inside `accepted` (which is
-`count(*)` of every outbound row) *and* inside `failed`; an API refusal is inside
+failure appears in both — a webhook failure is inside `accepted` *and* inside
+`failed`; an API refusal is inside
 `S.failed` *and* inside `skipped`, because it is written to the queue as
 `skipped_reason = 'failed'`. The dashboard summed them and read "74 of 57
 processed, 130%". Anything meaning "contacts resolved" reads `currentIdx`
@@ -144,6 +155,30 @@ belongs to the recipient, not to the attempt. Reaching those people reliably
 means the 24-hour service window — a template that invites a reply, then a
 free-form send — which is what `sendMedia` exists for. Do not re-shorten this
 ladder, and do not expect it to zero the failures on its own.
+
+**The ladder has two entrances, and the webhook one is the busy entrance.** Meta
+answers most sends with HTTP 200 and a wamid and only refuses to deliver minutes
+or hours later, over a `statuses[].status = 'failed'` webhook. `scheduleRetry`
+only ever saw the send-time half, so the code the ladder was lengthened *for*
+almost never reached it: the run closed "5 of 5 sent, 1 failed" and that contact
+was never tried again. `applyStatus` now returns a descriptor on the transition
+into `failed` and `services/ingest.js` hands it to `handleDeliveryFailure` in
+`services/campaign.js` — the descriptor, not the decision, because
+`services/messages.js` does not import the loop. It un-stamps the `wamid` so
+`nextPending` can see the row again, which is the only thing that makes a
+resolved row pending. It runs on the webhook thread and never interrupts the
+loop: a campaign still sending reaches everyone untouched first and picks the
+parked failures up when their deadline comes due. A run that already ended is
+restarted, gated on `S.phase === 'done'` — the one phase that means the loop ran
+out of work by itself. A Stop leaves `idle` and a Reset drops the run id, and a
+webhook must not resurrect a campaign the operator ended.
+
+**Both webhook writes are guarded on something that changes.** The requeue is
+`WHERE run_id = ? AND phone = ? AND wamid = ?` and only fires on the transition
+*into* `failed`. Meta redelivers statuses and the Diagnostics replay button
+re-runs stored envelopes, so an unguarded version would walk a contact down the
+whole ladder without a single extra attempt being made — and would un-send a
+newer attempt when a stale failure for an older wamid arrived late.
 
 **Quiet hours are a deferral, applied before the row is written.**
 `lib/schedule.js` pushes any deadline landing 23:00–07:00 IST to 08:00. Night
@@ -343,8 +378,10 @@ helper for this. `WA_MEDIA_MIN_FREE_BYTES=0` is a legitimate setting.
 
 **Replay is idempotent by construction.** `messages` dedupes on its primary key,
 `applyStatus` only moves a status forward, `disable()` is a no-op when already
-off for that reason. That is the only reason the Diagnostics replay button can
-exist. Do not add a non-idempotent write to `processEnvelope`.
+off for that reason, and the retry requeue is guarded on the `failed` transition
+*and* on the wamid the queue row still carries. That is the only reason the
+Diagnostics replay button can exist. Do not add a non-idempotent write to
+`processEnvelope`.
 
 ## Gotchas
 

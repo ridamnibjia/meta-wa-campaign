@@ -12,6 +12,7 @@ const { log, emit } = require('../state');
 const { broadcast } = require('./status');
 const { disable } = require('./contacts');
 const { applyStatus, markEnvelopeProcessed } = require('./messages');
+const { handleDeliveryFailure } = require('./campaign');
 const inbox = require('./inbox');
 
 function processEnvelope(body) {
@@ -60,7 +61,14 @@ function processEnvelope(body) {
       }
 
       for (const status of (change.value?.statuses || [])) {
-        applyStatus(status);
+        // applyStatus returns a descriptor only on the transition INTO 'failed'.
+        // Meta accepts most sends and refuses them later over this webhook, so
+        // without this hand-off the retry ladder never sees the failure it was
+        // lengthened for and the run closes with the contact never reached.
+        // Both sides are idempotent — the transition guard here, the wamid
+        // guard in the UPDATE — which is what keeps Replay safe to press twice.
+        const failure = applyStatus(status);
+        if (failure) handleDeliveryFailure(failure);
         broadcast();
       }
     }

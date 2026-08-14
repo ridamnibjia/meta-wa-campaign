@@ -545,12 +545,34 @@ test('a status for an unknown wamid changes nothing and does not throw', () => {
   assert.doesNotThrow(() => applyStatus({ id: 'never-sent', status: 'read' }));
   assert.equal(statusOf('never-sent'), undefined);
 });
-test('countsForRun sums per-message statuses', () => {
-  seedOut('r1', '911', 9); seedOut('r2', '911', 9); seedOut('r3', '911', 9); seedOut('r4', '911', 9);
+test('countsForRun sums per-contact statuses', () => {
+  seedOut('r1', '9111', 9); seedOut('r2', '9112', 9); seedOut('r3', '9113', 9); seedOut('r4', '9114', 9);
   applyStatus({ id: 'r1', status: 'read' });
   applyStatus({ id: 'r2', status: 'delivered' });
   applyStatus({ id: 'r3', status: 'failed', errors: [{ code: 1, title: 'x' }] });
   assert.deepEqual(countsForRun(9), { accepted: 4, delivered: 2, read: 1, failed: 1 });
+});
+// The counts are about people, not rows. A contact the retry ladder reaches on
+// a second attempt has TWO outbound rows in one run, and counting rows reported
+// three accepted on a run of two while leaving the recovered contact inside
+// `failed` beside their own `delivered`.
+test('a contact reached on a later attempt is delivered, not accepted twice and not still failed', () => {
+  seedOut('r5a', '9115', 10); seedOut('r6', '9116', 10);
+  applyStatus({ id: 'r5a', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
+  applyStatus({ id: 'r6', status: 'delivered' });
+  assert.deepEqual(countsForRun(10), { accepted: 2, delivered: 1, read: 0, failed: 1 },
+    'while the retry is still pending the contact is honestly a failure');
+
+  seedOut('r5b', '9115', 10);                       // the retry goes out
+  applyStatus({ id: 'r5b', status: 'delivered' });
+  assert.deepEqual(countsForRun(10), { accepted: 2, delivered: 2, read: 0, failed: 0 },
+    'two people were on this run, and both of them heard from us');
+});
+test('a contact whose every attempt failed stays failed', () => {
+  seedOut('r7a', '9117', 11); seedOut('r7b', '9117', 11);
+  applyStatus({ id: 'r7a', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
+  applyStatus({ id: 'r7b', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
+  assert.deepEqual(countsForRun(11), { accepted: 1, delivered: 0, read: 0, failed: 1 });
 });
 test('countsForRun on an empty run returns zeros, not nulls', () => {
   assert.deepEqual(countsForRun(999), { accepted: 0, delivered: 0, read: 0, failed: 0 });
@@ -2279,6 +2301,196 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     assert.equal(last.unfinished, true,
       'unfinished is derived from the queue, so it survives the process forgetting the run');
     assert.equal(last.nextRetry.count, 1);
+  });
+}
+
+// ── The failure that arrives after the accept ─────────────────────────────────
+// Meta answers the send with HTTP 200 and a wamid, then refuses to deliver it
+// minutes or hours later over the status webhook. The send-time ladder never
+// sees these, so the run closed "5 of 5 sent, 1 failed" with the failure never
+// retried — and 131049, the cap the ladder was lengthened to five rungs FOR,
+// almost always arrives this way.
+console.log('\ndelivery failures that arrive over the webhook');
+{
+  const M = require('./server');
+  const { buildRun, recordRecipientSent, progressForRun, handleDeliveryFailure,
+          applyStatus, countsForRun, recipientsForRun, RETRY_BACKOFF_MS } = M;
+  const C = M.contacts;
+
+  let runSeq = 0;
+  const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
+    .run(Date.now(), `w${++runSeq}`).lastInsertRowid);
+  let pseq = 0;
+  const people = n => Array.from({ length: n }, (_, i) => ({
+    name: `W${i}`, dialStr: `9198700${String(++pseq).padStart(5, '0')}` }));
+  const rowFor = (run, phone) => db
+    .prepare('SELECT wamid, attempts, retry_after, skipped_reason, error_code FROM run_recipients WHERE run_id = ? AND phone = ?')
+    .get(run, phone);
+
+  // One accepted send: the queue row stamped with a wamid, and the outbound row
+  // that stamp points at. Exactly the state a finished run is in.
+  const accepted = (run, contact, wamid) => {
+    recordRecipientSent(run, contact.dialStr, wamid);
+    db.prepare("INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status, run_id) VALUES (?,?, 'out','template','hi',1000,'accepted',?)")
+      .run(wamid, contact.dialStr, run);
+  };
+  // What ingest does with one status envelope.
+  const webhook = (wamid, code) => {
+    const failure = applyStatus({ id: wamid, status: 'failed', errors: [{ code, title: 't' }] });
+    return failure ? handleDeliveryFailure(failure) : 'ignored';
+  };
+
+  test('a retryable failure after the accept puts the contact back on the queue', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.ok');
+    accepted(run, p[1], 'w.capped');
+    assert.equal(progressForRun(run).pending, 0, 'the run had closed — this is the bug');
+
+    assert.equal(webhook('w.capped', 131049), 'retrying');
+
+    const prog = progressForRun(run);
+    assert.deepEqual([prog.sent, prog.retrying, prog.pending], [1, 1, 1],
+      'a run is not finished while somebody Meta refused is still owed a message');
+    const row = rowFor(run, p[1].dialStr);
+    assert.equal(row.wamid, null, 'the accept stamp is what made the queue call them done');
+    assert.equal(row.attempts, 1);
+    assert.ok(row.retry_after > Date.now() + RETRY_BACKOFF_MS[0] - 5000, 'due about three hours out');
+  });
+
+  test('the same failure delivered twice does not cost a second rung', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.twice');
+
+    assert.equal(webhook('w.twice', 131049), 'retrying');
+    const after = rowFor(run, p[0].dialStr);
+    // Meta redelivers, and the Diagnostics replay button re-runs stored
+    // envelopes. Either one handing the contact another rung would walk the
+    // ladder to exhaustion without a single extra attempt being made.
+    assert.equal(webhook('w.twice', 131049), 'ignored', 'the status was already failed');
+    assert.deepEqual(rowFor(run, p[0].dialStr), after);
+  });
+
+  test('a failure for an attempt the contact has already moved past changes nothing', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.old');
+    accepted(run, p[0], 'w.new');          // the retry went out; the row carries w.new now
+
+    assert.equal(webhook('w.old', 131049), 'stale',
+      'un-sending the newer attempt would queue a third send to someone already messaged twice');
+    assert.equal(rowFor(run, p[0].dialStr).wamid, 'w.new');
+  });
+
+  test('a number that is not on WhatsApp is switched off, never retried', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    C.upsertFromCsv(p, {});
+    accepted(run, p[0], 'w.gone');
+
+    assert.equal(webhook('w.gone', 131026), 'permanent');
+    assert.equal(C.isDisabled(p[0].dialStr), true,
+      'no ladder changes the answer for a wrong number, and each rung costs a send slot');
+    assert.equal(rowFor(run, p[0].dialStr).wamid, 'w.gone', 'and the queue row is left resolved');
+    assert.equal(progressForRun(run).pending, 0);
+  });
+
+  test('a code nobody has ruled on is reported, not retried', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.odd');
+    assert.equal(webhook('w.odd', 999999), 'unclassified');
+    assert.equal(progressForRun(run).pending, 0, 'guessing on the operator\'s behalf is the thing skipDisposition refuses to do');
+  });
+
+  test('the ladder ends after five rungs and the run is allowed to close', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    for (let i = 0; i < RETRY_BACKOFF_MS.length; i++) {
+      accepted(run, p[0], `w.rung${i}`);
+      assert.equal(webhook(`w.rung${i}`, 131049), 'retrying');
+      assert.equal(rowFor(run, p[0].dialStr).attempts, i + 1);
+    }
+    accepted(run, p[0], 'w.rung5');
+    assert.equal(webhook('w.rung5', 131049), 'exhausted',
+      'six attempts over about fifteen hours is the whole ladder — the cap belongs to the '
+      + 'recipient, not to the attempt, so no ladder length zeroes it');
+    assert.equal(progressForRun(run).pending, 0, 'and the campaign is finally allowed to be finished');
+    assert.equal(countsForRun(run).failed, 1, 'reported as a failure, which is what it is');
+  });
+
+  test('the per-contact list stops calling a refused send "sent"', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.shown');
+    applyStatus({ id: 'w.shown', status: 'failed', errors: [{ code: 132001, title: 'bad template' }] });
+    assert.equal(recipientsForRun(run)[0].status, 'failed',
+      'a wamid means Meta ACCEPTED it — the list said "sent" about people Meta then refused');
+  });
+
+  // The complaint this whole path exists to answer: the campaign said
+  // "Finished" while a contact Meta had refused was owed five more attempts.
+  // This drives the real loop and asserts it reopens and parks on the ladder.
+  testAsync('a failure that lands after the run finished reopens it', async () => {
+    const { flags, startLoop } = M;
+    const saved = { phase: S.phase, run: S.currentRunId, reason: S.pauseReason };
+    const fsc = require('node:fs');
+    const cfile = require('./src/config').FILES.campaign;
+    const hadFile = fsc.existsSync(cfile);
+    const fileWas = hadFile ? fsc.readFileSync(cfile, 'utf8') : null;
+    const run = newRun();
+    const p = people(1);
+    try {
+      buildRun(run, p);
+      accepted(run, p[0], 'w.reopen');
+      S.currentRunId = run;
+      S.phase = 'done';                  // the loop ran out of work and said so
+      flags.stopFlag = false; flags.pauseFlag = false;
+
+      assert.equal(webhook('w.reopen', 131049), 'retrying');
+      await new Promise(r => setTimeout(r, 100));
+
+      assert.equal(flags.running, true, 'the loop is walking the queue again');
+      assert.equal(S.phase, 'waiting',
+        'parked on the ladder — and every label the operator sees for that phase says '
+        + '"In progress", because a campaign that says Finished with people still owed a '
+        + 'message is the bug');
+
+      flags.stopFlag = true;
+      const deadline = Date.now() + 3000;
+      while (flags.running && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+      assert.equal(flags.running, false);
+    } finally {
+      flags.stopFlag = false;
+      Object.assign(S, { phase: saved.phase, currentRunId: saved.run, pauseReason: saved.reason });
+      if (hadFile) fsc.writeFileSync(cfile, fileWas);
+      else if (fsc.existsSync(cfile)) fsc.unlinkSync(cfile);
+    }
+  });
+
+  test('a webhook cannot restart a campaign the operator stopped', () => {
+    const savedPhase = S.phase, savedRun = S.currentRunId, savedRunning = M.flags.running;
+    const run = newRun();
+    const p = people(1);
+    try {
+      buildRun(run, p);
+      accepted(run, p[0], 'w.stopped');
+      S.currentRunId = run;
+      S.phase = 'idle';                    // exactly what /stop leaves behind
+      assert.equal(webhook('w.stopped', 131049), 'retrying');
+      assert.equal(M.flags.running, false,
+        'only a run that ran out of work by itself ends in "done" — restarting a stopped one '
+        + 'would send to people the operator deliberately stopped sending to');
+      assert.equal(progressForRun(run).retrying, 1, 'the row still waits, for whenever it is started');
+    } finally { S.phase = savedPhase; S.currentRunId = savedRun; M.flags.running = savedRunning; }
   });
 }
 

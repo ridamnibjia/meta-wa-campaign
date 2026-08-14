@@ -118,8 +118,13 @@ function RunDetail({ id, onBack }) {
             <div key={r.phone} className="flex items-baseline gap-2 px-3 py-1.5 text-xs">
               <span className="w-28 shrink-0 truncate font-medium">{r.name || r.phone}</span>
               <span className="shrink-0 text-muted-foreground">+{r.phone}</span>
+              {/* The message status comes first, because a row with a wamid
+                  means Meta ACCEPTED it — and this list went on saying "sent"
+                  about contacts Meta had since refused to deliver to. */}
               <span className="ml-auto shrink-0">
-                {r.wamid ? <span className="text-success">sent</span>
+                {r.status === 'failed' ? <span className="text-destructive">failed</span>
+                  : r.status === 'read' || r.status === 'delivered' ? <span className="text-success">{r.status}</span>
+                  : r.wamid ? <span className="text-success">sent</span>
                   : r.skipped_reason === 'retry' ? <span className="text-warning">retrying</span>
                   : r.skipped_reason ? <span className="text-muted-foreground">{r.skipped_reason}</span>
                   : <span className="text-muted-foreground">not reached</span>}

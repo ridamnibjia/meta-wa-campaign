@@ -7,6 +7,7 @@ const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
 const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
 const { recordOutbound, countsForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
+        requeueFailedRecipient, recipientFor,
         nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition } = require('../lib/errors');
@@ -224,6 +225,73 @@ function scheduleRetry(contact, row, result, n) {
   recordRecipientRetry(S.currentRunId, contact.dialStr, result.errorCode, at);
   log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
   return true;
+}
+
+// ── The other half of the ladder: a failure that arrived after the accept ──────
+// Meta answers the send with HTTP 200 and a wamid, then decides minutes or hours
+// later that it will not deliver it and says so over the status webhook. The
+// send-time ladder above never sees these, which is how a run finished
+// "5 of 5 sent, 1 failed" with the failure permanently un-retried — and 131049,
+// the per-user marketing cap the ladder was lengthened to five rungs FOR, almost
+// always arrives this way rather than in the send response.
+//
+// This runs on the webhook thread, never inside the loop, and it deliberately
+// does not interrupt anything: it only edits the queue row. A campaign still
+// sending walks past the row and picks it up when the deadline comes due; a
+// campaign that already finished is restarted below. Either way the contacts
+// still un-messaged are reached first, and the parked failures come after.
+//
+// Which codes get a second attempt is lib/errors.js:skipDisposition, the same
+// whitelist the send-time path uses — a wrong number or a number not on
+// WhatsApp is 'permanent' and is switched off rather than retried, because no
+// number of attempts changes the answer and each one costs a send slot.
+function handleDeliveryFailure({ waId, runId, wamid, code }) {
+  const disp = skipDisposition(code);
+
+  // About the NUMBER, not about the moment. The send-time path disables these
+  // too; this is the same fact arriving late, and disable() is a no-op when the
+  // contact is already off for that reason, so replay is free.
+  if (disp === 'permanent') {
+    if (disable(waId, 'failed_hard')) {
+      log('warn', `+${waId} disabled — Meta reports this number as undeliverable, so no campaign will try it again`);
+      broadcast();
+    }
+    return 'permanent';
+  }
+  // 'fix' is a fault a human has to correct and 'unclassified' is a code nobody
+  // has ruled on. Retrying either unchanged reproduces the failure once per
+  // contact, which is the cost the whitelist exists to refuse.
+  if (disp !== 'retry') return disp;
+
+  const row = recipientFor(runId, waId);
+  // No row means the failure belongs to an inbox reply or a run whose queue was
+  // rebuilt. Nothing to put back.
+  if (!row || row.wamid !== wamid) return 'stale';
+
+  const made = row.attempts || 0;
+  if (made >= RETRY_BACKOFF_MS.length) {
+    // Six attempts over about fifteen hours. The cap belongs to the recipient,
+    // not to the attempt, so there is no ladder length that zeroes it — see the
+    // note above RETRY_BACKOFF_MS. They stay in `failed` and the run closes.
+    log('warn', `+${waId} — still not delivered after ${made + 1} attempts, giving up [${code}]`);
+    return 'exhausted';
+  }
+  const at = deferPastQuietHours(Date.now() + RETRY_BACKOFF_MS[made]);
+  if (!requeueFailedRecipient(runId, waId, wamid, code, at)) return 'stale';
+  log('warn', `+${waId} — back on the queue, retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
+
+  // Reopening a finished run. `S.phase === 'done'` is the test rather than
+  // `!campaignActive()` alone, because it is the one phase that means the loop
+  // ran out of work by itself: a Stop leaves 'idle' and a Reset drops the run
+  // id, and a webhook must not restart a campaign the operator ended. The loop
+  // sets the phase to 'waiting' as soon as it sees the deadline is in the
+  // future, so the dashboard goes back to "In progress — retrying".
+  if (runId === S.currentRunId && S.phase === 'done' && !campaignActive()) {
+    log('info', 'Campaign reopened — a delivery failure came back after it had finished');
+    startLoop();
+  }
+  broadcast();
+  return 'retrying';
 }
 
 // Waits in slices rather than in one call, so Stop and Pause are answered in a
@@ -475,5 +543,5 @@ function stageRun(contacts, label = S.config.templateName) {
 module.exports = {
   CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
-  campaignActive, campaignBlocker, scheduleRetry, RETRY_BACKOFF_MS,
+  campaignActive, campaignBlocker, scheduleRetry, handleDeliveryFailure, RETRY_BACKOFF_MS,
 };
