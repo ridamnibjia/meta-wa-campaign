@@ -31,6 +31,7 @@ const ROUTES = [
   { path: '',         label: 'Dashboard', icon: '◧' },
   { path: 'campaign', label: 'Campaign',  icon: '➤' },
   { path: 'inbox',    label: 'Inbox',     icon: '✉' },
+  { path: 'history',  label: 'History',   icon: '▤' },
   { path: 'settings', label: 'Settings',  icon: '⚙' },
   { path: 'diagnostics', label: 'Diagnostics', icon: '⚕' },
 ];
@@ -315,8 +316,8 @@ function App() {
     return <LoginScreen setupRequired={session.setupRequired} onIn={checkSession} />;
   }
 
-  const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, settings: SettingsView,
-                 diagnostics: Diagnostics }[tab] || Dashboard;
+  const View = { '': Dashboard, campaign: Campaign, inbox: Inbox, history: History,
+                 settings: SettingsView, diagnostics: Diagnostics }[tab] || Dashboard;
 
   return (
     <AppContext.Provider value={ctx}>

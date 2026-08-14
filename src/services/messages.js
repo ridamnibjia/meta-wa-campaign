@@ -464,7 +464,12 @@ function runDetail(runId) {
     language: r.template_lang, body: r.template_body, headerAsset: r.header_asset,
     counts: countsForRun(id), progress,
     billable: billableForRun(id), nextRetry: nextRetryForRun(id),
-    recipients: recipientsForRun(id), skips: skippedForRun(id),
+    recipients: recipientsForRun(id),
+    // The explanation is attached here rather than in the view, because
+    // lib/errors.js is the one table that turns a Meta code into "what happened
+    // — what to do" and it lives on this side. A second copy in the browser
+    // would be a second thing to update when Meta adds a code.
+    skips: skippedForRun(id).map(s => ({ ...s, explanation: explainError(s.error_code) })),
   };
 }
 
