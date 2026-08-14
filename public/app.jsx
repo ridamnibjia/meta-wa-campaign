@@ -117,7 +117,7 @@ const NavLink = ({ r, on, unread }) => (
 );
 
 function Shell({ children }) {
-  const { ss, connected, dark, setDark, signOut } = useApp();
+  const { ss, account, connected, dark, setDark, signOut } = useApp();
   const [tab] = useRoute();
   const unread = ss.inboxUnread || 0;
 
@@ -125,12 +125,22 @@ function Shell({ children }) {
     <div className="flex min-h-full flex-col md:flex-row">
       <aside className="flex shrink-0 flex-col gap-1 border-b border-border bg-card p-3 md:h-screen md:w-56 md:border-b-0 md:border-r md:sticky md:top-0">
         <div className="mb-2 flex items-center gap-2 px-2 py-1">
-          <span className="grid h-7 w-7 place-items-center rounded-md bg-primary text-sm font-bold text-primary-foreground">W</span>
+          {/* The business name comes from Meta, not from a constant here: this
+              dashboard is self-hosted and the person running it should see whose
+              WhatsApp account it is pointed at. It falls back to the generic
+              name whenever credentials are missing or the fetch failed, because
+              an empty header would read as a broken page. */}
+          <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-primary text-sm font-bold text-primary-foreground">
+            {(account?.verifiedName || 'W').trim().charAt(0).toUpperCase()}
+          </span>
           <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-semibold leading-tight">WA Campaign</p>
-            <p className="flex items-center gap-1 text-[11px] text-muted-foreground">
-              <span className={cn('h-1.5 w-1.5 rounded-full', connected ? 'bg-success' : 'bg-destructive')} />
-              {connected ? 'Live' : 'Reconnecting'}
+            <p className="truncate text-sm font-semibold leading-tight"
+               title={account?.verifiedName ? `${account.verifiedName} — WhatsApp campaign` : 'WA Campaign'}>
+              {account?.verifiedName || 'WA Campaign'}
+            </p>
+            <p className="flex items-center gap-1 truncate text-[11px] text-muted-foreground">
+              <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', connected ? 'bg-success' : 'bg-destructive')} />
+              {account?.verifiedName ? 'WhatsApp campaign · ' : ''}{connected ? 'Live' : 'Reconnecting'}
             </p>
           </div>
         </div>

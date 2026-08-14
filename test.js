@@ -2280,6 +2280,71 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   });
 }
 
+// ── Progress cannot exceed the list ───────────────────────────────────────────
+// The dashboard read "74 of 57 processed, 130%". It was adding numbers that
+// come from two different tables: `accepted` counts message ROWS, `skipped`
+// counts queue CONTACTS, and a failure appears in both. currentIdx is the only
+// honest answer because it asks one table one question.
+console.log('\nstate — processed never exceeds the list');
+{
+  const { buildRun, recordRecipientSent, recordRecipientSkipped, applyStatus } = require('./server');
+
+  test('a webhook failure is not counted twice against the total', () => {
+    const run = startRun('progress-webhook-fail');
+    const people = Array.from({ length: 3 }, (_, i) => ({ name: `P${i}`, dialStr: `9198700${i}0001` }));
+    buildRun(run, people);
+
+    // All three accepted by the API, so all three have a wamid and a row.
+    people.forEach((p, i) => {
+      recordOutbound({ wamid: `pw-${i}`, waId: p.dialStr, name: p.name, body: 'x', runId: run });
+      recordRecipientSent(run, p.dialStr, `pw-${i}`);
+    });
+    // Meta then reports two of them as undeliverable.
+    applyStatus({ id: 'pw-0', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+    applyStatus({ id: 'pw-1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+
+    const s = buildState();
+    assert.equal(s.total, 3);
+    assert.ok(s.currentIdx <= s.total,
+      `processed (${s.currentIdx}) exceeded the list (${s.total}) — a contact was counted more than once`);
+    assert.equal(s.currentIdx, 3, 'three contacts were resolved, however their statuses later moved');
+    // The old formula, kept here as the thing that must never come back.
+    const oldWay = s.accepted + s.failed + s.skipped;
+    assert.ok(oldWay > s.total,
+      'accepted + failed + skipped is the double count this test exists to prevent regressing to');
+  });
+
+  test('an API refusal is not counted twice either', () => {
+    const run = startRun('progress-api-fail');
+    const people = Array.from({ length: 4 }, (_, i) => ({ name: `Q${i}`, dialStr: `9198700${i}0002` }));
+    buildRun(run, people);
+
+    recordOutbound({ wamid: 'qa-0', waId: people[0].dialStr, name: 'Q0', body: 'x', runId: run });
+    recordRecipientSent(run, people[0].dialStr, 'qa-0');
+    // The Graph API refused these outright: no wamid, no message row, but the
+    // queue records them so the skip report can say who was missed.
+    recordRecipientSkipped(run, people[1].dialStr, 'failed', 131049);
+    recordRecipientSkipped(run, people[2].dialStr, 'skipped', 131026);
+
+    const s = buildState();
+    assert.equal(s.total, 4);
+    assert.equal(s.currentIdx, 3, 'one sent plus two resolved failures — the fourth is still pending');
+    assert.ok(s.currentIdx <= s.total, 'and it can never run past the list');
+  });
+
+  test('processed equals the total exactly when a run finishes', () => {
+    const run = startRun('progress-complete');
+    const people = Array.from({ length: 2 }, (_, i) => ({ name: `R${i}`, dialStr: `9198700${i}0003` }));
+    buildRun(run, people);
+    recordOutbound({ wamid: 'rc-0', waId: people[0].dialStr, name: 'R0', body: 'x', runId: run });
+    recordRecipientSent(run, people[0].dialStr, 'rc-0');
+    recordRecipientSkipped(run, people[1].dialStr, 'skipped', 131026);
+
+    const s = buildState();
+    assert.equal(s.currentIdx, s.total, 'a finished run must read 100%, not 99% and not 130%');
+  });
+}
+
 // ── Storage management ────────────────────────────────────────────────────────
 // Two stores with two different owners, and the asymmetry between them is the
 // whole feature: our uploads can be deleted and renamed, a customer's KEPT file

@@ -11,7 +11,9 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 - **Survives restarts.** The send queue and cursor are written to disk, so a crash or deploy resumes where it stopped instead of re-sending.
 - **Warm-up ladder.** A brand-new number climbs `20 → 50 → 100 → 250 → 500 → 1000` per sending day, and holds its rung if quality drops to YELLOW or RED.
 - **One-tap opt-out.** A "Stop promotions" button on every template; taps arrive by webhook and disable that contact for campaigns — while leaving them replyable in the inbox.
-- **Two-way inbox.** Inbound replies are threaded, and you can reply free-form inside Meta's 24-hour customer-service window.
+- **Two-way inbox with attachments.** Inbound replies are threaded, and you can reply free-form — text or a file — inside Meta's 24-hour customer-service window. Files come from a reusable library, so one price list is uploaded once and sent to any number of contacts.
+- **Campaign history.** Every past campaign with its start and end, the message body *as it was sent*, and who was reached, delivered to, read by, or missed and why.
+- **Storage management.** One page showing what the disk holds, what it is filled with, and what can safely be removed — with a hard line between files you uploaded and customer files under a retention promise.
 - **Cost estimates** before you start and a running spend figure while you send, per Meta's per-message pricing.
 - **Password gate.** The whole API and the socket sit behind one password. Without `APP_PASSWORD` set, the app refuses to serve anything rather than opening up.
 - **Signed webhooks.** Every `POST /webhook` is verified against your Meta App Secret with HMAC-SHA256; unsigned calls get a 401.
@@ -306,14 +308,27 @@ A send that fails for a reason about the **moment** rather than about the
 Meta fault, or `131049` (the per-person marketing cap, which is counted across
 every business messaging that person and has nothing to do with your settings).
 
-Four attempts in all — the original, then one an hour later, one two hours after
-that, one four hours after that. The deadline is a column on the queue row
-(`run_recipients.retry_after`), not a timer in memory, so it survives a restart
-and the campaign resumes its own wait. While any contact is on the ladder the run
-is **not finished**: the phase is `waiting`, the contact still counts as pending
-and as billable, and starting another campaign or uploading a new list is refused
-until this one finishes or you stop it. Stopping leaves those contacts
-un-messaged and says so.
+Six attempts in all — the original, then five more three hours apart. Any rung
+that would land between 23:00 and 07:00 IST is deferred to 08:00, because a
+notification at 3am is what gets a business blocked and reported, and that feeds
+the quality rating which gates your messaging limit. The ladder is therefore 15
+hours of sending time spread over at most about a day.
+
+The deadline is a column on the queue row (`run_recipients.retry_after`), not a
+timer in memory, so it survives a restart and the campaign resumes its own wait.
+While any contact is on the ladder the run is **not finished**: the phase is
+`waiting` and every label reads *"In progress — retrying"*, the contact still
+counts as pending and as billable, and starting another campaign or uploading a
+new list is refused until this one finishes or you stop it. Stopping leaves those
+contacts un-messaged and says so.
+
+**This will not take 131049 to zero, and no retry schedule can.** The per-person
+marketing cap is a rolling window belonging to the recipient, counted across
+every business that messages them — waiting longer helps, but the cap may still
+be closed. The reliable way to reach a capped contact is the 24-hour service
+window: send one marketing template that invites a reply (a quick-reply button),
+and when they tap it, send the real content free-form from the inbox. Nothing
+sent inside that window is subject to the cap, or to template pricing.
 
 Before this, one DNS blip at contact #340 dropped that person from the run
 permanently, and the only way to reach them was re-uploading the CSV — which
@@ -326,6 +341,64 @@ across every conversation or inside the open one. Measured at 40ms over 200k
 rows, so there is no FTS index to drift out of step with the messages table.
 `%` and `_` are escaped, so searching `50%` finds the discount rather than
 everything.
+
+### Inbox attachments
+
+Inside the 24-hour window an operator can send an image, video or document as
+well as text. The 📎 button opens a picker with two halves: the **library** of
+everything uploaded so far, and a drop zone for a new file.
+
+Files are deduplicated on **content hash**, not filename — a renamed copy of last
+month's price list is the same file — so sending one document to fifty dealers is
+one upload, one Meta media id and fifty sends. Meta deletes uploaded media after
+30 days; the app refreshes the id at 29 and re-uploads transparently if a send
+comes back complaining, so a file from six months ago still sends.
+
+Uploads are checked the same way inbound files are: the declared type, the
+extension and the actual magic bytes all have to agree, and anything whose bytes
+identify it as a program is refused outright.
+
+### Campaign history
+
+Every campaign that has ever run, newest first, with when it started and when the
+last attempt was made, how many contacts it had, and how many were reached,
+delivered to, read by and failed. Opening one shows the **message body as that
+campaign sent it** — editing a template later does not rewrite history — plus the
+full recipient list and a per-contact reason for anyone not reached.
+
+Nothing here is stored as a summary. The counts are a `GROUP BY` over the
+messages table and the status is derived from what is left in the queue, so there
+is no number that can disagree with the rows underneath it.
+
+**About the read count:** WhatsApp only reports a message as read when the
+recipient has read receipts switched on, and many people turn them off. It
+undercounts, sometimes badly. The page says so next to the number. Delivered is
+the figure to trust.
+
+### Storage
+
+One page for the question "what is filling this disk, and what can I remove". It
+reports the whole volume — total, free, what this app uses, and what belongs to
+the OS — then breaks the app's share into four categories: the database, files
+you uploaded, customer files you saved, and customer files you only previewed.
+
+Two of those four can be removed, and the distinction is deliberate:
+
+| Category | Removable | Why |
+|---|---|---|
+| Files you uploaded | Yes, and renameable | Yours. Refused only while a template, campaign or sent message still points at it — and it says which. |
+| Customer files previewed only | Yes | Fetched to be looked at; nothing ever committed to keeping them. |
+| Customer files you **saved** | **No** | The app promised a retention window when you saved it. A promise you can cancel early is not a retention window. It goes on its own date, shown on the row. |
+| Database | No | It is the message history. |
+
+The one lever over saved files is **Run sweep now**, which removes only what is
+already past its window — it does not shorten anyone's window, it just means not
+waiting for the timer when the disk is filling.
+
+Renaming changes the display name only. The content hash and the bytes are
+untouched, so deduplication still works and every campaign that reported sending
+that file still reported the truth. Customer files cannot be renamed at all: the
+name is part of what they sent.
 
 ### Diagnostics
 

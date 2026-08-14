@@ -3,10 +3,21 @@
 function Dashboard() {
   const { ss, account, threads, logs, contacts } = useApp();
   const { phase, accepted, delivered, read, failed, skipped, total, dailyCount, dailyCap,
-          pricing = {}, warmup, retrying = 0, nextRetry, lastRun } = ss;
+          pricing = {}, warmup, retrying = 0, nextRetry, lastRun, currentIdx = 0 } = ss;
 
-  const done = accepted + failed + skipped;
-  const pct  = total > 0 ? Math.round((done / total) * 100) : 0;
+  // "Processed" is a count of CONTACTS resolved, and the only place that can
+  // answer it is the queue — which is what currentIdx (p.sent + p.skipped) is.
+  //
+  // It used to be `accepted + failed + skipped`, and that double-counted twice:
+  //   · `accepted` is count(*) of every outbound row for the run, so a message
+  //     that was accepted and later failed by webhook is in `accepted` AND in
+  //     the `failed` half of ss.failed;
+  //   · a send the API refused has no wamid but IS written to the queue as
+  //     skipped_reason='failed', so it lands in S.failed AND in `skipped`.
+  // On a 57-contact run with 17 such failures that read "74 of 57 processed,
+  // 130%". Numbers derived from two different tables cannot be added.
+  const done = Math.min(currentIdx, total);
+  const pct  = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const rate = n => (accepted > 0 ? Math.round((n / accepted) * 100) + '%' : '—');
   const cur  = pricing.currency || '₹';
   const unread = threads.reduce((n, t) => n + (t.unread || 0), 0);

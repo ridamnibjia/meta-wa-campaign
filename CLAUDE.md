@@ -102,6 +102,15 @@ it is not that number — delivered is. `STATUS_RANK` already counts a `read` th
 arrives with no preceding `delivered` as both, because Meta does not promise
 status order. Do not remove the caveat from the History view to tidy it up.
 
+**Never add a message count to a queue count.** `countsForRun` counts rows in
+`messages`; `progressForRun` counts contacts in `run_recipients`. The same
+failure appears in both — a webhook failure is inside `accepted` (which is
+`count(*)` of every outbound row) *and* inside `failed`; an API refusal is inside
+`S.failed` *and* inside `skipped`, because it is written to the queue as
+`skipped_reason = 'failed'`. The dashboard summed them and read "74 of 57
+processed, 130%". Anything meaning "contacts resolved" reads `currentIdx`
+(`p.sent + p.skipped`) — one table, one question.
+
 **`countsForRun(null)` returns zeroes.** `run_id IS NULL` is not "no campaign" —
 it is the bucket inbox replies and migrated legacy rows deliberately land in.
 Querying it for a null run reports every reply as campaign traffic.
