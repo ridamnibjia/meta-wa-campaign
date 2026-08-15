@@ -114,6 +114,138 @@ wamid, where a failure is terminal and a later `delivered` for it is a stale
 redelivery; this one is about one person across several attempts, where any
 attempt that landed is the answer.
 
+**The bucket rule is ONE SQL string, and the list is filtered on it.**
+`BUCKET_CASE` in `services/messages.js` is interpolated into both `funnelQ` (the
+counts) and `recipientsQ` (the contacts), and the half SQL cannot express —
+`gaveUp` splitting into `failed` vs `unreachable` by `skipDisposition` — is
+`bucketOf()`, which both call. So clicking "12 failed" in History filters on the
+identical rule that produced the 12. A second hand-written CASE, or the view
+re-deriving an outcome from `skipped_reason` and `status` the way `history.jsx`
+used to, is how a list quietly stops matching the number above it. The Funnel
+component asserts both invariants on screen: the buckets summing to `total`, and
+each opened list's length matching its own count. There is a test that groups
+`recipientsForRun` by bucket and compares it to `funnelForRun` field by field.
+
+**`S.failed` is gone — Failed comes from the queue only.** It was an in-memory
+integer the loop incremented, and `buildState` did `S.failed + c.failed`: a
+counter plus a count over `messages`, with the same contact inside both, because
+an API refusal is ALSO written to the queue as `skipped_reason = 'failed'`. The
+tile over-reported, and a restart zeroed the integer while the rows still
+remembered. `buildState().failed` is now `funnel.failed`, with `unreachable`
+beside it rather than folded in. That does mean the tile counts only contacts
+that have a `run_recipients` row: a failed *test send* is not a campaign contact
+and no longer appears there, which is correct. Do not add the counter back.
+
+**The app must not suggest re-sending marketing copy as UTILITY.** Both
+`errors.js` (131049) and the skip report used to. The category describes what the
+message IS — transactional content the customer is expecting — not which cap it
+avoids; promotional copy submitted under it is category misuse, which Meta
+re-categorises or rejects, and repeat offences cost the quality rating that gates
+the messaging tier. The retry ladder is the answer to 131049 and it is already
+running. Say that instead.
+
+**`funnelForRun` is the one set of numbers on screen that DOES add up.** Every
+row in `run_recipients` lands in exactly one bucket — `delivered`, `sent`,
+`pending`, `retrying`, `failed`, `unreachable`, `optedOut` — and they sum to
+`total`, which is the CSV. It exists because the stat tiles could not answer
+"what happened to my list": `failed` and `retrying` sat side by side with no way
+to tell whether one contained the other (it does not), and there was nowhere at
+all for the contacts nothing would even attempt. `read` is deliberately shown
+*inside* `delivered` rather than beside it, and is the only figure on the card
+that is a subset rather than a slice — counting it as its own bucket would make
+the rows miss `total` by exactly the number of people with read receipts on. The
+Dashboard and History both render it from `ui.jsx:Funnel`, and that component
+asserts the sum out loud rather than trusting it. `unreachable` gathers both
+halves of one fact: a contact attempted here who came back `131026`, and one an
+*earlier* run already switched off with `failed_hard` and so was never attempted.
+Which codes qualify is `skipDisposition`, never a second list.
+
+**Today's send count is a query, and a refused send hands its slot back.**
+`S.dailyCount` is gone. `warmup.js:dailyCount()` is `sentSince(startOfIstDay())`,
+a `GROUP BY wa_id` over `messages` that drops any contact whose every send today
+is `failed`. Meta accepts most sends with a 200 and refuses minutes or hours
+later over the status webhook — that is how 131049 and most quality blocks
+actually arrive — and the incremented counter had already spent that slot
+permanently: a day of 800 accepts with 200 refusals parked the loop overnight on
+600 real messages. Counted per CONTACT, not per row, because the retry ladder
+writes a second outbound row for the same person and Meta's own limit is on
+unique recipients per 24h. It filters `type = 'template'`: `services/inbox.js`
+writes free-form replies into the same table, those go out inside the 24-hour
+service window, are not marketing, and Meta does not count them against the
+messaging tier this cap exists to respect — answering a customer must not spend a
+campaign's allowance. `sendingDays()` filters the same way for the same reason.
+`/api/reset` deliberately does **not** zero the count: a Reset is an operator
+tidying their screen, not a claim that today's messages never went out.
+
+**The warm-up ladder ENDS, and graduation is asked of the RUNG, not the day
+count.** `graduated()` is `rawStep() >= WARMUP_PLAN.length && quality is not
+RED/YELLOW`, and `warmupCap()` then returns null. It was
+`W.days.length >= WARMUP_PLAN.length`, which was off by a whole rung:
+`markWarmupDay()` appends today after the FIRST send of the day, so on the top
+rung's own day the length reached the plan length one message in and the ceiling
+lifted for the rest of that day — the real ladder was 20 → 50 → 100 → 250 → 500
+→ uncapped, which is not the ladder the README documents. `rawStep()` is
+`warmupStep()` before the clamp, and it is unclamped precisely so the value past
+the last rung can distinguish "the top rung, today" from "the ladder is behind
+us"; clamping first made those two indistinguishable. There is a test for the top
+rung holding for its whole day. The ladder's job is to prove a
+new number sends steadily; once it has, Meta's messaging tier is the real limit
+and a homemade 1000 on top of it refuses campaigns the account is entitled to
+send, with nothing on screen saying which cap said no. It is re-checked every
+call, not persisted, so a quality slip puts the number back — falling quality is
+exactly when volume should come down. Nothing about it is per-account: every
+install still walks the full ladder from rung one, and there is no business's
+number written down anywhere in this repo. `S.config.dailyCap = 0` is the
+operator's own "no cap", and `effectiveCap()` returns null when neither applies —
+**null is no ceiling, not zero**, and every view must render it as such, because
+`num(null)` is `"0"` and reads as a cap that blocks every send. The config route
+uses an explicit presence check rather than `if (dailyCap)` for the same reason.
+
+**`warmup.json` is reconciled against the message rows at every boot.**
+`reconcileWarmupDays()` merges the distinct IST send-days in `messages` into
+`W.days`. That file is the smallest and most losable thing in a deployment — it
+is not in the database backup a self-hoster actually takes — and losing it put a
+number that had been sending for months back on rung one at 20 a day, with
+nothing explaining why every campaign suddenly stopped at 20. It merges rather
+than replaces (either source knowing about a day is evidence the day happened)
+and is idempotent. A day whose every send Meta refused is not a sending day: it
+is no evidence the number sends steadily, which is the only thing the ladder
+measures.
+
+**One place decides that a number is undeliverable.**
+`campaign.js:suppressIfPermanent()` is called by all three paths that can learn
+it — the send response, the delivery-failure webhook, and a test send — so none
+of them can grow its own idea of which codes mean "not on WhatsApp". It routes
+through `skipDisposition() === 'permanent'` and `disable(…, 'failed_hard')`,
+which writes both the `contacts` row and the `suppressed` row and is a no-op when
+the contact is already off for that reason, so webhook redeliveries and envelope
+replays cost nothing. The suppression outlives the contacts row, so re-uploading
+the CSV brings the person back already switched off.
+
+**Pause / Resume / Stop live in a sticky bar at the top of the Campaign screen,
+and are not repeated in step 3.** They used to exist only at the bottom of a
+column that grows a template composer, a preview and a skip report above them —
+a scroll away from the one control an operator wants in a hurry, and "I could not
+find Stop" is measured in messages sent. Two copies would be two things to keep
+in step; the bar renders only while a campaign is actually under way.
+
+**Every number on a screen comes from the funnel, and `countsForRun` renders
+nowhere.** The Dashboard tiles and the breakdown card under them used to be
+split — `accepted`/`delivered`/`read` from `countsForRun` (the `messages` table)
+beside `failed`/`unreachable` from `funnelForRun` (the queue) — so a tile could
+disagree with the row directly beneath it, and did. The everyday way in is a test
+send: `/api/test-send` stamps its message row with the current run *deliberately*,
+so the operator watches accepted → delivered → read in front of them, but it
+stages no `run_recipients` row. That moved the top three tiles and nothing else.
+`pricing.spent` had the same split against an estimate derived from the queue.
+Both now read the funnel. `buildState` still publishes `accepted`/`delivered`/
+`read` because "what has this number actually sent" is a real question and
+`countsForRun` is the only thing that answers it — but nothing renders them, and
+nothing new should. `Funnel`'s `live` prop is the same rule for wording: a parked
+retry row looks identical whether a loop is about to pick it up or the campaign
+was stopped an hour ago, so History passes `status === 'in-progress'` rather than
+letting the card guess.
+
 **Never add a message count to a queue count.** `countsForRun` counts contacts in
 `messages`; `progressForRun` counts contacts in `run_recipients`. The same
 failure appears in both — a webhook failure is inside `accepted` *and* inside
@@ -172,6 +304,17 @@ parked failures up when their deadline comes due. A run that already ended is
 restarted, gated on `S.phase === 'done'` — the one phase that means the loop ran
 out of work by itself. A Stop leaves `idle` and a Reset drops the run id, and a
 webhook must not resurrect a campaign the operator ended.
+
+**The ladder only reopens the CURRENT run.** `handleDeliveryFailure` returns
+`stale` when `runId !== S.currentRunId`, before it touches the queue. Only
+`S.currentRunId` has anything walking it: a campaign finishes, the operator
+uploads a new CSV — which opens a new run and makes it current — and then a late
+failure webhook arrives for the old one. Requeuing there un-stamped a wamid
+nothing would ever re-send, so the finished run flipped from `completed` to
+`incomplete`, the contact moved out of `delivered`/`sent` into `retrying`, and
+the breakdown card promised an attempt that had no loop to make it. The failure
+is still recorded on the message row by `applyStatus` — the send really did fail
+— which is the honest outcome for a run that is over.
 
 **Both webhook writes are guarded on something that changes.** The requeue is
 `WHERE run_id = ? AND phone = ? AND wamid = ?` and only fires on the transition
@@ -383,6 +526,31 @@ off for that reason, and the retry requeue is guarded on the `failed` transition
 Diagnostics replay button can exist. Do not add a non-idempotent write to
 `processEnvelope`.
 
+**The loop reads `S.currentRunId` once per contact, before the await.**
+`campaignLoop` captures `const runId = S.currentRunId` and every write about that
+send uses it. `/api/reset` nulls `S.currentRunId` synchronously and can land
+while the loop is inside `sendTemplate()`; re-reading it afterwards gave the
+queue stamp a null run — matching no row, leaving the contact pending — while the
+message row was filed under `run_id NULL`, the inbox-reply bucket
+`countsForRun(null)` exists to keep clean. One mis-filed template send and one
+contact who would be messaged twice on a resume.
+
+**An index that exists but is not chosen is worse than no index.** It costs a
+write on every insert and buys nothing, and both of this app's per-message
+queries regressed exactly that way. `nextPending` had a partial index carrying
+`WHERE wamid IS NULL AND skipped_reason IS NULL`; the retry ladder widened the
+query's WHERE into a disjunction that no longer *implies* that predicate, so
+SQLite silently stopped selecting it and fell back to the primary key plus a temp
+b-tree sort — a full scan of the run, once per message. `idx_run_recipients_seq`
+is plain `(run_id, seq)` for that reason, and the old partial index is dropped in
+`openDb`. `sentSince` (today's cap) grouped by `wa_id`, which made SQLite prefer
+`idx_messages_thread (wa_id, at)` — no way to seek on `at`, so it scanned the
+whole message history on every send, a cost that grows with age rather than with
+load. `idx_messages_cap` is covering, so the range seek answers it without
+touching the table. Both are asserted on the **query plan** in `test.js`, not on
+the schema: the schema test only proves the index exists, which is the half that
+was never in doubt.
+
 ## Gotchas
 
 - **`node:sqlite` binds anonymous `?` placeholders strictly by position.**
@@ -398,7 +566,15 @@ Diagnostics replay button can exist. Do not add a non-idempotent write to
   parameterised ones — `/inbox/search` before `/inbox/:waId`.
 - **`migrateJsonToSql` and `migrateOptOuts` rename their source files.** They run
   only under `require.main === module` in `server.js`. Never call them at require
-  time, or `npm test` renames the repo's own state files.
+  time, or `npm test` renames the repo's own state files. `reconcileWarmupDays`
+  is in the same block for the same reason — it *writes* `warmup.json`, so the
+  test that covers it snapshots and restores that file.
+- **`Number(x)` is a validator; `parseInt(x)` is not.** `/api/config` used to
+  coerce anything unparseable into a working setting, and both settings failed
+  towards MORE sending: `delaySec: "abc"` became `Math.max(1, NaN)` → `NaN` →
+  `sleep(NaN)` fires immediately, removing the pause between sends entirely, and
+  `dailyCap: "abc"` became `NaN || 0` → `0`, which is the operator's own "no
+  cap". Reject what does not parse rather than guess a value that spends money.
 - **Meta states one media `sha256` in two encodings.** The webhook envelope
   carries **base64** (`/ZYvm28…D6xw=`); `GET /{media-id}` carries **hex**
   (`fd962f9b…43eb1c`). Same 32 bytes. `sha256Hex()` in `services/media.js`

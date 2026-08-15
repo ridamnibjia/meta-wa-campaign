@@ -178,7 +178,7 @@ function App() {
     phase: 'idle', accepted: 0, delivered: 0, read: 0, failed: 0, skipped: 0,
     dailyCount: 0, dailyCap: 1000, total: 0, currentContact: null, pauseReason: null,
     configured: false, config: {}, pricing: { currency: '₹', rate: 0, estimate: 0, spent: 0, billable: 0, rates: {} },
-    inboxUnread: 0, warmup: null,
+    inboxUnread: 0, warmup: null, funnel: null,
   });
   const [connected, setConnected] = useState(false);
   const [account,  setAccount]  = useState(null);

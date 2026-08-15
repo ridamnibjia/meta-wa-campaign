@@ -1,7 +1,7 @@
 'use strict';
 const { db } = require('../lib/db');
 const { S, flags, campaignActive, log } = require('../state');
-const { explainError } = require('../lib/errors');
+const { explainError, skipDisposition } = require('../lib/errors');
 
 // An unknown ID means a message this server never sent — traffic from another
 // tool on the same number, or a status for a message from before the SQL store.
@@ -140,6 +140,66 @@ function countsForRun(runId) {
     failed:    r.failed    || 0,
   };
 }
+
+// ── What today's sending has actually cost the daily cap ───────────────────────
+// Derived, like every other counter in this file, and for a reason an operator
+// hit directly: Meta answers most sends with HTTP 200 and a wamid, then decides
+// minutes or hours later that it will not deliver — for the recipient's per-user
+// marketing cap, or on quality grounds — and says so over the status webhook.
+//
+// The incremented counter this replaces had already spent that slot and never
+// got it back. A day of 800 accepts with 200 later refused reported 800 against
+// the cap when only 600 messages existed, so the loop parked for the night with
+// a fifth of the day's allowance burnt on messages nobody received. Counting the
+// rows instead hands the slot back the instant the failure webhook lands, and
+// there is no second number to keep in step with the first.
+//
+// Counted per CONTACT, not per row, and for two reasons: the retry ladder writes
+// a second outbound row for the same person, and Meta's own messaging limit is
+// on unique users per day rather than on messages.
+//
+// A contact counts if ANY of their sends today is not `failed` — the same
+// "best outcome per person" rule runCounts uses above.
+//
+// `type = 'template'` matters: services/inbox.js writes free-form replies here
+// too, with type 'text' or a media kind. Those go out inside the 24-hour service
+// window, are not marketing, and Meta does not count them against the messaging
+// tier this cap exists to stay under — so answering a customer must not spend a
+// campaign's allowance. Campaign sends and test sends are the 'template' rows.
+const sentSinceQ = db.prepare(`
+  SELECT count(*) AS n FROM (
+      SELECT wa_id FROM messages
+       WHERE dir = 'out' AND type = 'template' AND at >= ?
+       GROUP BY wa_id
+      HAVING sum(CASE WHEN status = 'failed' THEN 0 ELSE 1 END) > 0
+  )
+`);
+
+const sentSince = at => sentSinceQ.get(at).n || 0;
+
+// Which IST days this number actually sent on, as 'YYYY-MM-DD'. The warm-up
+// ladder counts sending days, and it used to know about them only from
+// warmup.json — a file that did not exist before the ladder was written, is not
+// in the backup a self-hoster is most likely to take (the database is), and is
+// absent on a machine the deployment moved to. Losing it silently restarted a
+// mature number at twenty messages a day.
+//
+// SQLite's date() works on seconds, hence /1000; '+5 hours','+30 minutes' shifts
+// UTC to IST, which has no daylight saving so the constant is the whole zone.
+// Rows Meta refused are excluded on purpose: a day whose every send was refused
+// is not evidence the number sends steadily, which is the only thing the ladder
+// is measuring.
+// Templates only, for the same reason sentSince filters on them: a day spent
+// answering the inbox is not a day this number sent marketing traffic, and the
+// ladder is measuring the latter.
+const sendingDaysQ = db.prepare(`
+  SELECT DISTINCT date(at / 1000, 'unixepoch', '+5 hours', '+30 minutes') AS day
+    FROM messages
+   WHERE dir = 'out' AND type = 'template' AND (status IS NULL OR status <> 'failed')
+   ORDER BY day
+`);
+
+const sendingDays = () => sendingDaysQ.all().map(r => r.day);
 
 // ── The durability boundary ────────────────────────────────────────────────────
 // Meta's Cloud API is webhook-push only: there is no endpoint that returns past
@@ -329,6 +389,100 @@ const progressQ = db.prepare(`
     FROM run_recipients WHERE run_id = ?
 `);
 
+// ── Where every contact in the run actually ended up ───────────────────────────
+// progressForRun answers "how far along is this", which is a different question
+// to "what happened to my list". An operator reading `failed: 180` next to
+// `retrying: 40` cannot tell whether those forty are inside the hundred and
+// eighty or beside it, and the honest answer — beside — was nowhere on screen.
+//
+// Every recipient row lands in exactly ONE bucket here, and the buckets sum to
+// `total`. That is the whole contract: if a number is missing from the screen it
+// is missing from the sum, and the sum is the CSV. `read` is the one deliberate
+// exception — it is a subset of `delivered`, not a bucket beside it, because a
+// message that was read was also delivered.
+//
+// The join is on the wamid the queue row currently CARRIES. A contact the
+// webhook ladder put back has no wamid, so they read as retrying rather than as
+// the send Meta already refused — which is the correct answer while another
+// attempt is still owed to them.
+// ONE copy of the rule, interpolated into both the count query and the list
+// query below. The count on the card and the names behind it have to be the same
+// answer to the same question — an operator who clicks "12 failed" and is shown
+// eleven contacts has been told the app is lying, and cannot tell which half.
+// A second hand-written CASE is exactly how those two drift apart.
+const BUCKET_CASE = `CASE
+    -- Never attempted: switched off before the queue was built. Split by WHY,
+    -- because "asked us to stop" and "Meta says this number cannot receive
+    -- messages" are the same skip to the loop and completely different facts to
+    -- the person reading the report.
+    WHEN r.skipped_reason = 'disabled' AND c.disabled_reason = 'failed_hard' THEN 'unreachable'
+    WHEN r.skipped_reason = 'disabled'                                       THEN 'optedOut'
+    WHEN r.skipped_reason = 'retry'                                          THEN 'retrying'
+    -- Attempted and given up on: the send-time ladder exhausted, or a code that
+    -- was never retryable. Which of the two buckets it belongs to is the error
+    -- code's business — bucketOf() below, never a code list repeated in SQL.
+    WHEN r.skipped_reason IS NOT NULL                                        THEN 'gaveUp'
+    WHEN r.wamid IS NULL                                                     THEN 'pending'
+    WHEN m.status = 'failed'                                                 THEN 'gaveUp'
+    WHEN m.status = 'read'                                                   THEN 'read'
+    WHEN m.status = 'delivered'                                              THEN 'delivered'
+    ELSE 'sent'
+  END`;
+
+const BUCKET_FROM = `
+    FROM run_recipients r
+    LEFT JOIN messages m ON m.wamid = r.wamid
+    LEFT JOIN contacts c ON c.phone = r.phone
+   WHERE r.run_id = ?`;
+
+const funnelQ = db.prepare(`
+  SELECT ${BUCKET_CASE}                         AS bucket,
+         COALESCE(r.error_code, m.error_code)   AS code,
+         count(*)                               AS n
+  ${BUCKET_FROM}
+   GROUP BY bucket, code
+`);
+
+// The half of the rule SQL cannot express, because it is a policy call in
+// lib/errors.js rather than a value in a column. Both the aggregate and the
+// per-contact list run their raw bucket through this, so neither can decide a
+// 131026 differently from the other.
+//
+// 'read' resolves to 'delivered' here: a message that was read was also
+// delivered, so it belongs in that bucket for the purpose of "which list is this
+// contact in". The read COUNT is kept separately by funnelForRun.
+function bucketOf(raw, code) {
+  if (raw === 'read')   return 'delivered';
+  if (raw !== 'gaveUp') return raw;
+  return skipDisposition(code) === 'permanent' ? 'unreachable' : 'failed';
+}
+
+const ZERO_FUNNEL = {
+  total: 0, delivered: 0, read: 0, sent: 0, pending: 0,
+  retrying: 0, failed: 0, unreachable: 0, optedOut: 0,
+};
+
+// `unreachable` is the one an operator asked for by name: contacts nothing will
+// ever try again, because Meta reports the number as undeliverable — usually
+// "not on WhatsApp". It gathers both halves of that fact: someone disabled by an
+// EARLIER run's hard failure and never attempted here, and someone attempted
+// here who came back 131026. Which codes count is lib/errors.js:skipDisposition,
+// not a list kept twice.
+function funnelForRun(runId) {
+  const f = { ...ZERO_FUNNEL };
+  if (runId == null) return f;
+  for (const r of funnelQ.all(runId)) {
+    const n = r.n || 0;
+    f.total += n;
+    // Counted twice on purpose, and only here: read ⊂ delivered, so folding it
+    // into the sum as its own bucket would make the buckets miss `total` by
+    // exactly the number of people who have read receipts switched on.
+    if (r.bucket === 'read') f.read += n;
+    f[bucketOf(r.bucket, r.code)] += n;
+  }
+  return f;
+}
+
 // What this run will actually cost, asked against the CURRENT enabled flags
 // rather than against the snapshot taken when the queue was staged. Disabling
 // someone mid-run stops them being messaged — the loop re-checks — but without
@@ -365,12 +519,19 @@ const skippedQ = db.prepare(`
 // "sent" — and went on saying it about a contact Meta had since refused to
 // deliver to. The join is on the wamid the row currently carries, so a contact
 // waiting on the ladder (wamid NULL) matches nothing and reads as retrying.
+// `bucket` and `code` come back with every row, from the same CASE the counts
+// are made of — so "show me the 12 that failed" filters on the identical rule
+// rather than on the view's own re-reading of skipped_reason and status. The old
+// version left that re-reading to history.jsx, which is how a list can quietly
+// stop matching the number above it.
 const recipientsQ = db.prepare(
   `SELECT r.phone, r.name, r.seq, r.wamid, r.skipped_reason, r.error_code,
-          r.attempts, r.retry_after, m.status
-     FROM run_recipients r
-     LEFT JOIN messages m ON m.wamid = r.wamid
-    WHERE r.run_id = ? ORDER BY r.seq`);
+          r.attempts, r.retry_after, r.attempted_at, m.status,
+          m.at AS sent_at, m.status_at,
+          ${BUCKET_CASE} AS raw_bucket,
+          COALESCE(r.error_code, m.error_code) AS code,
+          c.disabled_reason
+   ${BUCKET_FROM} ORDER BY r.seq`);
 
 // Building a run twice for the same id replaces it: /upload-csv opens a fresh
 // run for every upload, so this only ever fires if a caller reuses one.
@@ -444,7 +605,31 @@ function progressForRun(runId) {
 
 const billableForRun  = runId => (runId == null ? 0 : billableQ.get(runId).n || 0);
 const skippedForRun   = runId => (runId == null ? [] : skippedQ.all(runId));
-const recipientsForRun = runId => (runId == null ? [] : recipientsQ.all(runId));
+
+// Every contact in the run with the bucket the funnel counted them in, plus the
+// sentence explaining what happened. Composed here rather than in the browser
+// for the same reason the skip report's is: the log, the API and the screen must
+// not tell three versions of one story.
+//
+// `read` is folded into `delivered` by bucketOf, so `wasRead` carries the
+// distinction the list still wants to show.
+function recipientsForRun(runId) {
+  if (runId == null) return [];
+  return recipientsQ.all(runId).map(r => ({
+    phone: r.phone, name: r.name, seq: r.seq, wamid: r.wamid,
+    skipped_reason: r.skipped_reason, error_code: r.error_code,
+    attempts: r.attempts, retry_after: r.retry_after, status: r.status,
+    bucket:      bucketOf(r.raw_bucket, r.code),
+    wasRead:     r.raw_bucket === 'read',
+    code:        r.code,
+    // Why this contact is in this bucket, in one sentence. Meta's own code is
+    // shown beside it rather than instead of it — an operator who has to look a
+    // bare number up in Meta's reference has not been told anything.
+    explanation: explainError(r.code),
+    disabledReason: r.disabled_reason,
+    at: r.status_at || r.sent_at || r.attempted_at || null,
+  }));
+}
 
 // ── The last campaign ──────────────────────────────────────────────────────────
 // Read from campaign_runs rather than from S.currentRunId, so it still answers
@@ -460,7 +645,8 @@ function lastRunSummary() {
   const progress = progressForRun(r.id);
   return {
     id: r.id, label: r.label, startedAt: r.started_at, language: r.template_lang,
-    progress, counts: countsForRun(r.id), nextRetry: nextRetryForRun(r.id),
+    progress, counts: countsForRun(r.id), funnel: funnelForRun(r.id),
+    nextRetry: nextRetryForRun(r.id),
     // "Unfinished" is a property of the queue, not of S.phase: a run with rows
     // still pending is unfinished even if the process died and forgot it.
     unfinished: progress.pending > 0,
@@ -515,7 +701,9 @@ function listRuns({ limit = 100 } = {}) {
       return {
         id: r.id, label: r.label, startedAt: r.started_at, endedAt: r.ended_at,
         status: statusForRun(r.id, progress.pending),
-        counts: countsForRun(r.id), progress,
+        // The list line and the campaign it opens must not report different
+        // numbers for one run, so both read the funnel.
+        counts: countsForRun(r.id), progress, funnel: funnelForRun(r.id),
       };
     });
 }
@@ -535,7 +723,7 @@ function runDetail(runId) {
     startedAt: r.started_at, endedAt: r.ended_at,
     status: statusForRun(id, progress.pending),
     language: r.template_lang, body: r.template_body, headerAsset: r.header_asset,
-    counts: countsForRun(id), progress,
+    counts: countsForRun(id), progress, funnel: funnelForRun(id),
     billable: billableForRun(id), nextRetry: nextRetryForRun(id),
     recipients: recipientsForRun(id),
     // The explanation is attached here rather than in the view, because
@@ -552,6 +740,6 @@ module.exports = {
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
   recordRecipientRetry, requeueFailedRecipient, recipientFor,
-  nextRetryForRun, lastRunSummary,
-  progressForRun, skippedForRun, recipientsForRun, billableForRun,
+  nextRetryForRun, lastRunSummary, sentSince, sendingDays,
+  progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
 };

@@ -5,7 +5,7 @@ const { S, log } = require('../state');
 const { buildState, broadcast } = require('../services/status');
 const { fetchAccountInfo } = require('../services/graph');
 const { CONTACT_FIELDS } = require('../services/campaign');
-const { W, saveWarmup, warmupCap, warmupStep } = require('../services/warmup');
+const { W, saveWarmup, warmupCap, warmupStep, graduated } = require('../services/warmup');
 const { missingParams } = require('../services/campaign');
 const diagnostics = require('../services/diagnostics');
 const { replayUnprocessed } = require('../services/ingest');
@@ -21,8 +21,36 @@ router.post('/config', (req, res) => {
   if (templateName)     { CFG.templateName     = templateName;     S.config.templateName     = templateName; }
   if (templateLanguage) { CFG.templateLanguage = templateLanguage; S.config.templateLanguage = templateLanguage; }
   if (templateCategory) { CFG.templateCategory = templateCategory; S.config.templateCategory = templateCategory; }
-  if (delaySec)         S.config.delaySec = Math.max(1, parseInt(delaySec));
-  if (dailyCap)         S.config.dailyCap = Math.max(1, parseInt(dailyCap));
+  // parseInt is not a validator. Both of these used to coerce anything
+  // unparseable into a working setting, and both failed towards MORE sending:
+  //   · delaySec "abc" → Math.max(1, NaN) → NaN → sleep(NaN) fires immediately,
+  //     so a typo removed the delay between sends entirely;
+  //   · dailyCap "abc" → NaN || 0 → 0, and 0 is the operator's own "no cap",
+  //     so a typo silently uncapped the account.
+  // A number that does not parse is a mistake, and the honest answer to a
+  // mistake is to refuse it rather than to guess a value that spends money.
+  const asInt = v => {
+    const n = Number(String(v).trim());
+    return Number.isInteger(n) ? n : null;
+  };
+
+  if (delaySec !== undefined && delaySec !== null && String(delaySec).trim() !== '') {
+    const n = asInt(delaySec);
+    if (n === null || n < 1) {
+      return res.json({ ok: false, error: 'Delay between sends must be a whole number of seconds, 1 or more.' });
+    }
+    S.config.delaySec = n;
+  }
+  // 0 is a legitimate value and means "no cap of mine" — the warm-up ladder and
+  // Meta's own messaging tier are then the only ceilings. `if (dailyCap)` could
+  // not express it, so an operator who typed 0 silently kept their old cap.
+  if (dailyCap !== undefined && dailyCap !== null && String(dailyCap).trim() !== '') {
+    const n = asInt(dailyCap);
+    if (n === null || n < 0) {
+      return res.json({ ok: false, error: 'Daily cap must be a whole number. Use 0 for no cap of your own.' });
+    }
+    S.config.dailyCap = n;
+  }
 
   // Checked with `in` rather than truthiness so null can clear it. The
   // template's own approval example is restored on the next adoptTemplate, so
@@ -76,7 +104,8 @@ router.get('/account-info', async (req, res) => {
 router.post('/warmup', (req, res) => {
   if (typeof req.body.enabled === 'boolean') { W.enabled = req.body.enabled; saveWarmup(); }
   broadcast();
-  res.json({ ok: true, enabled: W.enabled, cap: warmupCap(), step: warmupStep(), daysSent: W.days.length });
+  res.json({ ok: true, enabled: W.enabled, cap: warmupCap(), step: warmupStep(),
+             daysSent: W.days.length, graduated: graduated() });
 });
 
 // ── Diagnostics ────────────────────────────────────────────────────────────────

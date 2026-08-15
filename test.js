@@ -26,7 +26,8 @@ const assert = require('node:assert/strict');
 const {
   slugify, templateVars, sanitizeParam, validateTemplateInput,
   buildTemplatePayload, renderBody, normalizePhone, parseCSV, buildParams, verifySignature, explainError, tierToCap, META_ERRORS, S,
-  warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W,
+  warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W, graduated, dailyCount,
+  sentSince, funnelForRun, startOfIstDay, nextIstMidnight, suppressIfPermanent,
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
@@ -35,7 +36,7 @@ const {
   PRICES,
   nodeVersionOk, openDb, SCHEMA,
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
-  startRun, recordOutbound,
+  startRun, recordOutbound, buildRun, recordRecipientSent,
   buildState, app,
   migrateJsonToSql, db,
   MEDIA_KINDS, kindFor, saveUpload, listAssets, getAsset, assetPath, deleteAsset,
@@ -452,9 +453,49 @@ console.log('\nwarm-up ladder');
   });
   test('a fresh day climbs one rung', () => { setup(['2026-01-01']); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
   test('climbs one rung per sending day', () => { setup(['a', 'b', 'c']); assert.equal(warmupCap(), WARMUP_PLAN[3]); });
-  test('never climbs past the top rung', () => {
-    setup(new Array(50).fill(0).map((_, i) => 'd' + i));
+  test('the last rung is still the last rung on its own day', () => {
+    setup(new Array(WARMUP_PLAN.length - 1).fill(0).map((_, i) => 'd' + i));
     assert.equal(warmupCap(), WARMUP_PLAN[WARMUP_PLAN.length - 1]);
+  });
+  // The regression this exists for: graduation used to be
+  // `W.days.length >= WARMUP_PLAN.length`, and markWarmupDay() appends today
+  // after the FIRST send of the day — so on the top rung's own day the length
+  // reached the plan length one message in and the ceiling lifted for the rest
+  // of that day. The top rung was applied to exactly one message and the real
+  // ladder was 20 → 50 → 100 → 250 → 500 → uncapped, which is not the ladder
+  // the README documents.
+  test('the last rung holds for its whole day, not just its first message', () => {
+    const earlier = new Array(WARMUP_PLAN.length - 1).fill(0).map((_, i) => 'd' + i);
+    setup([...earlier, todayKey()]);        // markWarmupDay has just run
+    assert.equal(graduated(), false, 'the top rung has not had its day yet — it is having it');
+    assert.equal(warmupCap(), WARMUP_PLAN[WARMUP_PLAN.length - 1],
+      'a ceiling that lifts one message into its own day was never a ceiling');
+  });
+  test('the day after the last rung is off the ladder', () => {
+    setup(new Array(WARMUP_PLAN.length).fill(0).map((_, i) => 'd' + i));
+    assert.equal(graduated(), true, 'every rung has now HAD its sending day');
+    assert.equal(warmupCap(), null);
+  });
+  // The ladder is a warm-UP, not a permanent ceiling: once every rung has had a
+  // sending day the number has proved itself and Meta's own messaging tier is
+  // the real limit. Leaving a homemade 1000 on top of it refuses campaigns the
+  // account is entitled to send, with nothing on screen saying which cap said no.
+  test('graduates once every rung has had a sending day', () => {
+    setup(new Array(50).fill(0).map((_, i) => 'd' + i));
+    assert.equal(graduated(), true);
+    assert.equal(warmupCap(), null, 'a finished ladder is no ceiling at all');
+  });
+  test('a quality slip puts a graduated number back on the ladder', () => {
+    setup(new Array(50).fill(0).map((_, i) => 'd' + i), 'YELLOW');
+    assert.equal(graduated(), false, 'falling quality is exactly when volume should come down');
+    assert.equal(warmupCap(), WARMUP_PLAN[WARMUP_PLAN.length - 1]);
+  });
+  test('an unknown quality rating does not hold a finished ladder back', () => {
+    // Credentials missing or the Graph call failed. Refusing to graduate on a
+    // rating nobody could read would cap a mature number forever on a network
+    // blip; only an actual RED or YELLOW is evidence to slow down.
+    setup(new Array(50).fill(0).map((_, i) => 'd' + i), null);
+    assert.equal(graduated(), true);
   });
   test('holds a rung back while quality is RED', () => { setup(['a', 'b'], 'RED'); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
   test('holds a rung back while quality is YELLOW', () => { setup(['a', 'b'], 'YELLOW'); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
@@ -473,9 +514,354 @@ console.log('\nwarm-up ladder');
     setup([]); W.enabled = false; S.config.dailyCap = 750;
     assert.equal(effectiveCap(), 750);
   });
+  // 0 is the operator saying "no cap of mine". It is a value, not a missing
+  // one — `if (dailyCap)` in the config route could not express it, so typing 0
+  // used to leave the old cap in place with no sign that it had been ignored.
+  test('a dailyCap of 0 means no cap of your own', () => {
+    setup([]); W.enabled = false; S.config.dailyCap = 0;
+    assert.equal(effectiveCap(), null, 'null is no ceiling; 0 would read as "send nothing"');
+  });
+  test('the warm-up ceiling still applies when you have set no cap of your own', () => {
+    setup([]); S.config.dailyCap = 0;
+    assert.equal(effectiveCap(), WARMUP_PLAN[0], 'a new number does not skip the ladder by clearing its cap');
+  });
+  test('a finished ladder plus no cap of your own is no cap at all', () => {
+    setup(new Array(50).fill(0).map((_, i) => 'd' + i)); S.config.dailyCap = 0;
+    assert.equal(effectiveCap(), null);
+  });
 
   Object.assign(W, { days: restore.days, enabled: restore.enabled });
   S.quality = restore.quality; S.config.dailyCap = restore.cap;
+}
+
+// warmup.json is the smallest and most losable file in a deployment — it is not
+// in the database backup a self-hoster actually takes — and losing it put a
+// number that had been sending for months back on rung one at 20 a day, with
+// nothing on screen explaining why every campaign suddenly stopped at 20. This
+// runs at every boot and can change today's ceiling, and had no test at all.
+console.log('\nwarm-up reconciliation against the message rows');
+{
+  const { reconcileWarmupDays, sendingDays } = require('./server');
+  const { FILES } = require('./src/config');
+  const fsw = require('node:fs');
+  const restore = [...W.days];
+  // reconcileWarmupDays writes warmup.json on a change, and that file is the
+  // REPO's — the same hazard CLAUDE.md flags for the migrations. Snapshot it and
+  // put it back, so a test run cannot alter the ladder on a developer's machine.
+  const had  = fsw.existsSync(FILES.warmup);
+  const prev = had ? fsw.readFileSync(FILES.warmup) : null;
+
+  const istDay = (d, h = 12) => Date.parse(`${d}T${String(h).padStart(2, '0')}:00:00+05:30`);
+  const seed = (wamid, day, { status = 'delivered', type = 'template' } = {}) =>
+    db.prepare("INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status) "
+      + "VALUES (?, '919000009999', 'out', ?, 'x', ?, ?)").run(wamid, type, istDay(day), status);
+
+  test('a day is a sending day in IST, not in the server\'s own zone', () => {
+    // 23:00 UTC on the 9th is 04:30 IST on the 10th. A server outside India
+    // would otherwise credit the ladder for the wrong day.
+    db.prepare("INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status) "
+      + "VALUES ('rec-tz', '919000009999', 'out', 'template', 'x', ?, 'delivered')")
+      .run(Date.parse('2026-04-09T23:00:00Z'));
+    assert.ok(sendingDays().includes('2026-04-10'), 'the IST date is the one the ladder counts');
+  });
+
+  test('a day whose every send Meta refused is not a sending day', () => {
+    seed('rec-fail', '2026-04-11', { status: 'failed' });
+    assert.equal(sendingDays().includes('2026-04-11'), false,
+      'no evidence this number sends steadily, which is the only thing the ladder measures');
+    seed('rec-mixed', '2026-04-11', { status: 'delivered' });
+    assert.ok(sendingDays().includes('2026-04-11'), 'one send that landed is enough');
+  });
+
+  test('a day spent answering the inbox is not a sending day', () => {
+    seed('rec-text', '2026-04-12', { type: 'text' });
+    assert.equal(sendingDays().includes('2026-04-12'), false,
+      'free-form replies go out inside the service window and are not the traffic being warmed up');
+  });
+
+  test('a lost warmup.json is rebuilt from the message rows', () => {
+    W.days = [];
+    const r = reconcileWarmupDays();
+    assert.ok(r.added > 0, 'the ladder must not restart at rung one because a small file went missing');
+    assert.deepEqual(W.days, sendingDays(), 'and it recovers exactly the days that were actually sent on');
+  });
+
+  test('it merges rather than replaces, and running it twice writes nothing', () => {
+    W.days = ['2019-01-01', ...sendingDays()];   // a day only the file knows about
+    const again = reconcileWarmupDays();
+    assert.equal(again.added, 0, 'idempotent — it runs at every boot');
+    assert.ok(W.days.includes('2019-01-01'),
+      'either source knowing about a day is evidence the day happened; rows can age out');
+  });
+
+  W.days = restore;
+  if (had) fsw.writeFileSync(FILES.warmup, prev); else fsw.rmSync(FILES.warmup, { force: true });
+}
+
+console.log('\nIST day arithmetic');
+{
+  const { IST_OFFSET_MS } = require('./server');
+  // 2026-03-15T18:30:00Z is exactly midnight IST on the 16th.
+  const midnightIst = Date.parse('2026-03-15T18:30:00Z');
+
+  test('midnight IST is the start of that IST day', () =>
+    assert.equal(startOfIstDay(midnightIst), midnightIst));
+  test('an instant late in the IST day still maps back to its own midnight', () =>
+    assert.equal(startOfIstDay(midnightIst + 23 * 3600000), midnightIst));
+  test('one millisecond earlier belongs to the previous IST day', () =>
+    assert.equal(startOfIstDay(midnightIst - 1), midnightIst - 86400000));
+  // The server may run anywhere. If this used the host's own zone, the daily
+  // counter would roll over at the wrong hour on every deploy outside India.
+  test('the answer does not depend on the host time zone', () => {
+    const asIst = new Date(startOfIstDay(midnightIst + 3600000) + IST_OFFSET_MS);
+    assert.equal(asIst.getUTCHours(), 0);
+    assert.equal(asIst.getUTCMinutes(), 0);
+  });
+  test('the next midnight is a day ahead, with slack so the loop cannot re-park', () => {
+    const next = nextIstMidnight(midnightIst + 3600000);
+    assert.equal(next, midnightIst + 86400000 + 120000);
+    assert.ok(next > startOfIstDay(next) - 1, 'it must land inside the new day, never on the boundary');
+  });
+}
+
+console.log("\ntoday's send count — refused sends give the slot back");
+{
+  const { startRun: openRun, recordOutbound: out } = require('./server');
+  // A window of its own, well clear of every other test's rows. The suite shares
+  // one in-memory database and writes outbound messages throughout, so a window
+  // anchored on Date.now() would count whatever the previous block just sent.
+  const BASE  = Date.parse('2030-06-01T00:00:00Z');
+  const since = BASE - 1;
+  const run   = openRun('daily-count');
+
+  test('an accepted send counts', () => {
+    out({ wamid: 'day-1', waId: '919600000001', name: 'One', body: 'x', at: BASE, runId: run });
+    assert.equal(sentSince(since), 1);
+  });
+  test('a delivered send still counts', () => {
+    applyStatus({ id: 'day-1', status: 'delivered' });
+    assert.equal(sentSince(since), 1);
+  });
+  // The whole point. Meta answers the send with a 200 and a wamid, then refuses
+  // to deliver hours later over the status webhook — for the recipient's
+  // per-user marketing cap, or on quality grounds. The counter this replaces had
+  // already spent that slot and never gave it back, so a day of 800 accepts with
+  // 200 refusals parked the loop for the night on 600 real messages.
+  test('a send Meta later refuses stops counting against the cap', () => {
+    out({ wamid: 'day-2', waId: '919600000002', name: 'Two', body: 'x', at: BASE, runId: run });
+    assert.equal(sentSince(since), 2);
+    applyStatus({ id: 'day-2', status: 'failed', errors: [{ code: 131049, title: 'refused' }] });
+    assert.equal(sentSince(since), 1, 'the refused send must hand its slot back');
+  });
+  // Counted per person, not per row: the retry ladder writes a second outbound
+  // row for the same contact, and Meta's own limit is on unique users per day.
+  test('a contact reached on the second attempt costs one slot, not two', () => {
+    out({ wamid: 'day-3a', waId: '919600000003', name: 'Three', body: 'x', at: BASE, runId: run });
+    applyStatus({ id: 'day-3a', status: 'failed', errors: [{ code: 131049, title: 'refused' }] });
+    out({ wamid: 'day-3b', waId: '919600000003', name: 'Three', body: 'x', at: BASE, runId: run });
+    assert.equal(sentSince(since), 2, 'One plus Three, each once');
+  });
+  test('yesterday does not count against today', () => {
+    assert.equal(sentSince(BASE + 86400000), 0);
+  });
+  // Answering a customer inside the 24-hour service window is not marketing, and
+  // Meta does not count it against the messaging tier this cap exists to respect.
+  // Spending a campaign's allowance on a reply would be the app inventing a limit.
+  test('a free-form inbox reply does not spend the campaign allowance', () => {
+    out({ wamid: 'day-reply', waId: '919600000004', name: 'Four', type: 'text',
+          body: 'sure, here you go', at: BASE, runId: null });
+    assert.equal(sentSince(since), 2, 'still One and Three');
+  });
+  test('the live daily count is the same query, asked about the IST day', () => {
+    assert.equal(dailyCount(), sentSince(startOfIstDay()));
+  });
+
+  // The ladder counts sending days and warmup.json is the smallest, most losable
+  // file in a deployment. The message rows know the same fact.
+  test('sending days are read back from the message rows in IST', () => {
+    const days = require('./server').sendingDays();
+    assert.ok(days.includes('2030-06-01'),
+      'a send at midnight UTC on 1 June is 05:30 IST the same day');
+    assert.deepEqual(days, [...days].sort(), 'returned in order');
+    assert.equal(new Set(days).size, days.length, 'one entry per day');
+  });
+  test('a day whose only send Meta refused is not a sending day', () => {
+    const { recordOutbound: o } = require('./server');
+    const lonely = Date.parse('2031-02-02T06:00:00Z');
+    o({ wamid: 'lonely-1', waId: '919600000009', name: 'Lone', body: 'x', at: lonely, runId: run });
+    assert.ok(require('./server').sendingDays().includes('2031-02-02'));
+    applyStatus({ id: 'lonely-1', status: 'failed', errors: [{ code: 131049, title: 'refused' }] });
+    assert.equal(require('./server').sendingDays().includes('2031-02-02'), false,
+      'a day on which nothing was actually delivered is no evidence the number sends steadily');
+  });
+}
+
+console.log('\nthe funnel — every contact in exactly one bucket');
+{
+  const M = require('./server');
+  const { buildRun, recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
+          recordOutbound: out, startRun: openRun } = M;
+
+  // Sums to `total` by construction, which is the contract the dashboard renders.
+  // `read` is the one deliberate exception: it is a subset of delivered, so it is
+  // left out of the sum rather than counted beside it.
+  const sums = f => f.delivered + f.sent + f.pending + f.retrying
+                  + f.failed + f.unreachable + f.optedOut;
+
+  let seq = 0;
+  const who = n => Array.from({ length: n },
+    () => ({ name: `F${seq}`, dialStr: `919500${String(++seq).padStart(6, '0')}` }));
+
+  test('an empty run is all zeroes and no run at all is too', () => {
+    assert.deepEqual(funnelForRun(null), funnelForRun(openRun('funnel-empty')));
+  });
+
+  test('every outcome lands in its own bucket and the buckets sum to the CSV', () => {
+    const run = openRun('funnel-full');
+    const p = who(8);
+    // Someone an earlier run already found undeliverable: never attempted here,
+    // and the reason is the one the operator asked to see broken out.
+    M.contacts.disable(p[7].dialStr, 'failed_hard', p[7].name);
+    buildRun(run, p, phone => (M.contacts.isDisabled(phone) ? 'disabled' : null));
+
+    // read
+    recordRecipientSent(run, p[0].dialStr, 'fn-0');
+    out({ wamid: 'fn-0', waId: p[0].dialStr, name: p[0].name, body: 'x', runId: run });
+    applyStatus({ id: 'fn-0', status: 'read' });
+    // delivered
+    recordRecipientSent(run, p[1].dialStr, 'fn-1');
+    out({ wamid: 'fn-1', waId: p[1].dialStr, name: p[1].name, body: 'x', runId: run });
+    applyStatus({ id: 'fn-1', status: 'delivered' });
+    // accepted, no status back yet
+    recordRecipientSent(run, p[2].dialStr, 'fn-2');
+    out({ wamid: 'fn-2', waId: p[2].dialStr, name: p[2].name, body: 'x', runId: run });
+    // on the retry ladder
+    recordRecipientRetry(run, p[3].dialStr, 131049, Date.now() + 3600000);
+    // attempted, given up on, and it was about the moment rather than the number
+    recordRecipientSkipped(run, p[4].dialStr, 'failed', 131000);
+    // attempted, and Meta says the number itself cannot receive messages
+    recordRecipientSkipped(run, p[5].dialStr, 'skipped', 131026);
+    // p[6] untouched — still pending
+    // p[7] disabled before the run, reason failed_hard
+
+    const f = funnelForRun(run);
+    assert.equal(f.total, 8);
+    assert.equal(f.read, 1);
+    assert.equal(f.delivered, 2, 'a read message was also delivered');
+    assert.equal(f.sent, 1);
+    assert.equal(f.retrying, 1);
+    assert.equal(f.pending, 1);
+    assert.equal(f.failed, 1);
+    assert.equal(f.unreachable, 2, 'the 131026 and the contact an earlier run switched off');
+    assert.equal(f.optedOut, 0);
+    assert.equal(sums(f), f.total,
+      'the buckets must account for every contact in the CSV — a number missing here is a number the operator cannot see');
+  });
+
+  // The invariant the drill-down rests on. Clicking "12 failed" filters the
+  // recipient list on `bucket`, so if the list and the count were built from two
+  // readings of the rules an operator would be shown eleven names under a
+  // heading that says twelve — and would have no way to tell which was wrong.
+  test('the per-contact list groups exactly as the counts count', () => {
+    const run = openRun('funnel-agrees');
+    const p = who(7);
+    M.contacts.disable(p[6].dialStr, 'failed_hard', p[6].name);
+    buildRun(run, p, phone => (M.contacts.isDisabled(phone) ? 'disabled' : null));
+    recordRecipientSent(run, p[0].dialStr, 'ag-0');
+    out({ wamid: 'ag-0', waId: p[0].dialStr, name: p[0].name, body: 'x', runId: run });
+    applyStatus({ id: 'ag-0', status: 'read' });
+    recordRecipientSent(run, p[1].dialStr, 'ag-1');
+    out({ wamid: 'ag-1', waId: p[1].dialStr, name: p[1].name, body: 'x', runId: run });
+    applyStatus({ id: 'ag-1', status: 'failed', errors: [{ code: 131049, title: 'x' }] });
+    recordRecipientRetry(run, p[2].dialStr, 131049, Date.now() + 3600000);
+    recordRecipientSkipped(run, p[3].dialStr, 'skipped', 131026);
+    recordRecipientSkipped(run, p[4].dialStr, 'failed', 131000);
+
+    const f    = funnelForRun(run);
+    const rows = M.recipientsForRun(run);
+    assert.equal(rows.length, f.total, 'one row per contact in the run');
+
+    const counted = {};
+    for (const r of rows) counted[r.bucket] = (counted[r.bucket] || 0) + 1;
+    for (const k of ['delivered', 'sent', 'pending', 'retrying', 'failed', 'unreachable', 'optedOut']) {
+      assert.equal(counted[k] || 0, f[k],
+        `the "${k}" list has ${counted[k] || 0} contacts but the card says ${f[k]}`);
+    }
+    // read stays a subset: the contact is in the delivered list AND flagged read.
+    assert.equal(rows.filter(r => r.wasRead).length, f.read);
+    assert.equal(rows.filter(r => r.wasRead).every(r => r.bucket === 'delivered'), true);
+    // Every row can explain itself — a bare Meta code is not an explanation.
+    assert.equal(rows.find(r => r.bucket === 'unreachable' && r.code)?.explanation?.length > 0, true);
+  });
+
+  // Every place a run's numbers are read must carry the funnel, or the screen
+  // that lost it silently renders zeroes for a run that really sent.
+  test('the funnel travels with the run everywhere it is reported', () => {
+    const run = openRun('funnel-shape');
+    buildRun(run, who(2));
+    for (const [where, obj] of [['listRuns', M.listRuns().find(r => r.id === run)],
+                                ['runDetail', M.runDetail(run)],
+                                ['lastRunSummary', M.lastRunSummary()]]) {
+      assert.ok(obj && obj.funnel, `${where} lost the funnel`);
+      assert.equal(obj.funnel.total, 2, `${where} reported the wrong total`);
+    }
+  });
+
+  test('an opt-out is not filed as unreachable', () => {
+    const run = openRun('funnel-optout');
+    const p = who(1);
+    M.contacts.disable(p[0].dialStr, 'opt_out', p[0].name);
+    buildRun(run, p, () => 'disabled');
+    const f = funnelForRun(run);
+    assert.equal(f.optedOut, 1);
+    assert.equal(f.unreachable, 0, '"asked us to stop" and "cannot receive messages" are different facts');
+    assert.equal(sums(f), f.total);
+  });
+
+  // A delivery failure the webhook put back on the ladder un-stamps the wamid.
+  // The contact is owed another attempt, so they read as retrying rather than as
+  // the send Meta already refused.
+  test('a contact the webhook requeued reads as retrying, not failed', () => {
+    const run = openRun('funnel-requeue');
+    const p = who(1);
+    buildRun(run, p);
+    recordRecipientSent(run, p[0].dialStr, 'fn-rq');
+    out({ wamid: 'fn-rq', waId: p[0].dialStr, name: p[0].name, body: 'x', runId: run });
+    assert.equal(funnelForRun(run).sent, 1);
+    M.requeueFailedRecipient(run, p[0].dialStr, 'fn-rq', 131049, Date.now() + 3600000);
+    const f = funnelForRun(run);
+    assert.equal(f.retrying, 1);
+    assert.equal(f.failed, 0);
+    assert.equal(sums(f), f.total);
+  });
+}
+
+console.log('\nundeliverable numbers switch themselves off');
+{
+  const M = require('./server');
+  // One decision, three callers — the send response, the delivery-failure
+  // webhook, and a test send — so none of them can grow its own idea of which
+  // codes mean "this number will never receive a message".
+  test('a permanent code disables the contact and records the suppression', () => {
+    const phone = '919400000001';
+    assert.equal(suppressIfPermanent(phone, 131026, 'Ghost'), true);
+    assert.equal(M.contacts.isDisabled(phone), true);
+    assert.equal(M.contacts.getRow(phone).disabled_reason, 'failed_hard');
+  });
+  test('running it again is a no-op, so webhook redeliveries cost nothing', () => {
+    assert.equal(suppressIfPermanent('919400000001', 131026, 'Ghost'), false);
+  });
+  test('a moment-based failure leaves the contact enabled', () => {
+    const phone = '919400000002';
+    assert.equal(suppressIfPermanent(phone, 131049, 'Busy'), false);
+    assert.equal(M.contacts.isDisabled(phone), false,
+      'the per-user marketing cap is about this moment — switching the contact off would lose them forever');
+  });
+  test('a code nobody has classified never writes a customer off', () => {
+    const phone = '919400000003';
+    assert.equal(suppressIfPermanent(phone, 999999, 'Unknown'), false);
+    assert.equal(M.contacts.isDisabled(phone), false);
+  });
 }
 
 console.log('\nstatus');
@@ -1004,8 +1390,35 @@ test('the schema creates every table', () => {
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_run', 'idx_messages_thread',
-                           'idx_run_recipients_pending', 'idx_run_recipients_retry']);
+  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_cap', 'idx_messages_out_at',
+                           'idx_messages_run', 'idx_messages_thread',
+                           'idx_run_recipients_retry', 'idx_run_recipients_seq']);
+});
+// The two indexes the loop's per-message queries actually need, asserted on the
+// PLAN rather than on the schema — an index that exists but is not chosen is
+// worse than no index, because it costs writes and buys nothing. Both of these
+// regressed exactly that way: the retry ladder widened nextPending's WHERE into
+// a disjunction that no longer implied the old partial index's predicate, and
+// sentSince's GROUP BY made SQLite prefer the (wa_id, at) thread index — which
+// cannot seek on `at`, so it scanned the whole message history once per send.
+test('the two per-message queries are answered by an index, not by a scan', () => {
+  const d = openDb(':memory:');
+  const plan = sql => d.prepare('EXPLAIN QUERY PLAN ' + sql).all().map(r => r.detail).join(' | ');
+
+  const pending = plan("SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL "
+    + "AND (skipped_reason IS NULL OR (skipped_reason = 'retry' AND retry_after <= ?)) ORDER BY seq LIMIT 1");
+  assert.match(pending, /idx_run_recipients_seq/,
+    'nextPending must seek the run rather than scan it — this is once per message sent');
+  assert.doesNotMatch(pending, /TEMP B-TREE/,
+    'and the index must supply the ORDER BY, or every send sorts the whole queue again');
+
+  const cap = plan("SELECT count(*) AS n FROM (SELECT wa_id FROM messages WHERE dir = 'out' "
+    + "AND type = 'template' AND at >= ? GROUP BY wa_id "
+    + "HAVING sum(CASE WHEN status = 'failed' THEN 0 ELSE 1 END) > 0)");
+  assert.match(cap, /idx_messages_cap/,
+    "today's send count must be answered from today's rows — the scan it replaces grew with all history, forever");
+  assert.doesNotMatch(cap, /SCAN messages/,
+    'a full table scan here is once per message sent, on a synchronous driver, blocking webhook ingestion');
 });
 test('opening twice does not throw', () => {
   const d = openDb(':memory:');
@@ -1575,13 +1988,26 @@ test('displayed counters are derived from the current run', () => {
   assert.equal(st.delivered, 1);
   assert.equal(st.read, 1);
 });
-test('a webhook failure is counted alongside API failures', () => {
-  const runId = S.currentRunId;
-  recordOutbound({ wamid: 'snap-3', waId: '919911000003', name: 'Three', body: 'x', runId });
-  applyStatus({ id: 'snap-3', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
-  S.failed = 2;                      // two sends the Graph API rejected outright
-  assert.equal(buildState().failed, 3);
-  S.failed = 0;
+// `failed` used to be an in-memory counter added to a count over the message
+// rows, and the same contact could be inside both. It is one query over the
+// queue now, and it separates "gave up on this person" from "this number cannot
+// receive messages at all" — two different things to do about it.
+test('failures and undeliverable numbers are counted separately, from the queue', () => {
+  const { buildRun: br, recordRecipientSent: sent } = require('./server');
+  const runId = startRun('snapshot-run-failed');
+  const p = [{ name: 'Cap', dialStr: '919911000010' }, { name: 'Ghost', dialStr: '919911000011' }];
+  br(runId, p);
+  p.forEach((c, i) => {
+    recordOutbound({ wamid: `snapf-${i}`, waId: c.dialStr, name: c.name, body: 'x', runId });
+    sent(runId, c.dialStr, `snapf-${i}`);
+  });
+  applyStatus({ id: 'snapf-0', status: 'failed', errors: [{ code: 131049, title: 'Not delivered' }] });
+  applyStatus({ id: 'snapf-1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+
+  const st = buildState();
+  assert.equal(st.failed, 1, 'the per-user cap is a failure of this attempt');
+  assert.equal(st.unreachable, 1, 'the undeliverable number is not — no attempt will ever work');
+  assert.equal(st.funnel.failed + st.funnel.unreachable, 2, 'and the card agrees with the tiles');
 });
 test('starting a new run resets the displayed counters to zero', () => {
   startRun('snapshot-run-2');
@@ -1592,15 +2018,42 @@ test('starting a new run resets the displayed counters to zero', () => {
 });
 test('spent is priced on delivered messages in the current run', () => {
   const runId = startRun('snapshot-run-3');
+  // Staged as a recipient, because that is what a campaign contact IS. Spend is
+  // priced off the queue now, not off the message rows — see the test below.
+  buildRun(runId, [{ dialStr: '919911000004', name: 'Four' }]);
+  recordRecipientSent(runId, '919911000004', 'snap-4');
   recordOutbound({ wamid: 'snap-4', waId: '919911000004', name: 'Four', body: 'x', runId });
   applyStatus({ id: 'snap-4', status: 'delivered' });
   const st = buildState();
   assert.equal(st.pricing.spent, spentCost(1, rateFor(S.config.templateCategory)));
 });
+// /api/test-send stamps its message row with the CURRENT run — deliberately, so
+// the operator watches accepted → delivered → read in front of them — but it
+// stages no recipient. Pricing spend off the message rows therefore billed test
+// sends against a campaign whose estimate came from the queue, so the two halves
+// of one pricing object described different sets of people. The same split is
+// why the Dashboard's Delivered tile could read one higher than the Delivered
+// row in the card directly beneath it.
+test('a test send does not spend the campaign, and does not move its funnel', () => {
+  const runId = startRun('snapshot-run-4');
+  buildRun(runId, [{ dialStr: '919911000005', name: 'Five' }]);
+  const before = buildState();
+
+  recordOutbound({ wamid: 'snap-test', waId: '919911000099', name: 'tester', body: 'x', runId });
+  applyStatus({ id: 'snap-test', status: 'delivered' });
+  const after = buildState();
+
+  assert.equal(after.pricing.spent, before.pricing.spent,
+    'a number that was never on the list cannot have cost this campaign anything');
+  assert.deepEqual(after.funnel, before.funnel,
+    'and it is not one of the contacts the funnel is accounting for');
+  assert.equal(after.delivered, before.delivered + 1,
+    'the message-table view still sees it — that surface is "what has this number sent"');
+});
 test('the snapshot still carries every key the frontend reads', () => {
   const st = buildState();
   for (const k of ['phase','currentIdx','total','accepted','delivered','read','failed','skipped',
-                   'dailyCount','dailyCap','quality','warmup','pricing','inboxUnread','pauseReason',
+                   'dailyCount','dailyCap','quality','warmup','pricing','inboxUnread','pauseReason','funnel',
                    'config','configured','currentContact','limits','disabledCount','contacts','optOutLabel']) {
     assert.ok(k in st, `buildState lost the "${k}" key`);
   }
@@ -2318,8 +2771,17 @@ console.log('\ndelivery failures that arrive over the webhook');
   const C = M.contacts;
 
   let runSeq = 0;
-  const newRun = () => Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
-    .run(Date.now(), `w${++runSeq}`).lastInsertRowid);
+  // Made CURRENT, exactly as services/messages.js:startRun does. The ladder only
+  // reopens the run the app is actually pointed at — a webhook must not requeue
+  // a contact onto a run a later CSV upload has already superseded, because
+  // nothing will ever walk that queue again. Leaving currentRunId unset here
+  // made every run in this block look superseded.
+  const newRun = () => {
+    const id = Number(db.prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)')
+      .run(Date.now(), `w${++runSeq}`).lastInsertRowid);
+    S.currentRunId = id;
+    return id;
+  };
   let pseq = 0;
   const people = n => Array.from({ length: n }, (_, i) => ({
     name: `W${i}`, dialStr: `9198700${String(++pseq).padStart(5, '0')}` }));
@@ -2426,6 +2888,32 @@ console.log('\ndelivery failures that arrive over the webhook');
     assert.equal(countsForRun(run).failed, 1, 'reported as a failure, which is what it is');
   });
 
+  // A campaign finishes, the operator uploads a new CSV — which opens a new run
+  // and makes it current — and then a late failure webhook arrives for the OLD
+  // run. Requeuing there un-stamps a wamid nothing will ever re-send: the loop
+  // only ever walks S.currentRunId. The old run's report flipped from
+  // "completed" to "incomplete", the contact moved out of delivered/sent into
+  // "retrying", and the breakdown card then promised an attempt that had no loop
+  // to make it.
+  test('a failure for a run a later upload superseded is not requeued', () => {
+    const old = newRun();
+    const p = people(1);
+    buildRun(old, p);
+    accepted(old, p[0], 'w.superseded');
+    const before = { ...progressForRun(old) };
+
+    newRun();                                   // the CSV upload: a new current run
+
+    assert.equal(webhook('w.superseded', 131049), 'stale',
+      'nothing walks a run that is no longer current, so putting somebody back on it strands them');
+    assert.deepEqual(progressForRun(old), before,
+      'the finished run must be left exactly as it was');
+    assert.equal(rowFor(old, p[0].dialStr).wamid, 'w.superseded',
+      'the accept stamp stays — un-stamping it is what made the run look unfinished forever');
+    assert.equal(countsForRun(old).failed, 1,
+      'the failure is still recorded on the message row, because the send really did fail');
+  });
+
   test('the per-contact list stops calling a refused send "sent"', () => {
     const run = newRun();
     const p = people(1);
@@ -2513,19 +3001,28 @@ console.log('\nstate — processed never exceeds the list');
       recordOutbound({ wamid: `pw-${i}`, waId: p.dialStr, name: p.name, body: 'x', runId: run });
       recordRecipientSent(run, p.dialStr, `pw-${i}`);
     });
-    // Meta then reports two of them as undeliverable.
-    applyStatus({ id: 'pw-0', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
-    applyStatus({ id: 'pw-1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+    // Meta then refuses two of them. 131049, the per-user marketing cap, is the
+    // code this actually happens with — and unlike 131026 it lands in `failed`
+    // rather than in `unreachable`, which is what makes the old double count
+    // below reproducible.
+    applyStatus({ id: 'pw-0', status: 'failed', errors: [{ code: 131049, title: 'Not delivered' }] });
+    applyStatus({ id: 'pw-1', status: 'failed', errors: [{ code: 131049, title: 'Not delivered' }] });
 
     const s = buildState();
     assert.equal(s.total, 3);
     assert.ok(s.currentIdx <= s.total,
       `processed (${s.currentIdx}) exceeded the list (${s.total}) — a contact was counted more than once`);
     assert.equal(s.currentIdx, 3, 'three contacts were resolved, however their statuses later moved');
-    // The old formula, kept here as the thing that must never come back.
+    // The old formula, kept here as the thing that must never come back:
+    // `accepted` counts message ROWS, `failed` and `skipped` count queue
+    // CONTACTS, and a refused send is inside both.
     const oldWay = s.accepted + s.failed + s.skipped;
     assert.ok(oldWay > s.total,
       'accepted + failed + skipped is the double count this test exists to prevent regressing to');
+    // The buckets, by contrast, are one table asked one question and they add up.
+    const f = s.funnel;
+    assert.equal(f.delivered + f.sent + f.pending + f.retrying + f.failed + f.unreachable + f.optedOut,
+      f.total, 'the breakdown must account for every contact exactly once');
   });
 
   test('an API refusal is not counted twice either', () => {
@@ -2725,6 +3222,47 @@ console.log('\nstorage — overview, listing, rename, bulk removal');
       });
       assert.equal(bulk.status, 400, 'an empty selection is a refusal, not a silent success');
     } finally { s.close(); CFG.appPassword = savedPw; }
+  });
+
+  // parseInt is not a validator, and both of these coerced their way towards
+  // MORE sending: an unparseable delay became NaN, and sleep(NaN) fires
+  // immediately — so a typo removed the pause between sends entirely — while an
+  // unparseable cap became 0, which is the operator's own "no cap". A number
+  // that does not parse is a mistake, and guessing a value that spends money is
+  // the wrong way to answer one.
+  testAsync('the config route refuses a setting it cannot parse rather than guessing', async () => {
+    const savedPw = CFG.appPassword;
+    CFG.appPassword = 'test-password';
+    const before = { delaySec: S.config.delaySec, dailyCap: S.config.dailyCap };
+    const s = http.createServer(app);
+    await new Promise(r => s.listen(0, r));
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const cookie = { cookie: `wa_session=${createSession()}` };
+      const post = body => fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...cookie },
+        body: JSON.stringify(body),
+      }).then(r => r.json());
+
+      const badCap = await post({ dailyCap: 'abc' });
+      assert.equal(badCap.ok, false, 'NaN || 0 is 0, and 0 means "no cap of mine" — a typo must not uncap the account');
+      assert.equal(S.config.dailyCap, before.dailyCap, 'and nothing is changed by a refusal');
+
+      const badDelay = await post({ delaySec: 'abc' });
+      assert.equal(badDelay.ok, false, 'Math.max(1, NaN) is NaN, and sleep(NaN) sends with no pause at all');
+      assert.equal(S.config.delaySec, before.delaySec);
+
+      assert.equal((await post({ delaySec: 0 })).ok, false, 'no delay is not a delay');
+      assert.equal((await post({ dailyCap: -5 })).ok, false, 'a negative cap is not a cap');
+
+      assert.equal((await post({ dailyCap: 0 })).ok, true, '0 is still the deliberate "no cap of mine"');
+      assert.equal(S.config.dailyCap, 0);
+      assert.equal((await post({ dailyCap: 500, delaySec: 3 })).ok, true);
+      assert.deepEqual([S.config.dailyCap, S.config.delaySec], [500, 3]);
+    } finally {
+      s.close(); CFG.appPassword = savedPw;
+      Object.assign(S.config, before);
+    }
   });
 }
 

@@ -37,4 +37,20 @@ function deferPastQuietHours(at, { start = 23, end = 7, resumeAt = 8 } = {}) {
   return ist.getTime() - IST_OFFSET_MS;
 }
 
-module.exports = { deferPastQuietHours, IST_OFFSET_MS };
+// Midnight IST of the day containing `at`, as a UTC epoch. "Today" is an IST
+// question everywhere in this app — the warm-up ladder, the daily cap, the log
+// timestamps — and answering it with the server's own zone silently rolls the
+// counter over at the wrong hour on any host that is not in India.
+function startOfIstDay(at = Date.now()) {
+  const ist = new Date(at + IST_OFFSET_MS);
+  ist.setUTCHours(0, 0, 0, 0);             // UTC setter, IST value — see above
+  return ist.getTime() - IST_OFFSET_MS;
+}
+
+// The next IST midnight after `at`, plus two minutes. The slack is what stops a
+// loop that wakes a second early from re-reading the day it just left and
+// parking again for another twenty-four hours. IST has no daylight saving, so
+// a day is exactly 24 hours here and the arithmetic needs no calendar.
+const nextIstMidnight = (at = Date.now()) => startOfIstDay(at) + 86400000 + 120000;
+
+module.exports = { deferPastQuietHours, IST_OFFSET_MS, startOfIstDay, nextIstMidnight };

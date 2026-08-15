@@ -44,7 +44,7 @@ router.post('/upload-csv', (req, res, next) => {
     const upload = contacts.upsertFromCsv(parsed, {
       filename: req.file.originalname || null, skippedCount: skipped.length,
     });
-    S.phase = 'idle'; S.failed = 0; S.failLog = [];
+    S.phase = 'idle'; S.failLog = [];
     // The queue is staged now, not at /start: it is then durable from the moment
     // the operator has one, so a restart before sending begins loses nothing.
     stageRun(parsed);

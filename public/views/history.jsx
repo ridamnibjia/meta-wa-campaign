@@ -45,7 +45,12 @@ function RunDetail({ id, onBack }) {
   if (!d) return <Empty icon="◌" title="Loading campaign…" />;
 
   const [tone, label] = RUN_STATUS[d.status] || RUN_STATUS.completed;
-  const pct = n => (d.counts.accepted ? `${Math.round((n / d.counts.accepted) * 100)}% of reached` : '—');
+  // Percentages of the LIST, not of "reached". An operator planning the next
+  // campaign is asking "of the people I uploaded, how many heard from me" — and
+  // measuring against `accepted` quietly excludes everyone the run never got to,
+  // which flatters the number exactly when the run went badly.
+  const f = d.funnel || {};
+  const pct = n => (f.total ? `${Math.round((n / f.total) * 100)}% of the list` : '—');
 
   return (
     <div className="space-y-4">
@@ -70,15 +75,30 @@ function RunDetail({ id, onBack }) {
         </Alert>
       )}
 
+      {/* Every tile here reads from the same funnel as the breakdown below, so
+          the summary and the detail cannot disagree. They used to come from
+          `counts` (message rows) and `progress` (queue rows) side by side —
+          which is also why these six DO add up, unlike the old pair. */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
-        <Stat label="Contacts"  value={num(d.progress.total)} />
-        <Stat label="Reached"   value={num(d.counts.accepted)} hint="accepted by Meta" />
-        <Stat label="Delivered" value={num(d.counts.delivered)} hint={pct(d.counts.delivered)} />
-        <Stat label="Read"      value={num(d.counts.read)} hint="see note below" />
-        <Stat label="Failed"    value={num(d.counts.failed)} tone={d.counts.failed ? 'text-destructive' : ''} />
-        <Stat label="Skipped"   value={num(d.progress.skipped)} hint="opted out or given up on" />
+        <Stat label="Contacts"      value={num(f.total)} hint="rows in the CSV" />
+        <Stat label="Delivered"     value={num(f.delivered)} tone={f.delivered ? 'text-success' : ''} hint={pct(f.delivered)} />
+        <Stat label="Read"          value={num(f.read)} hint="see note below" />
+        <Stat label="Failed"        value={num(f.failed)} tone={f.failed ? 'text-destructive' : ''} hint="gave up after every attempt" />
+        <Stat label="Not on WhatsApp" value={num(f.unreachable)} tone={f.unreachable ? 'text-destructive' : ''} hint="Meta says undeliverable" />
+        <Stat label="Opted out"     value={num(f.optedOut)} hint="never attempted" />
       </div>
       <p className="text-xs text-muted-foreground"><strong>About “Read”:</strong> {READ_CAVEAT}</p>
+
+      {/* The same funnel the tiles above are slices of, broken out: every contact
+          in the run, in exactly one row — and every row opens into the contacts
+          behind it, filtered on the bucket the server stamped, so the list and
+          the number are the same query.
+
+          `live` is what stops the retrying row promising an attempt nothing will
+          make. Only an in-progress run has a loop walking its queue; a stopped
+          one, or one a later CSV upload superseded, keeps its parked rows and its
+          retry_after column forever. */}
+      <Funnel funnel={d.funnel} recipients={d.recipients} live={d.status === 'in-progress'} />
 
       <Card className="p-4">
         <p className="mb-2 text-xs font-semibold">The message this campaign sent</p>
@@ -92,45 +112,32 @@ function RunDetail({ id, onBack }) {
         ) : null}
       </Card>
 
-      {d.skips.length > 0 && (
-        <Card className="p-4">
-          <p className="mb-2 text-xs font-semibold">Not delivered ({num(d.skips.length)})</p>
-          <div className="max-h-80 divide-y divide-border overflow-y-auto rounded-md border border-border">
-            {d.skips.map(s => (
-              <div key={s.phone} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 px-3 py-2 text-xs">
-                <span className="font-medium">{s.name || s.phone}</span>
-                <span className="text-muted-foreground">+{s.phone}</span>
-                <span className="w-full text-muted-foreground md:w-auto md:flex-1">
-                  {s.error_code ? `[${s.error_code}] ` : ''}
-                  {s.explanation || s.skipped_reason}
-                  {s.attempts > 1 ? ` · tried ${s.attempts}×` : ''}
-                </span>
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
+      {/* The old "Not delivered" card is gone: it was a third list of the same
+          people, re-deriving its own labels from skipped_reason, and the
+          breakdown above now opens into every one of those groups with the
+          server's own classification. Three renderings of one fact is three
+          things to keep in step. */}
 
       <Card className="p-4">
         <p className="mb-2 text-xs font-semibold">Everyone on this campaign ({num(d.recipients.length)})</p>
+        <p className="mb-2 text-[11px] text-muted-foreground">
+          In send order. The outcome shown is the same one the breakdown above counted —
+          it is stamped on the row by the server, not worked out again here.
+        </p>
         <div className="max-h-80 divide-y divide-border overflow-y-auto rounded-md border border-border">
-          {d.recipients.map(r => (
-            <div key={r.phone} className="flex items-baseline gap-2 px-3 py-1.5 text-xs">
-              <span className="w-28 shrink-0 truncate font-medium">{r.name || r.phone}</span>
-              <span className="shrink-0 text-muted-foreground">+{r.phone}</span>
-              {/* The message status comes first, because a row with a wamid
-                  means Meta ACCEPTED it — and this list went on saying "sent"
-                  about contacts Meta had since refused to deliver to. */}
-              <span className="ml-auto shrink-0">
-                {r.status === 'failed' ? <span className="text-destructive">failed</span>
-                  : r.status === 'read' || r.status === 'delivered' ? <span className="text-success">{r.status}</span>
-                  : r.wamid ? <span className="text-success">sent</span>
-                  : r.skipped_reason === 'retry' ? <span className="text-warning">retrying</span>
-                  : r.skipped_reason ? <span className="text-muted-foreground">{r.skipped_reason}</span>
-                  : <span className="text-muted-foreground">not reached</span>}
-              </span>
-            </div>
-          ))}
+          {d.recipients.map(r => {
+            const row = FUNNEL_ROWS.find(x => x.key === r.bucket);
+            return (
+              <div key={r.phone} className="flex items-baseline gap-2 px-3 py-1.5 text-xs">
+                <span className="w-28 shrink-0 truncate font-medium">{r.name || r.phone}</span>
+                <span className="shrink-0 font-mono text-muted-foreground">+{r.phone}</span>
+                {r.code ? <span className="shrink-0 text-muted-foreground">[{r.code}]</span> : null}
+                <span className={cn('ml-auto shrink-0', row?.tone || 'text-muted-foreground')}>
+                  {row?.label || r.bucket}{r.wasRead ? ' · read' : ''}
+                </span>
+              </div>
+            );
+          })}
         </div>
       </Card>
     </div>
@@ -181,16 +188,23 @@ function History() {
               <p className="text-[11px] text-muted-foreground">
                 {runStamp(r.startedAt)} → {runStamp(r.endedAt)}
               </p>
+              {/* All from the funnel, so this line and the campaign it opens
+                  cannot show different numbers for the same run. */}
               <p className="flex flex-wrap gap-x-3 text-xs text-muted-foreground">
-                <span><strong className="text-foreground tabular-nums">{num(r.progress.total)}</strong> contacts</span>
-                <span><strong className="text-foreground tabular-nums">{num(r.counts.accepted)}</strong> reached</span>
-                <span><strong className="text-foreground tabular-nums">{num(r.counts.delivered)}</strong> delivered</span>
-                <span><strong className="text-foreground tabular-nums">{num(r.counts.read)}</strong> read</span>
-                {r.counts.failed > 0 && (
-                  <span><strong className="text-destructive tabular-nums">{num(r.counts.failed)}</strong> failed</span>
+                <span><strong className="text-foreground tabular-nums">{num(r.funnel.total)}</strong> contacts</span>
+                <span><strong className="text-success tabular-nums">{num(r.funnel.delivered)}</strong> delivered</span>
+                <span><strong className="text-foreground tabular-nums">{num(r.funnel.read)}</strong> read</span>
+                {r.funnel.failed > 0 && (
+                  <span><strong className="text-destructive tabular-nums">{num(r.funnel.failed)}</strong> failed</span>
                 )}
-                {r.progress.retrying > 0 && (
-                  <span><strong className="text-warning tabular-nums">{num(r.progress.retrying)}</strong> retrying</span>
+                {r.funnel.unreachable > 0 && (
+                  <span><strong className="text-destructive tabular-nums">{num(r.funnel.unreachable)}</strong> not on WhatsApp</span>
+                )}
+                {r.funnel.optedOut > 0 && (
+                  <span><strong className="tabular-nums">{num(r.funnel.optedOut)}</strong> opted out</span>
+                )}
+                {r.funnel.retrying > 0 && (
+                  <span><strong className="text-warning tabular-nums">{num(r.funnel.retrying)}</strong> retrying</span>
                 )}
               </p>
             </button>

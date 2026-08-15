@@ -11,7 +11,7 @@ const path = require('node:path');
 const { FILES, MEDIA_DIR, UPLOAD_DIR, MEDIA_LIMITS, CFG, CLAMAV } = require('../config');
 const { db } = require('../lib/db');
 const { S, todayKey } = require('../state');
-const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap } = require('./warmup');
+const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap, graduated, dailyCount } = require('./warmup');
 const { scannerConfigured } = require('../lib/clamav');
 
 const one = sql => db.prepare(sql);
@@ -157,7 +157,8 @@ function snapshot({ now = Date.now() } = {}) {
       daysSent:  W.days.length,
       sentToday: W.days.includes(todayKey()),
       today:     todayKey(),
-      dailyCount: S.dailyCount,
+      graduated: graduated(),
+      dailyCount: dailyCount(),
     },
 
     scanner: {

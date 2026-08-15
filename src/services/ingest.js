@@ -15,8 +15,15 @@ const { applyStatus, markEnvelopeProcessed } = require('./messages');
 const { handleDeliveryFailure } = require('./campaign');
 const inbox = require('./inbox');
 
+// One broadcast per envelope, not one per message and one per status.
+// broadcast() rebuilds the whole state snapshot — several SQL aggregates,
+// including the per-contact funnel — and Meta batches statuses, so a single
+// webhook carrying fifty of them was fifty full rebuilds pushed down every open
+// socket to render the same final number. The clients only ever see the last
+// one; the other forty-nine were work nobody could observe.
 function processEnvelope(body) {
   if (body.object !== 'whatsapp_business_account') return;
+  let changed = false;
   for (const entry of (body.entry || [])) {
     // Meta stamps every webhook with the WABA ID that produced it. A System User
     // token without business_management cannot look that ID up from the Business
@@ -57,7 +64,7 @@ function processEnvelope(body) {
             log('warn', `opt-out — +${m.from} will be skipped by campaigns from now on`);
           }
         }
-        broadcast();
+        changed = true;
       }
 
       for (const status of (change.value?.statuses || [])) {
@@ -69,10 +76,11 @@ function processEnvelope(body) {
         // guard in the UPDATE — which is what keeps Replay safe to press twice.
         const failure = applyStatus(status);
         if (failure) handleDeliveryFailure(failure);
-        broadcast();
+        changed = true;
       }
     }
   }
+  if (changed) broadcast();
 }
 
 // ── Replay ─────────────────────────────────────────────────────────────────────

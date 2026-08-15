@@ -2,23 +2,42 @@
 // things you might want to do next.
 function Dashboard() {
   const { ss, account, threads, logs, contacts } = useApp();
-  const { phase, accepted, delivered, read, failed, skipped, total, dailyCount, dailyCap,
-          pricing = {}, warmup, retrying = 0, nextRetry, lastRun, currentIdx = 0 } = ss;
+  const { phase, skipped, total, dailyCount, dailyCap,
+          pricing = {}, warmup, retrying = 0, nextRetry, lastRun, currentIdx = 0,
+          funnel } = ss;
+
+  // ONE source for the outcome tiles, and it is the same one the breakdown card
+  // below renders. They used to be split: Accepted/Delivered/Read came from
+  // countsForRun (the messages table) while Failed/Not-on-WhatsApp came from the
+  // funnel (the queue) — so the tile and the row underneath it could disagree
+  // about the same run, on the same screen, and did. A test send is the everyday
+  // way in: /api/test-send writes a message row stamped with the current run but
+  // no queue row, so it moved the top three tiles and nothing else. `f.sent` is
+  // "accepted, not yet confirmed"; `f.delivered` already contains `f.read`.
+  const f = funnel || {};
+  const delivered   = f.delivered   || 0;
+  const read        = f.read        || 0;
+  const failed      = f.failed      || 0;
+  const unreachable = f.unreachable || 0;
+  const accepted    = delivered + (f.sent || 0);
 
   // "Processed" is a count of CONTACTS resolved, and the only place that can
   // answer it is the queue — which is what currentIdx (p.sent + p.skipped) is.
   //
-  // It used to be `accepted + failed + skipped`, and that double-counted twice:
-  //   · `accepted` is count(*) of every outbound row for the run, so a message
-  //     that was accepted and later failed by webhook is in `accepted` AND in
-  //     the `failed` half of ss.failed;
-  //   · a send the API refused has no wamid but IS written to the queue as
-  //     skipped_reason='failed', so it lands in S.failed AND in `skipped`.
-  // On a 57-contact run with 17 such failures that read "74 of 57 processed,
-  // 130%". Numbers derived from two different tables cannot be added.
+  // It used to be `accepted + failed + skipped`, and that double-counted:
+  // `accepted` counted message ROWS while `failed` and `skipped` counted queue
+  // CONTACTS, and a send Meta accepted and later refused was inside both. On a
+  // 57-contact run with 17 such failures that read "74 of 57 processed, 130%".
+  // Everything on this screen now comes from the queue, so the tiles and the
+  // card add up to the same list — but this line stays a queue read on purpose.
   const done = Math.min(currentIdx, total);
   const pct  = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-  const rate = n => (accepted > 0 ? Math.round((n / accepted) * 100) + '%' : '—');
+  // Of the LIST, not of "accepted" — the same call History made, for the same
+  // reason: measuring against what was reached quietly excludes everyone the run
+  // never got to, which flatters the number exactly when the run went badly. It
+  // also removes the last denominator on this screen that came from a different
+  // table than its numerator.
+  const rate = n => (total > 0 ? Math.round((n / total) * 100) + '% of the list' : '—');
   const cur  = pricing.currency || '₹';
   const unread = threads.reduce((n, t) => n + (t.unread || 0), 0);
 
@@ -100,16 +119,29 @@ function Dashboard() {
 
       {/* Counters */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-        <Stat label="Accepted"  value={num(accepted)} />
-        <Stat label="Delivered" value={num(delivered)} tone="text-success" hint={`${rate(delivered)} of accepted`} />
-        <Stat label="Read"      value={num(read)}      hint={`${rate(read)} of accepted`} />
-        <Stat label="Failed"    value={num(failed)}    tone={failed ? 'text-destructive' : undefined} />
-        <Stat label="Skipped"   value={num(skipped)}   hint="opted out or undeliverable" />
+        {/* Accepted means "Meta took it and has not since refused it". A send it
+            later failed leaves this tile and appears in Failed or Waiting, which
+            is why the two never double-count — and why this number can go down. */}
+        <Stat label="Accepted"  value={num(accepted)} hint="taken, not since refused" />
+        <Stat label="Delivered" value={num(delivered)} tone="text-success" hint={rate(delivered)} />
+        <Stat label="Read"      value={num(read)}      hint="undercounts — see below" />
+        {/* "Failed", "Waiting" and "Not on WhatsApp" are separate populations,
+            not a total and parts of it. The card below breaks the whole list
+            down so nobody has to guess — these tiles are the live pulse, that is
+            the ledger. Every tile in this row is now a slice of that same
+            funnel, so a tile can never disagree with the row beneath it. */}
+        <Stat label="Failed"    value={num(failed)}    tone={failed ? 'text-destructive' : undefined}
+              hint="gave up after every attempt" />
+        <Stat label="Not on WhatsApp" value={num(unreachable)}
+              tone={unreachable ? 'text-destructive' : undefined} hint="Meta says undeliverable" />
+        <Stat label="Skipped"   value={num(skipped)}   hint="opted out or switched off" />
         {retrying > 0 && (
           <Stat label="Waiting" value={num(retrying)} tone="text-warning"
                 hint={nextRetry ? `next attempt ${new Date(nextRetry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'queued for another try'} />
         )}
       </div>
+
+      <Funnel funnel={funnel} />
 
       <div className="grid gap-4 lg:grid-cols-3">
         {/* Cost */}
@@ -173,8 +205,20 @@ function Dashboard() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="rounded-md border border-border p-3">
                     <p className="text-xs text-muted-foreground">Sent today</p>
-                    <p className="text-lg font-semibold tabular-nums">{num(dailyCount)} <span className="text-sm font-normal text-muted-foreground">/ {num(dailyCap)}</span></p>
-                    {warmup?.enabled && <p className="text-[11px] text-muted-foreground">Warm-up day {warmup.daysSent || 1} — ceiling {num(warmup.cap)}</p>}
+                    {/* dailyCap is null when nothing is capping this number.
+                        num(null) is "0", which would read as a cap that blocks
+                        every send — the opposite of what null means. */}
+                    <p className="text-lg font-semibold tabular-nums">{num(dailyCount)} <span className="text-sm font-normal text-muted-foreground">{dailyCap == null ? '· no cap' : `/ ${num(dailyCap)}`}</span></p>
+                    <p className="text-[11px] text-muted-foreground">
+                      {warmup?.graduated
+                        ? `Warm-up complete after ${num(warmup.daysSent)} sending days — Meta's tier is the limit now`
+                        : warmup?.enabled
+                          ? `Warm-up day ${warmup.daysSent || 1} — ceiling ${num(warmup.cap)}`
+                          : 'Warm-up off'}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Sends Meta later refused do not count here.
+                    </p>
                   </div>
                   <div className="rounded-md border border-border p-3">
                     <p className="text-xs text-muted-foreground">Currently sending to</p>

@@ -4,7 +4,7 @@ const { CFG } = require('../config');
 const { S, flags, log, todayKey } = require('../state');
 const { broadcast } = require('../services/status');
 const { isDisabled, markMessaged, getRow } = require('../services/contacts');
-const { W, effectiveCap } = require('../services/warmup');
+const { W, effectiveCap, graduated } = require('../services/warmup');
 const { recordOutbound, progressForRun, skippedForRun,
         listRuns, runDetail } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
@@ -13,7 +13,7 @@ const { fetchAccountInfo } = require('../services/graph');
 const { skipDisposition, explainError } = require('../lib/errors');
 const {
   sendTemplate, missingParams, startLoop, saveCampaignNow, clearCampaignFile,
-  campaignBlocker, campaignActive,
+  campaignBlocker, campaignActive, suppressIfPermanent,
 } = require('../services/campaign');
 
 const router = express.Router();
@@ -48,9 +48,9 @@ router.post('/test-send', async (req, res) => {
     log('info', `test send → +${dialStr}`);
     const r = await sendTemplate(contact);
     if (r.ok) {
-      // Counted like any other send so the stat tiles walk accepted → delivered
-      // → read in front of you; /api/start opens a new run before the campaign.
-      S.dailyCount++;
+      // Recorded like any other send so the stat tiles walk accepted → delivered
+      // → read in front of you. It counts against the daily cap for free: that
+      // figure is a query over these rows, not a counter this route increments.
       markMessaged(dialStr);
       recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, r.params)
@@ -60,6 +60,10 @@ router.post('/test-send', async (req, res) => {
     } else {
       log('error', `test send failed — +${dialStr} [${r.errorCode}] ${r.error}`);
       if (r.hint) log('error', `   ↳ ${r.hint}`);
+      // A test send is the cheapest place to learn a number is not on WhatsApp,
+      // and the campaign loop already acts on it. Not doing the same here meant
+      // the operator had to be told twice before the contact was switched off.
+      suppressIfPermanent(dialStr, r.errorCode, contact.name);
     }
     results.push({ input: n, dialStr, ok: !!r.ok, error: r.error || null, hint: r.hint || null });
   }
@@ -113,13 +117,22 @@ router.post('/start', async (req, res) => {
   // The queue was staged at upload and is NOT rebuilt here. Rebuilding would
   // reset every wamid, and /start after a pause would re-send to everyone who
   // had already received the message.
-  S.failed = 0; S.failLog = []; S.logs = [];
+  // No failure counter to clear — the queue rows are the count now, and a Start
+  // must not appear to erase failures that really happened.
+  S.failLog = []; S.logs = [];
   // `running` is NOT cleared here. It means "a loop is executing" and only the
   // loop may set it — clearing it from a route was what let startLoop() spawn a
   // second walk over one queue while the first was still inside an await.
   flags.stopFlag = false; flags.pauseFlag = false;
   S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast();
-  if (W.enabled) log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${effectiveCap()} today`);
+  const cap = effectiveCap();
+  if (W.enabled && !graduated()) {
+    log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${cap} today`);
+  } else {
+    log('info', cap === null
+      ? `No daily cap — this number has ${W.enabled ? 'finished its warm-up' : 'warm-up switched off'} and no cap of your own is set, so Meta's messaging tier is the only limit`
+      : `Warm-up complete — today's ceiling is your own cap of ${cap}`);
+  }
   startLoop();
   res.json({ ok: true });
 });
@@ -136,7 +149,11 @@ router.post('/reset',  (req, res) => {
   flags.stopFlag = true; flags.pauseFlag = false;
   // A reset abandons the current run rather than deleting it: campaign_runs and
   // run_recipients are history, and the counters were never the history.
-  Object.assign(S, { failed: 0, dailyCount: 0, phase: 'idle', logs: [], failLog: [],
+  // Today's send count is deliberately NOT reset: it is a query over the message
+  // rows, and a Reset is an operator tidying their screen, not a claim that the
+  // messages already sent today never went out. Zeroing it used to hand back a
+  // day's worth of allowance the number had genuinely spent.
+  Object.assign(S, { phase: 'idle', logs: [], failLog: [],
                      pauseReason: null, currentRunId: null });
   clearCampaignFile();
   broadcast(); log('info', 'Reset'); res.json({ ok: true });

@@ -8,8 +8,8 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 
 - **Compose and submit templates** to Meta from the app, with local validation that catches the documented rejection causes before you spend a review cycle.
 - **Bulk send** from a CSV, at a configurable pace, with live per-message state over WebSocket.
-- **Survives restarts.** The send queue and cursor are written to disk, so a crash or deploy resumes where it stopped instead of re-sending.
-- **Warm-up ladder.** A brand-new number climbs `20 → 50 → 100 → 250 → 500 → 1000` per sending day, and holds its rung if quality drops to YELLOW or RED.
+- **Survives restarts.** The send queue is a table in SQLite and the resume point is a query over what was actually sent — not a saved cursor a crash can leave ahead of reality — so a crash or deploy picks up where it stopped instead of re-sending.
+- **Warm-up ladder.** A brand-new number climbs `20 → 50 → 100 → 250 → 500 → 1000` per sending day, holds its rung if quality drops to YELLOW or RED, and graduates off the ladder entirely once it has walked the whole thing at good quality.
 - **One-tap opt-out.** A "Stop promotions" button on every template; taps arrive by webhook and disable that contact for campaigns — while leaving them replyable in the inbox.
 - **Two-way inbox with attachments.** Inbound replies are threaded, and you can reply free-form — text or a file — inside Meta's 24-hour customer-service window. Files come from a reusable library, so one price list is uploaded once and sent to any number of contacts.
 - **Campaign history.** Every past campaign with its start and end, the message body *as it was sent*, and who was reached, delivered to, read by, or missed and why.
@@ -199,9 +199,32 @@ Meta monitors how recipients interact with your messages. High block or report r
 
 Meta upgrades your tier automatically when you have sent at least the current tier limit within 7 days and your quality rating is not LOW.
 
-This app tracks `dailyCount` and pauses at midnight when the cap is reached, automatically resuming the next day.
+The app counts how many people it has messaged today and pauses until midnight IST when the cap is reached, resuming on its own the next day.
 
 At 2s per message, 2,238 contacts takes ~75 minutes. If you are on Tier 1 (1,000/day), the first 1,000 go out in ~33 minutes; the rest resume the following day.
+
+### What counts against the daily cap
+
+The count is a query over the messages actually sent today, not a running total,
+and it counts **people, not messages**:
+
+- A send Meta accepted counts from the moment it is accepted.
+- A send Meta **later refuses** — the `failed` status webhook, which is how the
+  per-user marketing cap (131049) and most quality blocks actually arrive —
+  **stops counting**, and the slot goes back to the day the instant the webhook
+  lands. A day of 800 accepts with 200 refusals is 600 against the cap, not 800.
+- A contact reached on the second attempt costs one slot, not two, which matches
+  how Meta counts its own limit (unique recipients per 24h).
+
+Because it is derived, nothing can drift: there is no counter for a restart, a
+midnight rollover or a replayed webhook to leave disagreeing with the rows.
+
+### Removing the cap
+
+Set **Daily cap** to `0` in Settings. That removes *your* limit; Meta's
+messaging tier still applies, and the warm-up ladder below still applies until
+it finishes. Both are shown on the Settings page, so you can always see which
+one is holding a campaign back.
 
 ### The warm-up ladder
 
@@ -218,15 +241,27 @@ So the app enforces its own ceiling on top of the tier cap:
 | 3 | 100 |
 | 4 | 250 |
 | 5 | 500 |
-| 6+ | 1,000 |
+| 6 | 1,000 |
+| 7+ | no ceiling — the ladder is finished |
 
 - The rung advances per **sending day**, not per calendar day. A day you send
   nothing does not move you up.
 - If your quality rating is `YELLOW` or `RED`, today holds one rung *below* where
   it would otherwise be, instead of climbing.
-- The effective cap is always `min(warm-up rung, your own daily cap)`.
-- Progress persists in `warmup.json`, because the whole point is spanning days.
-- Toggle it off in Settings once the number is established.
+- **The ladder ends.** Once every rung has had a sending day and quality is not
+  YELLOW or RED, the number has graduated and the warm-up ceiling is lifted
+  entirely — the ladder exists to prove a new number sends steadily, and once it
+  has, Meta's own tier is the real limit. This is automatic and applies to every
+  install; there is no per-account setting anywhere in the repo.
+- Graduation is re-checked live, not stamped once. A drop to YELLOW or RED puts
+  the number back on the ladder until quality recovers, because falling quality
+  is exactly when volume should come down.
+- The effective cap is `min(warm-up rung, your own daily cap)`, and `null` — no
+  cap at all — when neither applies.
+- Progress persists in `warmup.json`, and is reconciled at every boot against the
+  send days in the message store. A lost or left-behind `warmup.json` therefore
+  does not put an established number back on rung one at 20 a day.
+- Toggle it off in Settings if you want to skip it entirely.
 
 ---
 
@@ -378,14 +413,33 @@ identify it as a program is refused outright.
 ### Campaign history
 
 Every campaign that has ever run, newest first, with when it started and when the
-last attempt was made, how many contacts it had, and how many were reached,
-delivered to, read by and failed. Opening one shows the **message body as that
-campaign sent it** — editing a template later does not rewrite history — plus the
-full recipient list and a per-contact reason for anyone not reached.
+last attempt was made, and what happened to every contact in it. Opening one
+shows the **message body as that campaign sent it** — editing a template later
+does not rewrite history — plus the breakdown below and the full recipient list.
 
-Nothing here is stored as a summary. The counts are a `GROUP BY` over the
-messages table and the status is derived from what is left in the queue, so there
-is no number that can disagree with the rows underneath it.
+**Every contact, in exactly one group, and the groups add up to the CSV:**
+
+| Group | Meaning |
+|---|---|
+| Delivered *(of which N read)* | Reached the phone. This is what Meta bills for. |
+| Sent, no answer yet | Meta accepted it, delivery not confirmed. A recipient whose phone is offline sits here and moves to Delivered when they come back online — Meta holds it up to 30 days. |
+| Queued for another try | On the retry ladder. Still owed a message; the campaign is not finished. |
+| Not attempted yet | Still in the queue, in CSV order. |
+| Failed, given up on | Every attempt used, or a code never worth retrying. Not billed. |
+| Cannot receive messages | Meta reports the number as undeliverable — usually not on WhatsApp. Switched off automatically. |
+| Opted out or switched off | Never attempted. Tapped "Stop promotions", or you disabled them. |
+
+**Click any group to see exactly who is in it** — name, number, Meta's code, how
+many attempts were made and a plain-English explanation — with a search box and a
+CSV download of that group.
+
+Nothing here is stored as a summary. Both the count and the list behind it come
+from one SQL rule applied to one table, so the number on the card and the names
+under it cannot disagree — and the card says so out loud if they ever do.
+
+`read` is shown *inside* Delivered rather than beside it: a message that was read
+was also delivered, so counting it separately would make the groups miss the
+total by exactly the number of people with read receipts on.
 
 **About the read count:** WhatsApp only reports a message as read when the
 recipient has read receipts switched on, and many people turn them off. It
@@ -676,8 +730,28 @@ bad deploy mid-campaign costs real money:
 git pull && npm ci --omit=dev && sudo systemctl restart wa-campaign
 ```
 
-Safe to run mid-campaign: the queue and cursor are on disk, so the app resumes at
-the next unsent contact rather than restarting the list.
+Safe to run mid-campaign: the queue is on disk and the resume point is derived
+from it, so the app resumes at the next unsent contact rather than restarting the
+list.
+
+#### Backing it up
+
+`wa.db` is opened in **WAL mode**, so the newest writes live in `wa.db-wal` until
+SQLite checkpoints them into the main file. Copying `wa.db` alone from a running
+server therefore produces a backup that is silently missing recent messages,
+statuses and queue rows — and Meta's API is push-only, so nothing lost that way
+can be fetched back.
+
+Either stop the service first, or let SQLite do it live:
+
+```bash
+sqlite3 wa.db ".backup '/backups/wa-$(date +%F).db'"   # safe while running
+```
+
+Back up `warmup.json` and `campaign.json` beside it. Nothing else on disk is
+state — `.env` is credentials, and `media/` and `uploads/` are files you can
+re-upload. `warmup.json` is reconciled against the message store at every boot,
+so losing it alone is recoverable; losing the database is not.
 
 ---
 
@@ -825,10 +899,14 @@ Nothing in `lib/` knows about Express; nothing in `services/` knows about HTTP.
 `config.js` imports nothing at all, which is what lets everything else depend on
 it without a cycle.
 
-**Durability.** The send queue and cursor are written to `campaign.json` as the
-loop advances, and `resumeIfInterrupted()` runs at boot. A crash, a redeploy or
-an `systemctl restart` mid-campaign picks up at the next unsent contact — it does
-not restart the list, so nobody gets messaged twice.
+**Durability.** The send queue is the `run_recipients` table in `wa.db`, written
+when the CSV is uploaded rather than when sending starts, and
+`resumeIfInterrupted()` runs at boot. There is deliberately **no cursor**: the
+resume point is a query for the first row that has no message id yet, so a crash
+cannot leave a saved index ahead of what was actually sent and silently skip
+people. The recipient row is stamped before the message row, which means the
+worst case is one duplicate rather than one omission. A crash, a redeploy or a
+`systemctl restart` mid-campaign picks up at the next unsent contact.
 
 **Late receipts.** Every message — inbound or outbound, campaign or reply — lives
 in the `messages` table in `wa.db`, keyed by wamid. A read receipt that arrives

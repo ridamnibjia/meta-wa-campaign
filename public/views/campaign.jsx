@@ -215,7 +215,10 @@ const SKIP_GROUPS = [
     stoppedTitle: 'Left un-messaged when you stopped',
     stoppedBlurb: 'These were queued for another attempt when the campaign was stopped, so it never came. They are still on the queue: pressing Resume picks them up at their scheduled time. Starting a fresh run from a new CSV messages everyone on it, including the people already reached by this one.' },
   { key: 'retry',     title: 'Worth trying again another day',
-    blurb: 'These used up all four attempts and still failed for a reason nothing on your side controls — usually the per-person marketing cap, which resets on a scale of days. Re-upload and run again later, or send it as a UTILITY template, which the cap does not apply to.' },
+    // Deliberately does NOT suggest re-sending this as UTILITY. That category is
+    // for transactional messages the customer is expecting; promotional copy
+    // under it is category misuse and costs the quality rating.
+    blurb: 'These used up all six attempts and still failed for a reason nothing on your side controls — usually the per-person marketing cap, which resets on a scale of days. Put them in a later campaign; there is nothing to fix here.' },
   { key: 'fix',       title: 'Fix something first',
     blurb: 'These failed because of a setting on your side. Retrying unchanged repeats the failure; correcting the cause makes the whole list sendable.' },
   { key: 'permanent', title: 'Meta will not deliver these',
@@ -296,6 +299,55 @@ function SkipReport({ phase, retrying = 0 }) {
   );
 }
 
+// ── The controls, where you can always reach them ──────────────────────────────
+// Pause, Resume and Stop used to live only in step 3, at the bottom of a column
+// that grows a template composer, a preview and a skip report above it. On a
+// running campaign that is a scroll away from the one control an operator wants
+// in a hurry — and "I could not find Stop" is measured in messages sent.
+//
+// Sticky rather than fixed: it scrolls with the page until it reaches the top
+// and then stays, so it costs nothing on an idle screen and is never covering
+// content. It renders only while a campaign is actually under way, for the same
+// reason — nothing to stop, nothing to show.
+//
+// Module scope, like Step below: a component declared inside another component
+// is a new type on every render, and React remounts new types.
+function CampaignBar({ ss, phase, onPause, onResume, onStop }) {
+  const { total = 0, currentIdx = 0, retrying = 0, nextRetry, dailyCount = 0, dailyCap } = ss;
+  const done = Math.min(currentIdx, total);
+  const pct  = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const paused = phase === 'paused';
+
+  const [tone, label] = {
+    running: ['success', 'Sending'],
+    waiting: ['warning', 'In progress — retrying'],
+    paused:  ['warning', 'Paused'],
+  }[phase] || ['outline', phase];
+
+  return (
+    <div className="sticky top-0 z-20 -mx-4 mb-4 border-b border-border bg-background/95 px-4 py-3 backdrop-blur md:-mx-6 md:px-6">
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-4 gap-y-2">
+        <Badge variant={tone}>{label}</Badge>
+        <span className="text-sm font-medium tabular-nums">{num(done)} of {num(total)}</span>
+        <span className="text-xs text-muted-foreground">
+          {/* dailyCap is null when there is no ceiling at all — a finished
+              warm-up and no cap of your own. num(null) renders "0", which reads
+              as a limit that blocks every send. */}
+          {num(dailyCount)} sent today{dailyCap == null ? ' · no daily cap' : ` / ${num(dailyCap)}`}
+          {retrying > 0 && ` · ${num(retrying)} retrying${nextRetry ? `, next ${clockOf(nextRetry.at)}` : ''}`}
+        </span>
+        <div className="ml-auto flex gap-2">
+          {paused
+            ? <Button size="sm" onClick={onResume}>Resume</Button>
+            : <Button size="sm" variant="outline" onClick={onPause}>Pause</Button>}
+          <Button size="sm" variant="destructive" onClick={onStop}>Stop</Button>
+        </div>
+        <div className="w-full"><Progress value={pct} /></div>
+      </div>
+    </div>
+  );
+}
+
 const Step = ({ n, title, state, right, children }) => (
   <Card>
     <CardHeader row className="gap-3">
@@ -332,9 +384,12 @@ function Campaign() {
   });
   const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 1000 });
 
+  // `??`, not `||`: a dailyCap of 0 is a real setting — "no cap of mine" — and
+  // `||` would swap it back for the default here and then POST that default on
+  // Start, silently re-capping an account the operator had just uncapped.
   useEffect(() => {
     const c = ss.config || {};
-    setSettings(p => ({ delaySec: c.delaySec || p.delaySec, dailyCap: c.dailyCap || p.dailyCap }));
+    setSettings(p => ({ delaySec: c.delaySec || p.delaySec, dailyCap: c.dailyCap ?? p.dailyCap }));
   }, [ss.config?.delaySec, ss.config?.dailyCap]);
 
   // The preview needs an asset's kind and filename, which only the library
@@ -445,7 +500,11 @@ function Campaign() {
   const ready2 = templates.filter(t => t.status === 'APPROVED');
 
   return (
-    <div className="mx-auto grid max-w-6xl gap-4 lg:grid-cols-2">
+    <>
+      {isActive && (
+        <CampaignBar ss={ss} phase={phase} onPause={doPause} onResume={doResume} onStop={doStop} />
+      )}
+      <div className="mx-auto grid max-w-6xl gap-4 lg:grid-cols-2">
       <div className="space-y-4">
 
         {/* ── 1. Contacts ──────────────────────────────────────── */}
@@ -733,19 +792,16 @@ function Campaign() {
             <Alert variant="warning" title={`In progress — retrying ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'}`}>
               {ss.nextRetry ? `Next attempt at ${clockOf(ss.nextRetry.at)}. ` : ''}
               These failed for a reason that may pass — a network blip, a Meta hiccup, or the
-              per-person marketing cap. Each gets up to three more tries, an hour, two and four
-              hours apart, before it is reported. The campaign is not finished until then, and it
-              carries on by itself across a restart.
+              per-person marketing cap. Each gets up to five more tries, three hours apart, with
+              anything falling in the night pushed to 08:00. The campaign is not finished until
+              then, and it carries on by itself across a restart.
             </Alert>
           )}
-          {isRunning && <div className="flex gap-2">
-            <Button variant="outline" className="flex-1" onClick={doPause}>Pause</Button>
-            <Button variant="destructive" className="flex-1" onClick={doStop}>Stop</Button>
-          </div>}
-          {isPaused && <div className="flex gap-2">
-            <Button className="flex-1" onClick={doResume}>Resume</Button>
-            <Button variant="destructive" className="flex-1" onClick={doStop}>Stop</Button>
-          </div>}
+          {/* Pause / Resume / Stop are not repeated here. They live in the bar
+              pinned to the top of this screen, which is reachable without
+              scrolling past a template composer and a skip report — two copies
+              of a Stop button is two places to keep in step, and the one at the
+              bottom of the page is the one nobody could find. */}
           {blockedBy && !isActive && <p className="text-center text-xs text-muted-foreground">{blockedBy}</p>}
           <Button variant="ghost" size="sm" className="w-full text-muted-foreground" onClick={doReset}>Reset everything</Button>
         </Step>
@@ -817,6 +873,7 @@ function Campaign() {
           so pick a different name if you plan to submit a replacement.
         </p>
       </Dialog>
-    </div>
+      </div>
+    </>
   );
 }

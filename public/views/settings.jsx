@@ -20,9 +20,11 @@ function SettingsView() {
       .catch(() => {});
   }, [ss.disabledCount]);
 
+  // `??` on the cap: 0 is a real setting — "no cap of mine" — and `||` would
+  // swap it back for the default every time the server broadcast arrived.
   useEffect(() => {
     const c = ss.config || {};
-    setSettings(p => ({ delaySec: c.delaySec || p.delaySec, dailyCap: c.dailyCap || p.dailyCap }));
+    setSettings(p => ({ delaySec: c.delaySec || p.delaySec, dailyCap: c.dailyCap ?? p.dailyCap }));
   }, [ss.config?.delaySec, ss.config?.dailyCap]);
 
   useEffect(() => {
@@ -103,14 +105,23 @@ function SettingsView() {
               <Input type="number" min="1" max="60" value={settings.delaySec}
                      onChange={e => setSettings(p => ({ ...p, delaySec: parseInt(e.target.value) || 1 }))} />
             </Field>
-            <Field label="Daily cap" hint={warm?.enabled
-              ? `Warm-up holds today at ${num(warm.cap)} — whichever is lower wins`
+            <Field label="Daily cap" hint={
+              settings.dailyCap === 0 ? 'No cap of yours — Meta\'s messaging tier is the only limit'
+              : warm?.enabled && !warm?.graduated ? `Warm-up holds today at ${num(warm.cap)} — whichever is lower wins`
               : account?.tierCap ? `Your tier allows ${num(account.tierCap)}` : 'Messages per day'}>
-              <Input type="number" min="1" value={settings.dailyCap}
-                     onChange={e => setSettings(p => ({ ...p, dailyCap: parseInt(e.target.value) || 1 }))} />
+              {/* min 0, and 0 means no cap. Nothing here is per-account: a new
+                  install still walks the warm-up ladder whatever this says, and
+                  the tier above is Meta's number, not one written down here. */}
+              <Input type="number" min="0" value={settings.dailyCap}
+                     onChange={e => setSettings(p => ({ ...p, dailyCap: Math.max(0, parseInt(e.target.value) || 0) }))} />
             </Field>
           </div>
-          {ss.total > 0 && (
+          <p className="text-xs text-muted-foreground">
+            Set the cap to <strong>0</strong> to remove your own limit. Meta still enforces its own
+            messaging tier{account?.tierCap ? ` — currently ${num(account.tierCap)} unique recipients a day` : ''},
+            and sends it later refuses stop counting against the day.
+          </p>
+          {ss.total > 0 && settings.dailyCap > 0 && (
             <p className="text-xs text-muted-foreground">
               {num(ss.total)} contacts ≈ {eta} minute{eta === 1 ? '' : 's'} of sending, spread over {days} day{days === 1 ? '' : 's'} at this cap.
             </p>
@@ -133,15 +144,27 @@ function SettingsView() {
             <div className="flex flex-wrap gap-2">
               {warm.plan.map((cap, i) => (
                 <div key={i} className={cn('rounded-md border px-3 py-1.5 text-xs',
-                  i === warm.step ? 'border-primary bg-primary/10 font-semibold' : 'border-border text-muted-foreground')}>
+                  warm.graduated ? 'border-success/50 bg-success/10 text-muted-foreground'
+                  : i === warm.step ? 'border-primary bg-primary/10 font-semibold'
+                  : 'border-border text-muted-foreground')}>
                   Day {i + 1} · {num(cap)}
                 </div>
               ))}
+              <div className={cn('rounded-md border px-3 py-1.5 text-xs',
+                warm.graduated ? 'border-primary bg-primary/10 font-semibold' : 'border-border text-muted-foreground')}>
+                Then · no ceiling
+              </div>
             </div>
+            {/* The ladder ends. Its job is to prove a new number sends steadily
+                without collecting blocks; once every rung has had a sending day
+                and quality has held, that is proved, and Meta's own messaging
+                tier is the real limit. A quality slip puts it back. */}
             <p className="mt-2 text-xs text-muted-foreground">
-              {warm.sentToday
-                ? `Day ${warm.daysSent} — today's ceiling is ${num(warm.cap)}.`
-                : `Nothing sent today. The first message moves you to day ${warm.daysSent + 1}, ceiling ${num(warm.cap)}.`}
+              {warm.graduated
+                ? `Warm-up complete — ${num(warm.daysSent)} sending days at good quality, so this number is off the ladder. Only your own cap above and Meta's messaging tier apply now. A drop to RED or YELLOW quality puts the ladder back until it recovers.`
+                : warm.sentToday
+                  ? `Day ${warm.daysSent} of ${warm.plan.length} — today's ceiling is ${num(warm.cap)}. After the last rung the ladder ends on its own.`
+                  : `Nothing sent today. The first message moves you to day ${warm.daysSent + 1} of ${warm.plan.length}, ceiling ${num(warm.cap)}.`}
             </p>
           </CardContent>
         </Card>

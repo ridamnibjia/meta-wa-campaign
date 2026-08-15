@@ -12,9 +12,18 @@ const S = {
   // the loop is asleep until the earliest of them comes due. It is deliberately
   // not 'paused' — nobody paused it, and it resumes itself.
   phase:      'idle',   // idle | running | waiting | paused | done
-  failed:     0,        // Graph API rejected the send — no wamid exists, so no row
-  dailyCount: 0,
-  dailyDate:  null,
+  // `failed` is gone too, and for the same reason as the two below. It was an
+  // integer the loop incremented for a send the Graph API refused, and
+  // buildState added it to a count over the message rows — two sources for one
+  // number, with the same contact inside both (an API refusal is ALSO written to
+  // the queue as skipped_reason='failed'). The tile over-reported, and a restart
+  // zeroed the integer while the rows still remembered. The queue answers it now:
+  // services/messages.js:funnelForRun.
+  // dailyCount and dailyDate are deliberately gone. Today's send count is a
+  // query over the message rows — services/warmup.js:dailyCount() — so a send
+  // Meta accepted and then refused stops counting against the cap the moment
+  // the failure webhook lands, and there is no integer left that a restart, a
+  // midnight rollover or a webhook can leave disagreeing with the rows.
   currentRunId: null,   // campaign_runs.id — scopes every derived counter
   failLog:    [],       // last 50 failures
   quality:    null,     // last quality_rating seen from Meta — gates the warm-up climb
@@ -71,13 +80,4 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function todayKey() { return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); }
 
-function checkDaily() {
-  const today = todayKey();
-  if (S.dailyDate !== today) {
-    S.dailyDate  = today;
-    S.dailyCount = 0;
-    log('info', `Daily counter reset — ${today}`);
-  }
-}
-
-module.exports = { S, flags, ACTIVE_PHASES, campaignActive, setIO, emit, log, sleep, todayKey, checkDaily };
+module.exports = { S, flags, ACTIVE_PHASES, campaignActive, setIO, emit, log, sleep, todayKey };

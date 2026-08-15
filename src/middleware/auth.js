@@ -36,10 +36,24 @@ function checkPassword(input) {
   return crypto.timingSafeEqual(a, b);
 }
 
+// Both maps are swept on write rather than on a timer. This URL is public and
+// gets scanned: without a sweep, `attempts` grew one permanent entry per source
+// IP that ever probed /api/login, and `sessions` kept every expired token until
+// somebody happened to present it again. Neither is large per entry, and neither
+// had anything at all that removed them — which is the shape of a leak that only
+// shows up as an OOM months into an uptime.
+//
+// Sweeping on write is enough because both maps only grow on write, and the work
+// is proportional to what is already there rather than to the request.
+function sweep(map, expiryOf, now) {
+  for (const [k, v] of map) if (now > expiryOf(v)) map.delete(k);
+}
+
 function rateLimited(ip) {
   const now = Date.now();
   const rec = attempts.get(ip);
   if (!rec || now > rec.resetAt) {
+    sweep(attempts, r => r.resetAt, now);
     attempts.set(ip, { count: 1, resetAt: now + ATTEMPT_WINDOW_MS });
     return false;
   }
@@ -50,8 +64,10 @@ function rateLimited(ip) {
 const clearAttempts = ip => attempts.delete(ip);
 
 function createSession() {
+  const now = Date.now();
+  sweep(sessions, expiry => expiry, now);
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, Date.now() + SESSION_TTL_MS);
+  sessions.set(token, now + SESSION_TTL_MS);
   return token;
 }
 

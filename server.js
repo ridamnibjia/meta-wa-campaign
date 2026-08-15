@@ -135,6 +135,11 @@ if (require.main === module) {
   // Meta drops the number's quality rating for messaging people who asked you
   // to stop. It folds into contacts.enabled = 0 with reason 'opt_out'.
   migrateOptOuts();
+  // The ladder counts sending days, and warmup.json is the smallest, most
+  // losable file in the deployment. The message rows know the same fact, so a
+  // number that has been sending for months is never put back on rung one
+  // because that file went missing in a move or a restore.
+  require('./src/services/warmup').reconcileWarmupDays();
   resumeIfInterrupted();
   startRetention();
   server.listen(CFG.port, () => {

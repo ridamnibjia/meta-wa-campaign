@@ -25,11 +25,18 @@ const META_ERRORS = {
   131009: ['A parameter value was rejected',          'Usually a variable containing a newline, tab, or 4+ spaces. Check the CSV cell.'],
   131016: ['WhatsApp service temporarily unavailable','Transient on Meta\'s side. Pause and resume in a few minutes.'],
   131021: ['Sender and recipient are the same number','You are messaging your own business number. Remove it from the CSV.'],
-  131026: ['Message undeliverable',                   'Number is not on WhatsApp, or Meta blocked it on quality grounds. Nothing to fix — it is counted as skipped.'],
+  131026: ['Message undeliverable',                   'The number is not on WhatsApp, or Meta blocked it on quality grounds. A property of the number, not of the attempt — nothing to fix, and the contact has been switched off so later campaigns skip it automatically.'],
   131031: ['Account locked for a policy violation',   'Check Business Support Home in Business Manager. Sending stays blocked until resolved.'],
   131042: ['Billing not set up for this business',    'Add or fix the payment method: Business Settings → Billing & Payments. Sends stay blocked until it clears.'],
   131047: ['Outside the 24-hour customer service window', 'Only approved templates can open a conversation. Confirm you are sending the template, not free text.'],
-  131049: ['Meta chose not to deliver this one',      'This recipient hit their per-user marketing limit — a rolling, per-person cap Meta applies across every business messaging them. Not your error. Retry on a later day, or send it as a UTILITY-category template, which the cap does not apply to.'],
+  // Deliberately no longer suggests re-sending this as UTILITY. The category is
+  // about what the message IS, not about which cap it dodges: UTILITY is for
+  // transactional content the customer is expecting — an order update, an
+  // appointment reminder. Re-submitting promotional copy under it is category
+  // misuse, which Meta re-categorises or rejects, and repeat offences cost the
+  // quality rating that gates the messaging tier. The retry ladder is the
+  // answer, and it is already running.
+  131049: ['Meta chose not to deliver this one',      'This recipient hit their per-user marketing limit — a rolling, per-person cap Meta applies across every business messaging them. Not your error, and nothing on your side fixes it. The campaign retries them automatically, three hours apart, up to five more times.'],
   131051: ['Unsupported message type',                'The template was changed after approval. Re-run Check Template.'],
   132000: ['Wrong number of template variables',      'The approved template expects a different variable count than the CSV supplies. Re-run Check Template.'],
   132001: ['Template not found in that language',     'Name or language code does not match an APPROVED template. Check spelling and the language code (en vs en_US).'],

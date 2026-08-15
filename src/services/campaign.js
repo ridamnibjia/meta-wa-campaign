@@ -1,17 +1,17 @@
 'use strict';
 const { CFG, FILES } = require('../config');
 const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
-const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep, todayKey, checkDaily } = require('../state');
+const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep } = require('../state');
 const { broadcast } = require('./status');
 const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
-const { W, warmupCap, effectiveCap, markWarmupDay } = require('./warmup');
-const { recordOutbound, countsForRun, startRun, buildRun, nextPending,
+const { W, warmupCap, effectiveCap, markWarmupDay, dailyCount } = require('./warmup');
+const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
         requeueFailedRecipient, recipientFor,
         nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition } = require('../lib/errors');
-const { deferPastQuietHours } = require('../lib/schedule');
+const { deferPastQuietHours, nextIstMidnight } = require('../lib/schedule');
 const { graphHeaders } = require('./graph');
 const { headerComponent } = require('./media');
 
@@ -27,8 +27,6 @@ const writer = debouncedWriter(FILES.campaign, 2000);
 // which run is current, and how much of today's cap is spent.
 const snapshot = () => ({
   phase:        S.phase,
-  dailyCount:   S.dailyCount,
-  dailyDate:    S.dailyDate,
   config:       S.config,
   // Without this a restart forgets which run is current, applyStatus/recordOutbound
   // fall back to run_id NULL, and a resumed send merges into the inbox-reply /
@@ -54,10 +52,11 @@ function loadCampaign() {
     }
     return null;
   }
+  // dailyCount / dailyDate are not restored, and a file that still carries them
+  // is simply ignored: today's count is derived from the message rows now, so a
+  // restart re-reads it rather than trusting a number written before the crash.
   Object.assign(S, {
     phase:        d.phase        || 'idle',
-    dailyCount:   d.dailyCount   || 0,
-    dailyDate:    d.dailyDate    || null,
     currentRunId: d.currentRunId,
   });
   if (d.config) Object.assign(S.config, d.config);
@@ -210,7 +209,11 @@ const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
 // True when the contact was put back in the queue; false when the caller should
 // record a terminal skip. `row.attempts` is how many retries this contact has
 // already had — the SQL increments it, so it cannot drift.
-function scheduleRetry(contact, row, result, n) {
+// `runId` is passed in rather than read from S here, and for the same reason the
+// loop captures it before the await: this runs after sendTemplate() has resolved,
+// and a /api/reset landing in that window would otherwise park the contact on a
+// null run — a row that matches nothing, so the retry is simply lost.
+function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
   if (skipDisposition(result.errorCode) !== 'retry') return false;
   const made = row.attempts || 0;
   if (made >= RETRY_BACKOFF_MS.length) {
@@ -222,8 +225,32 @@ function scheduleRetry(contact, row, result, n) {
   // the operator, so nudging the deadline anywhere else would leave the queue
   // and the screen disagreeing about when this contact is due.
   const at = deferPastQuietHours(Date.now() + RETRY_BACKOFF_MS[made]);
-  recordRecipientRetry(S.currentRunId, contact.dialStr, result.errorCode, at);
+  recordRecipientRetry(runId, contact.dialStr, result.errorCode, at);
   log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
+  return true;
+}
+
+// ── A number Meta says cannot receive messages ─────────────────────────────────
+// "Not on WhatsApp" is the common case, and it is a fact about the NUMBER rather
+// than about this attempt: no ladder changes the answer, and a contact left
+// enabled burns one send slot on every run for the rest of the list's life.
+//
+// The three places that can learn it — the send response, the delivery-failure
+// webhook, and a test send — all route through here, so none of them can grow a
+// different idea of which codes count. Which ones do is
+// lib/errors.js:skipDisposition; `permanent` is its name for exactly this.
+//
+// disable() writes both the contacts row and the suppressed row, and it is a
+// no-op when the contact is already off for the same reason — so a redelivered
+// webhook, a replayed envelope and a second run all cost nothing. The
+// suppression outlives the contacts row on purpose: re-uploading the CSV brings
+// the person back already switched off.
+//
+// Returns true only on the transition, so the caller logs once.
+function suppressIfPermanent(dialStr, code, name = null, prefix = '') {
+  if (skipDisposition(code) !== 'permanent') return false;
+  if (!disable(dialStr, 'failed_hard', name)) return false;
+  log('warn', `${prefix} ${name || '+' + dialStr} switched off — Meta reports this number as undeliverable (usually: not on WhatsApp), so no later run will try it`.trim());
   return true;
 }
 
@@ -252,16 +279,23 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
   // too; this is the same fact arriving late, and disable() is a no-op when the
   // contact is already off for that reason, so replay is free.
   if (disp === 'permanent') {
-    if (disable(waId, 'failed_hard')) {
-      log('warn', `+${waId} disabled — Meta reports this number as undeliverable, so no campaign will try it again`);
-      broadcast();
-    }
+    if (suppressIfPermanent(waId, code)) broadcast();
     return 'permanent';
   }
   // 'fix' is a fault a human has to correct and 'unclassified' is a code nobody
   // has ruled on. Retrying either unchanged reproduces the failure once per
   // contact, which is the cost the whitelist exists to refuse.
   if (disp !== 'retry') return disp;
+
+  // Only the CURRENT run has anything walking its queue. A campaign finishes,
+  // the operator uploads a new CSV — which opens a new run and makes it current
+  // — and then a late failure webhook arrives for the old one. Requeuing there
+  // un-stamps a wamid nothing will ever re-send: the old run's report flips from
+  // "completed" to "incomplete", that contact moves out of `delivered`/`sent`
+  // and into `retrying`, and the card then promises an attempt that has no loop
+  // to make it. The failure is still recorded on the message row by applyStatus,
+  // which is the honest outcome — the send did fail, and this run is over.
+  if (runId !== S.currentRunId) return 'stale';
 
   const row = recipientFor(runId, waId);
   // No row means the failure belongs to an inbox reply or a run whose queue was
@@ -280,13 +314,15 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
   if (!requeueFailedRecipient(runId, waId, wamid, code, at)) return 'stale';
   log('warn', `+${waId} — back on the queue, retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
 
-  // Reopening a finished run. `S.phase === 'done'` is the test rather than
-  // `!campaignActive()` alone, because it is the one phase that means the loop
-  // ran out of work by itself: a Stop leaves 'idle' and a Reset drops the run
-  // id, and a webhook must not restart a campaign the operator ended. The loop
-  // sets the phase to 'waiting' as soon as it sees the deadline is in the
-  // future, so the dashboard goes back to "In progress — retrying".
-  if (runId === S.currentRunId && S.phase === 'done' && !campaignActive()) {
+  // Reopening a finished run. The run is already known to be the current one —
+  // the guard above returned 'stale' otherwise — so what is left to establish is
+  // that the loop is not already walking it. `S.phase === 'done'` is the test
+  // rather than `!campaignActive()` alone, because it is the one phase that
+  // means the loop ran out of work by itself: a Stop leaves 'idle' and a Reset
+  // drops the run id, and a webhook must not restart a campaign the operator
+  // ended. The loop sets the phase to 'waiting' as soon as it sees the deadline
+  // is in the future, so the dashboard goes back to "In progress — retrying".
+  if (S.phase === 'done' && !campaignActive()) {
     log('info', 'Campaign reopened — a delivery failure came back after it had finished');
     startLoop();
   }
@@ -383,42 +419,48 @@ async function campaignLoop() {
         if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
         continue;
       }
-      const counts = countsForRun(S.currentRunId);
-      const p = progressForRun(S.currentRunId);
-      log('info', `Done — accepted:${counts.accepted} failed:${S.failed} skipped:${p.skipped}`);
+      const f = funnelForRun(S.currentRunId);
+      log('info', `Done — ${f.total} contacts: ${f.delivered} delivered, ${f.sent} awaiting confirmation, `
+        + `${f.failed} failed, ${f.unreachable} not on WhatsApp, ${f.optedOut} opted out`);
       S.phase = 'done'; saveCampaignNow(); broadcast(); break;
     }
-    checkDaily();
-    const cap = effectiveCap();
-    if (S.dailyCount >= cap) {
-      // Compute ms until 00:02 IST regardless of the server's TZ.
-      // IST is UTC+05:30, so offset the current UTC time by +5.5h to get
-      // "IST wall-clock" as a Date, ceil to the next midnight, then undo.
-      const IST_OFFSET_MS = 5.5 * 3600000;
-      const nowMs = Date.now();
-      const istNow = new Date(nowMs + IST_OFFSET_MS);
-      istNow.setUTCHours(0, 2, 0, 0);                  // midnight IST + 2m in UTC terms
-      istNow.setUTCDate(istNow.getUTCDate() + 1);       // next occurrence
-      const nextIstMidnight = istNow.getTime() - IST_OFFSET_MS;
-      const wait = nextIstMidnight - nowMs;
+    // null is "no cap at all": the warm-up ladder is complete (or off) and the
+    // operator has set no number of their own, so how much this number may send
+    // today is Meta's business and the loop does not park for it.
+    const cap   = effectiveCap();
+    const today = dailyCount();
+    if (cap !== null && today >= cap) {
+      const nextMidnight = nextIstMidnight();
+      const wait = nextMidnight - Date.now();
       const h = Math.floor(wait / 3600000), m = Math.floor((wait % 3600000) / 60000);
-      const why = warmupCap() !== null && warmupCap() <= S.config.dailyCap
+      const w = warmupCap();
+      const why = w !== null && w === cap
         ? `Warm-up ceiling for day ${W.days.length}` : 'Daily cap';
-      log('info', `${why} ${S.dailyCount}/${cap} — resuming in ${h}h ${m}m`);
+      log('info', `${why} ${today}/${cap} — resuming in ${h}h ${m}m`);
       S.phase = 'paused'; S.pauseReason = `${why} reached (${cap}/day). Resumes in ${h}h ${m}m.`; broadcast();
       // sleepUntil, not sleep: this wait is up to a full day. A bare sleep here
       // meant a Stop set stopFlag that nothing read until tomorrow — and since
       // `flags.running` stays true until the loop exits, campaignBlocker()
       // refused every Start and every CSV upload for those hours with "still
       // stopping, try again in a second".
-      await sleepUntil(nextIstMidnight);
+      await sleepUntil(nextMidnight);
       if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue;
     }
     // A contact is { name, dialStr } to everything below; run_recipients stores
     // the same two fields under SQL names.
     const contact = { name: c.name, dialStr: c.phone };
-    const p = progressForRun(S.currentRunId);
+    // Read ONCE, before the await, and used for every write about this send.
+    // /api/reset sets S.currentRunId to null synchronously, and it can land while
+    // the loop is inside sendTemplate() — so reading S.currentRunId again after
+    // the await gave the queue stamp a null run (matching no row, leaving the
+    // contact pending) while the message row was filed under run_id NULL, which
+    // is the bucket inbox replies live in and the one countsForRun(null) exists
+    // to keep clean. One template send, mis-filed, and one contact who would be
+    // messaged twice on a resume. The run this message belongs to was decided
+    // when nextPending returned it.
+    const runId = S.currentRunId;
+    const p = progressForRun(runId);
     const n = `[${p.sent + p.skipped + 1}/${p.total}]`;
 
     // Re-checked here, not only at run build: a customer can tap "Stop
@@ -428,7 +470,7 @@ async function campaignLoop() {
       // number is undeliverable" are the same skip to the loop and completely
       // different problems to the operator.
       const why = getRow(contact.dialStr)?.disabled_reason || 'disabled';
-      recordRecipientSkipped(S.currentRunId, contact.dialStr, 'disabled', null);
+      recordRecipientSkipped(runId, contact.dialStr, 'disabled', null);
       log('warn', `${n} skipped — ${contact.name} is disabled (${why})`);
       saveCampaign();
       broadcast();
@@ -437,7 +479,6 @@ async function campaignLoop() {
     log('info', `${n} ${contact.name} +${contact.dialStr}`);
     const result = await sendTemplate(contact);
     if (result.ok) {
-      S.dailyCount++;
       markWarmupDay();
       markMessaged(contact.dialStr);
       // The recipient row is stamped BEFORE the message row. If the process
@@ -445,24 +486,25 @@ async function campaignLoop() {
       // visible in the thread, counted by countsForRun. The other order would
       // leave a sent message the queue still considers pending, and the resume
       // would message that person twice.
-      recordRecipientSent(S.currentRunId, contact.dialStr, result.messageId);
+      recordRecipientSent(runId, contact.dialStr, result.messageId);
       recordOutbound({ wamid: result.messageId, waId: contact.dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, result.params)
                              ?? `[template: ${S.config.templateName}]`,
-                       runId: S.currentRunId });
-      log('success', `${n} accepted — today:${S.dailyCount}/${cap}`);
+                       runId });
+      // Re-read rather than `today + 1`: the message row is already written, and
+      // asking the queue again is what keeps this line and the cap check reading
+      // the same number even when a failure webhook landed mid-send.
+      log('success', `${n} accepted — today:${dailyCount()}/${cap ?? 'no cap'}`);
     } else if (result.skip) {
-      // 131026 is a property of the NUMBER, not of the attempt: not on
-      // WhatsApp, or blocked by Meta on quality grounds. Retrying it is never
-      // right, and left enabled it burns a send slot on every run, forever.
-      // The other skippable codes are about the moment, so they change nothing.
-      if (result.errorCode === 131026 && disable(contact.dialStr, 'failed_hard', contact.name)) {
-        log('warn', `${n} ${contact.name} disabled — Meta reports this number as undeliverable, so later runs will not retry it`);
-      }
+      // A property of the NUMBER, not of the attempt: not on WhatsApp, or
+      // blocked by Meta on quality grounds. Retrying it is never right, and left
+      // enabled it burns a send slot on every run, forever. The other skippable
+      // codes are about the moment, so they change nothing.
+      suppressIfPermanent(contact.dialStr, result.errorCode, contact.name, n);
       // 131049 lands here: the per-person marketing cap is about the moment, so
       // it goes back on the queue rather than out of the run.
-      if (!scheduleRetry(contact, c, result, n)) {
-        recordRecipientSkipped(S.currentRunId, contact.dialStr, 'skipped', result.errorCode);
+      if (!scheduleRetry(contact, c, result, n, runId)) {
+        recordRecipientSkipped(runId, contact.dialStr, 'skipped', result.errorCode);
         log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
       }
     } else if (result.rateLimit) {
@@ -473,15 +515,15 @@ async function campaignLoop() {
       await sleepUntil(Date.now() + result.retryAfter);
       if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue; // retry same contact
-    } else if (!scheduleRetry(contact, c, result, n)) {
-      // Only counted as failed once the ladder is exhausted or the code was
-      // never retryable. A network blip that is about to be retried is not a
-      // failed send, and counting it as one would put a number on the dashboard
-      // that the queue disagrees with.
-      S.failed++;
-      // Recorded on the queue row too, so this person appears in the skip
-      // report rather than only in a 50-entry ring buffer that /api/start wipes.
-      recordRecipientSkipped(S.currentRunId, contact.dialStr, 'failed', result.errorCode);
+    } else if (!scheduleRetry(contact, c, result, n, runId)) {
+      // Not every permanent code arrives with result.skip set — Meta can return
+      // one as a plain rejection — and a number nothing will ever deliver to has
+      // to be switched off whichever branch learns it. No-op for every other code.
+      suppressIfPermanent(contact.dialStr, result.errorCode, contact.name, n);
+      // Recorded ONLY on the queue row. There is no counter to bump: the row is
+      // what the dashboard counts, so a network blip that is about to be retried
+      // cannot show up as a failure and a restart cannot forget one that is.
+      recordRecipientSkipped(runId, contact.dialStr, 'failed', result.errorCode);
       S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: contact.dialStr, name: contact.name, error: result.error, code: result.errorCode, hint: result.hint, attempts: (c.attempts || 0) + 1 });
       if (S.failLog.length > 50) S.failLog.shift();
       log('error', `${n} failed [${result.errorCode}] ${result.error}`);
@@ -489,7 +531,7 @@ async function campaignLoop() {
     }
     saveCampaign();   // debounced — only pacing state; the queue is already on disk
     broadcast();
-    if (!flags.pauseFlag && !flags.stopFlag && nextPending(S.currentRunId)) {
+    if (!flags.pauseFlag && !flags.stopFlag && nextPending(runId)) {
       await sleep(S.config.delaySec * 1000);
     }
   }
@@ -541,7 +583,7 @@ function stageRun(contacts, label = S.config.templateName) {
 }
 
 module.exports = {
-  CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun,
+  CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun, suppressIfPermanent,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
   campaignActive, campaignBlocker, scheduleRetry, handleDeliveryFailure, RETRY_BACKOFF_MS,
 };

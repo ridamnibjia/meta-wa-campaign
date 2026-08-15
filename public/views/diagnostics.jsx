@@ -183,10 +183,13 @@ function Diagnostics() {
       <Card>
         <CardHeader><CardTitle>Sending</CardTitle></CardHeader>
         <CardContent className="divide-y divide-border pt-0">
-          <Row label="Warm-up" value={d.warmup.enabled ? `day ${d.warmup.daysSent || 0} of ${d.warmup.plan.length}` : 'off'} />
+          <Row label="Warm-up" value={!d.warmup.enabled ? 'off'
+            : d.warmup.graduated ? `complete — ${num(d.warmup.daysSent)} sending days`
+            : `day ${d.warmup.daysSent || 0} of ${d.warmup.plan.length}`} />
           <Row label="Warm-up ceiling today" value={d.warmup.cap === null ? 'none' : num(d.warmup.cap)} />
-          <Row label="Cap actually enforced" value={num(d.warmup.effective)} />
-          <Row label="Sent today" value={`${num(d.warmup.dailyCount)} / ${num(d.warmup.effective)}`} />
+          {/* null is no cap at all, not zero. num(null) would print "0". */}
+          <Row label="Cap actually enforced" value={d.warmup.effective === null ? 'none' : num(d.warmup.effective)} />
+          <Row label="Sent today" value={`${num(d.warmup.dailyCount)}${d.warmup.effective === null ? ' (uncapped)' : ` / ${num(d.warmup.effective)}`}`} />
           <Row label="Today (IST)" value={d.warmup.today} />
         </CardContent>
       </Card>
