@@ -265,13 +265,47 @@ async function sendMediaNow(waId, assetId, caption = '') {
   }
 }
 
+// ── What is actually part of the conversation ─────────────────────────────────
+// A transcript is what the two people said to each other. An outbound message
+// Meta refused to deliver reached nobody: the customer has never seen it, has no
+// way to answer it, and does not know it exists. Rendering it in the thread —
+// even tagged "Not delivered" — puts words in our mouth that were never spoken,
+// and an operator skimming a thread before replying reads it as context the
+// customer shares. They do not.
+//
+// It is worse than cosmetic once the retry ladder runs. A contact Meta refuses
+// and we later reach has TWO rows for one message: the refused attempt and the
+// delivered one. The thread showed the same campaign copy twice, which reads as
+// the business having spammed them.
+//
+// The rows are NOT deleted, and must not be. services/messages.js counts them
+// (countsForRun), the funnel joins on them to decide the `gaveUp` bucket,
+// applyStatus needs the row to exist so a redelivered webhook is recognised
+// rather than logged as unknown, and the skip report is the audit trail. The
+// campaign screens are where "we tried and Meta refused" is answered; the inbox
+// is where "what did we say to each other" is answered. Two questions, two
+// surfaces, one set of rows.
+//
+// ONE fragment, interpolated into every query that renders a transcript — the
+// list preview, the page, the count and the search. A second hand-written copy
+// is how the preview starts showing a message the thread below it does not.
+//
+// `IS`, not `=`, and this is not a style choice. status is NULL on an inbound
+// row and on an outbound one Meta has not reported on yet, and in SQL
+// `NULL = 'failed'` is NULL rather than false — so `NOT (dir = 'out' AND NULL)`
+// is `NOT NULL`, which is NULL, which a WHERE clause treats as not-true. The `=`
+// version therefore hid every outbound message that had no status yet: the whole
+// transcript from the moment you sent it until the delivery receipt arrived.
+// SQLite's IS is null-safe equality and yields a real false. There is a test.
+const VISIBLE = `NOT (m.dir = 'out' AND m.status IS 'failed')`;
+
 // ponytail: two correlated subqueries for the preview instead of a join with a
 // window function — 0ms at this scale on the (wa_id, at DESC) index, and it
 // reads like what it does. Revisit if a deployment ever measures otherwise.
 const listThreads = db.prepare(`
   SELECT t.wa_id, t.name, t.unread, t.last_at, t.last_inbound_at,
-         (SELECT m.body FROM messages m WHERE m.wa_id = t.wa_id ORDER BY m.at DESC, m.rowid DESC LIMIT 1) AS preview,
-         (SELECT m.dir  FROM messages m WHERE m.wa_id = t.wa_id ORDER BY m.at DESC, m.rowid DESC LIMIT 1) AS last_dir
+         (SELECT m.body FROM messages m WHERE m.wa_id = t.wa_id AND ${VISIBLE} ORDER BY m.at DESC, m.rowid DESC LIMIT 1) AS preview,
+         (SELECT m.dir  FROM messages m WHERE m.wa_id = t.wa_id AND ${VISIBLE} ORDER BY m.at DESC, m.rowid DESC LIMIT 1) AS last_dir
     FROM threads t
    WHERE (? = 1 OR t.last_inbound_at > 0)
    ORDER BY t.last_at DESC
@@ -299,13 +333,20 @@ const pageOfMessages = db.prepare(`
     FROM messages m
     LEFT JOIN media md        ON md.wamid = m.wamid
     LEFT JOIN media_assets ma ON ma.id = m.asset_id
-   WHERE m.wa_id = ?
+   WHERE m.wa_id = ? AND ${VISIBLE}
      AND (? IS NULL OR m.at < ? OR (m.at = ? AND m.rowid < ?))
    ORDER BY m.at DESC, m.rowid DESC
    LIMIT ?
 `);
 
-const countMessages = db.prepare('SELECT count(*) AS n FROM messages WHERE wa_id = ?');
+const countMessages = db.prepare(`SELECT count(*) AS n FROM messages m WHERE m.wa_id = ? AND ${VISIBLE}`);
+
+// The ones deliberately left out, so the thread can say so in one line rather
+// than leave the operator wondering whether a campaign reached this contact at
+// all. Stating the number is the honest middle: the messages are not in the
+// conversation, and the fact that we tried is not hidden either.
+const countUndelivered = db.prepare(
+  `SELECT count(*) AS n FROM messages m WHERE m.wa_id = ? AND m.dir = 'out' AND m.status = 'failed'`);
 
 // "1712345678901:4821" — opaque to the client, which only ever echoes it back.
 const encodeCursor = r => `${r.at}:${r.rid}`;
@@ -409,6 +450,10 @@ function thread(waId, { now = Date.now(), before = null, limit = PAGE_SIZE } = {
     name: t.name || t.wa_id,
     messages: page.slice().reverse().map(r => toEntry(r, now)),
     total: countMessages.get(waId).n,
+    // Not in the transcript, and not hidden either: the thread states the count
+    // so an operator is never left wondering whether a campaign reached this
+    // contact. Campaign history is where the codes and the reasons live.
+    undelivered: countUndelivered.get(waId).n,
     hasMore,
     // The cursor for the NEXT page back — the oldest row on this one.
     nextBefore: hasMore && page.length ? encodeCursor(page[page.length - 1]) : null,
@@ -432,14 +477,14 @@ function thread(waId, { now = Date.now(), before = null, limit = PAGE_SIZE } = {
 const searchAll = db.prepare(`
   SELECT m.wamid, m.wa_id, m.dir, m.type, m.body, m.at, t.name
     FROM messages m JOIN threads t ON t.wa_id = m.wa_id
-   WHERE m.body LIKE ? ESCAPE '\\'
+   WHERE m.body LIKE ? ESCAPE '\\' AND ${VISIBLE}
    ORDER BY m.at DESC LIMIT ?
 `);
 
 const searchThread = db.prepare(`
   SELECT m.wamid, m.wa_id, m.dir, m.type, m.body, m.at, t.name
     FROM messages m JOIN threads t ON t.wa_id = m.wa_id
-   WHERE m.wa_id = ? AND m.body LIKE ? ESCAPE '\\'
+   WHERE m.wa_id = ? AND m.body LIKE ? ESCAPE '\\' AND ${VISIBLE}
    ORDER BY m.at DESC LIMIT ?
 `);
 

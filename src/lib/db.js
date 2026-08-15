@@ -298,6 +298,24 @@ function openDb(file) {
   d.exec(`INSERT OR IGNORE INTO suppressed (phone, reason, at)
           SELECT phone, disabled_reason, coalesce(disabled_at, first_seen)
             FROM contacts WHERE enabled = 0`);
+  // Backfill for the threads whose last_at was stamped by an outbound Meta then
+  // refused. Those messages are no longer part of the transcript
+  // (services/inbox.js:VISIBLE), so a thread sorted by one was sitting in the
+  // inbox above conversations that had actually moved. applyStatus keeps this
+  // true from now on; this is the same recomputation applied once to the rows
+  // that predate it.
+  //
+  // Scoped to the threads that are actually wrong rather than run over the whole
+  // table, so it is free on every boot after the first. Idempotent either way —
+  // it derives the value rather than adjusting it.
+  d.exec(`UPDATE threads SET last_at = COALESCE(
+            (SELECT max(m.at) FROM messages m
+              WHERE m.wa_id = threads.wa_id AND NOT (m.dir = 'out' AND m.status IS 'failed')),
+            last_inbound_at, 0)
+          WHERE last_at <> COALESCE(
+            (SELECT max(m.at) FROM messages m
+              WHERE m.wa_id = threads.wa_id AND NOT (m.dir = 'out' AND m.status IS 'failed')),
+            last_inbound_at, 0)`);
   return d;
 }
 

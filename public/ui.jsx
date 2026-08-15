@@ -220,8 +220,11 @@ const FUNNEL_ROWS = [
       : 'Failed for a reason that may pass, but this campaign is no longer running, so no further attempt will be made. Put them in a later campaign.') },
   { key: 'pending',     label: 'Not attempted yet',
     hint: 'Still in the queue, in CSV order.' },
+  // Two populations under one label, and the difference matters: some used all
+  // six attempts, and some were never retried at all because their Meta code is
+  // not on the retry whitelist. Each contact's row says which.
   { key: 'failed',      label: 'Failed, given up on', tone: 'text-destructive',
-    hint: 'Every attempt used, or a code that is never worth retrying. Nothing was billed.' },
+    hint: 'Either every attempt was used, or the code was one the app never retries. Open the list — each row says which, and how many times it was tried. Nothing was billed.' },
   { key: 'unreachable', label: 'Cannot receive messages', tone: 'text-destructive',
     hint: 'Meta reports the number as undeliverable — usually not on WhatsApp. Switched off automatically, so later runs skip them.' },
   { key: 'optedOut',    label: 'Opted out or switched off',
@@ -239,7 +242,16 @@ const FunnelContact = ({ r, live }) => (
     <span className="font-mono text-muted-foreground">+{r.phone}</span>
     {r.wasRead && <Badge variant="secondary">read</Badge>}
     {r.code ? <Badge variant="outline">code {r.code}</Badge> : null}
-    {r.attempts > 1 ? <span className="text-muted-foreground">tried {r.attempts}×</span> : null}
+    {/* `attempts` counts RETRIES, so the number of tries is one more. Shown on
+        every given-up row rather than only when it is above one, because "we
+        tried this person six times" and "we tried once and the code was never
+        retryable" are the two completely different stories inside one bucket,
+        and the operator could not tell them apart. */}
+    {(r.bucket === 'failed' || r.bucket === 'unreachable')
+      ? <span className="text-muted-foreground">
+          {r.attempts > 0 ? `tried ${r.attempts + 1}×` : 'tried once · not retried'}
+        </span>
+      : r.attempts > 0 ? <span className="text-muted-foreground">tried {r.attempts + 1}×</span> : null}
     {/* The scheduled time is shown only while something is still walking the
         queue. On a stopped run the column still holds a deadline nothing will
         act on, and printing "next 01:21" beside a campaign that ended an hour
@@ -295,12 +307,36 @@ function Funnel({ funnel, recipients, title, live = true }) {
   // server-side export, and it can only ever contain what the operator is
   // looking at. Quotes are doubled per RFC 4180 so a name with a comma in it
   // survives the round trip into a spreadsheet.
+  //
+  // The leading ﻿ is a UTF-8 byte-order mark, and it is the difference
+  // between "Priyā" and "PriyÄ" when the file is double-clicked: Excel on
+  // Windows decodes a CSV as the system codepage unless a BOM tells it
+  // otherwise. This list is names and phone numbers of real customers, so
+  // mangling them is not cosmetic.
+  //
+  // Attempts is `attempts + 1` for the same reason the row on screen says so —
+  // the column counts retries, and a contact tried once has had zero.
   const csvFor = key => {
     const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const head = 'Name,Phone,Outcome,Meta code,Attempts,What happened\n';
-    return head + rowsFor(key).map(r =>
-      [r.name, '+' + r.phone, key, r.code ?? '', (r.attempts ?? 0), r.explanation ?? '']
+    return '﻿' + head + rowsFor(key).map(r =>
+      [r.name, '+' + r.phone, key, r.code ?? '', (r.attempts ?? 0) + 1, r.explanation ?? '']
         .map(esc).join(',')).join('\n') + '\n';
+  };
+
+  // A Blob, not a data: URI. The whole CSV used to be percent-encoded into the
+  // href of an anchor that was rendered whether or not anyone clicked it — so a
+  // group of twenty thousand contacts built a multi-megabyte string on every
+  // render, and browsers cap data: URLs well below where that lands. Built on
+  // click, handed over, and revoked, so nothing is held.
+  const downloadCsv = key => {
+    const url = URL.createObjectURL(new Blob([csvFor(key)], { type: 'text/csv;charset=utf-8' }));
+    const a = Object.assign(document.createElement('a'), { href: url, download: `${key}-contacts.csv` });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Deferred: revoking synchronously can beat the download starting in Safari.
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   };
 
   return (
@@ -356,11 +392,10 @@ function Funnel({ funnel, recipients, title, live = true }) {
                     <span className="text-[11px] text-muted-foreground">
                       {num(filtered.length)} of {num(openRows.length)}
                     </span>
-                    <a className="text-[11px] font-medium text-primary underline underline-offset-2"
-                       download={`${r.key}-contacts.csv`}
-                       href={'data:text/csv;charset=utf-8,' + encodeURIComponent(csvFor(r.key))}>
+                    <button type="button" onClick={() => downloadCsv(r.key)}
+                       className="text-[11px] font-medium text-primary underline underline-offset-2">
                       Download CSV
-                    </a>
+                    </button>
                   </div>
                   {/* Capped height, not capped rows: an operator looking for one
                       person in eight hundred needs all eight hundred reachable,

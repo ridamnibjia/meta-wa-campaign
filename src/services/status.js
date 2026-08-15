@@ -26,6 +26,7 @@ function buildState() {
   const f        = funnelForRun(S.currentRunId);
   const billable = billableForRun(S.currentRunId);
   const next     = nextPending(S.currentRunId);
+  const retry    = nextRetryForRun(S.currentRunId);
   return {
     phase:          S.phase,
     currentIdx:     p.sent + p.skipped,
@@ -60,11 +61,16 @@ function buildState() {
     // is why "how many were delivered, failed, retried, never attempted" gets
     // its own derived object rather than being assembled in the browser.
     funnel:         f,
-    nextRetry:      nextRetryForRun(S.currentRunId),
+    nextRetry:      retry,
     // What the last send actually did, read from campaign_runs rather than from
     // the current run — so it still answers the question after a Reset, which
     // is exactly when it gets asked.
-    lastRun:        lastRunSummary(),
+    //
+    // Handed the four aggregates already computed above. The last run IS the
+    // current run except in the moments after a Reset, and this function runs on
+    // every broadcast — once per message sent — so re-asking was four queries
+    // per send, one of them a three-table join, for numbers sitting in scope.
+    lastRun:        lastRunSummary({ runId: S.currentRunId, progress: p, counts: c, funnel: f, nextRetry: retry }),
     dailyCount:     dailyCount(),
     // null means no ceiling at all — the ladder is finished (or off) and no cap
     // of the operator's own is set. The UI must render that as "no cap", never

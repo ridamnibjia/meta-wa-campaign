@@ -498,6 +498,21 @@ function Thread({ waId, onBack }) {
         <MediaInfo previewHours={data.previewHours} />
       </div>
 
+      {/* A transcript is what the two people said to each other, so a campaign
+          message Meta refused is not in it — the customer never saw it, cannot
+          answer it and does not know it exists. Stating the count is the honest
+          middle: it is out of the conversation, and the fact that we tried is
+          not hidden. The codes and the reasons live in Campaign history, which
+          is the surface built to answer them. */}
+      {data.undelivered > 0 && (
+        <p className="border-b border-border bg-muted/50 px-4 py-2 text-[11px] text-muted-foreground">
+          {num(data.undelivered)} campaign message{data.undelivered === 1 ? '' : 's'} to this contact
+          {data.undelivered === 1 ? ' was' : ' were'} not delivered by Meta and{' '}
+          {data.undelivered === 1 ? 'is' : 'are'} not shown here — they never reached this person.
+          See <strong>Campaign history</strong> for the reason.
+        </p>
+      )}
+
       <div className="flex-1 space-y-2 overflow-y-auto bg-muted/30 p-4">
         {/* ponytail: a button, not scroll detection. Prepending to a scrolled
             container without the browser jumping needs scroll anchoring that
@@ -535,17 +550,12 @@ function Thread({ waId, onBack }) {
               ) : m.text && m.text !== `[${m.type}]` && (
                 <p className="whitespace-pre-wrap break-words">{m.text}</p>
               )}
-              {/* On the message itself, not only in a fail log that /api/start
-                  wipes. The code is Meta's; the sentence after it is ours. */}
-              {m.error && (
-                <div className="mt-1 rounded border border-destructive/40 bg-destructive/10 px-2 py-1">
-                  <p className="text-[11px] font-medium text-destructive">
-                    Not delivered{m.error.code ? ` · ${m.error.code}` : ''}
-                    {m.error.title ? ` — ${m.error.title}` : ''}
-                  </p>
-                  {m.error.hint && <p className="mt-0.5 text-[10px] text-destructive/80">{m.error.hint}</p>}
-                </div>
-              )}
+              {/* The per-bubble "Not delivered" panel is gone. error_code is
+                  only ever written by markFailed, which also sets
+                  status = 'failed', and a failed outbound is no longer part of
+                  the transcript — so the panel could not render, and a reader
+                  would reasonably expect it to. The banner above states the
+                  count; Campaign history states the codes. */}
               <p className={cn('mt-0.5 text-right text-[10px]', m.dir === 'out' ? 'text-primary-foreground/70' : 'text-muted-foreground')}>
                 {clockTime(m.at)}
               </p>

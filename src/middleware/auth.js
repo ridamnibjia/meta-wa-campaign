@@ -45,7 +45,20 @@ function checkPassword(input) {
 //
 // Sweeping on write is enough because both maps only grow on write, and the work
 // is proportional to what is already there rather than to the request.
+//
+// RATE-LIMITED to once per window, and that matters under exactly the traffic
+// this exists for. Sweeping on every first-sighting of an IP is O(n) per new IP,
+// so a scan from many distinct addresses — which is what a botnet probing a
+// public hostname looks like — made the defence O(n²) in the number of probes
+// and turned the rate limiter into the cheapest way to burn this server's CPU.
+// Entries only expire on a clock, so sweeping more often than the window cannot
+// find anything a once-per-window sweep would miss; it can only cost more.
+const SWEEP_EVERY_MS = 60 * 1000;
+const lastSweep = new Map();   // map → timestamp of its last sweep
+
 function sweep(map, expiryOf, now) {
+  if (now - (lastSweep.get(map) || 0) < SWEEP_EVERY_MS) return;
+  lastSweep.set(map, now);
   for (const [k, v] of map) if (now > expiryOf(v)) map.delete(k);
 }
 

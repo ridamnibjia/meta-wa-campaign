@@ -3620,35 +3620,102 @@ console.log('\ndiagnostics');
   });
 }
 
-console.log('\ninline error badges');
+// ── The transcript is the conversation ────────────────────────────────────────
+// A campaign message Meta refused reached nobody. The customer has never seen
+// it, cannot answer it and does not know it exists, so it is not part of what
+// the two of them said to each other. It used to render as a bubble tagged "Not
+// delivered", which put words in our mouth that were never spoken — and once the
+// retry ladder reaches someone on a later attempt, the SAME copy appeared twice
+// in one thread, reading as the business having spammed them.
+//
+// The ROWS stay. countsForRun counts them, the funnel joins on them to decide
+// the gaveUp bucket, applyStatus needs them so a redelivered webhook is
+// recognised rather than logged as unknown, and the skip report is the audit
+// trail. Campaign history answers "we tried and Meta refused"; the inbox answers
+// "what did we say to each other".
+console.log('\nthe transcript excludes what was never delivered');
 {
-  test('a failed outbound message carries its code, title and what to do', () => {
+  test('a failed outbound is not in the thread, and is counted instead', () => {
     seedThread('910000006661', 'Failed Send', 0, 1700000000000);
     testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status, error_code, error_title)
                     VALUES (?, ?, 'out', 'template', ?, ?, 'failed', ?, ?)`)
       .run('fail-1', '910000006661', 'the message', 1700000000000, 131047, 'Re-engagement message');
-    const m = inboxThread('910000006661').messages.find(x => x.id === 'fail-1');
-    assert.equal(m.status, 'failed');
-    assert.equal(m.error.code, 131047);
-    assert.equal(m.error.title, 'Re-engagement message');
-    assert.match(m.error.hint, /24-hour/, 'the number alone tells an operator nothing');
+    const t = inboxThread('910000006661');
+    assert.equal(t.messages.find(x => x.id === 'fail-1'), undefined,
+      'the recipient never saw this, so it is not something we said to them');
+    assert.equal(t.undelivered, 1,
+      'but the operator is told it happened rather than left wondering whether the campaign reached them');
+    assert.equal(t.total, 0, 'the count matches the list, or the "load earlier" button lies');
   });
 
-  test('a delivered message carries no error object at all', () => {
+  // The three-valued-logic trap, and it is worth a test of its own: status is
+  // NULL on every inbound row and on an outbound one Meta has not reported on
+  // yet. `NULL = 'failed'` is NULL, so `NOT (dir = 'out' AND NULL)` is NULL,
+  // which a WHERE treats as not-true — the `=` spelling of this rule hid every
+  // outbound message from the moment it was sent until its receipt arrived.
+  test('an outbound with no status yet is still in the thread', () => {
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at)
+                    VALUES (?, ?, 'out', 'text', ?, ?)`)
+      .run('nostatus-1', '910000006661', 'just sent', 1700000000001);
+    const t = inboxThread('910000006661');
+    assert.ok(t.messages.some(x => x.id === 'nostatus-1'),
+      'NULL is not "failed" — SQL says NULL, and a WHERE reads that as no');
+    assert.equal(t.undelivered, 1, 'and it is not counted as undelivered either');
+  });
+
+  test('a delivered message is in the thread and carries no error', () => {
     testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status)
                     VALUES (?, ?, 'out', 'template', ?, ?, 'delivered')`)
-      .run('fine-1', '910000006661', 'fine', 1700000000001);
+      .run('fine-1', '910000006661', 'fine', 1700000000002);
     const m = inboxThread('910000006661').messages.find(x => x.id === 'fine-1');
-    assert.equal(m.error, null, 'an empty error object would render an empty badge');
+    assert.ok(m, 'this one actually arrived');
+    assert.equal(m.error, null);
   });
 
-  test('a failure Meta sent no code for still renders rather than breaking', () => {
+  test('an inbound message is never hidden, whatever the outbound rule says', () => {
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at)
+                    VALUES (?, ?, 'in', 'text', ?, ?)`)
+      .run('inb-1', '910000006661', 'their reply', 1700000000003);
+    assert.ok(inboxThread('910000006661').messages.some(x => x.id === 'inb-1'),
+      'the rule is scoped to dir = out — hiding a customer message would be indefensible');
+  });
+
+  test('search does not surface a message that was never delivered', () => {
+    const hits = inboxSearch('the message', { waId: '910000006661' }).messages;
+    assert.equal(hits.some(m => m.id === 'fail-1'), false,
+      'finding it in search and not in the thread is the two disagreeing');
+  });
+
+  test('the thread list previews a delivered message, never a refused one', () => {
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status, error_code)
+                    VALUES (?, ?, 'out', 'template', ?, ?, 'failed', ?)`)
+      .run('fail-3', '910000006661', 'newest but refused', 1700000009999, 131049);
+    const t = inboxSummary({ all: true }).threads.find(x => x.waId === '910000006661');
+    assert.notEqual(t.preview, 'newest but refused',
+      'a preview the thread underneath does not contain is the list lying about the conversation');
+    assert.equal(t.preview, 'their reply', 'the newest thing actually exchanged');
+  });
+
+  // threads.last_at is stamped when the send is ACCEPTED, which is the only
+  // moment available — Meta refuses hours later. Left alone, a thread whose
+  // newest message nobody received sorted above conversations that had actually
+  // moved, showing a preview older than its own timestamp.
+  test('a refused send stops counting towards the thread clock', () => {
+    seedThread('910000006662', 'Clock', 500, 500);
     testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status)
-                    VALUES (?, ?, 'out', 'template', ?, ?, 'failed')`)
-      .run('fail-2', '910000006661', 'no code', 1700000000002);
-    const m = inboxThread('910000006661').messages.find(x => x.id === 'fail-2');
-    assert.equal(m.error.code, null);
-    assert.equal(m.error.hint, null);
+                    VALUES ('clk-in', '910000006662', 'in', 'text', 'hello', 500, NULL)`).run();
+    testDb.prepare(`INSERT OR REPLACE INTO messages (wamid, wa_id, dir, type, body, at, status)
+                    VALUES ('clk-out', '910000006662', 'out', 'template', 'blast', 9000, 'accepted')`).run();
+    testDb.prepare("UPDATE threads SET last_at = 9000 WHERE wa_id = '910000006662'").run();
+
+    applyStatus({ id: 'clk-out', status: 'failed', errors: [{ code: 131049, title: 'capped' }] });
+
+    const row = testDb.prepare("SELECT last_at FROM threads WHERE wa_id = '910000006662'").get();
+    assert.equal(row.last_at, 500,
+      'the clock falls back to the newest message still in the conversation');
+    // Idempotent: Meta redelivers statuses and Replay re-runs stored envelopes.
+    applyStatus({ id: 'clk-out', status: 'failed', errors: [{ code: 131049, title: 'capped' }] });
+    assert.equal(testDb.prepare("SELECT last_at FROM threads WHERE wa_id = '910000006662'").get().last_at, 500);
   });
 }
 
@@ -5920,6 +5987,79 @@ console.log('\nstorage — a file in use is never deleted');
     } finally {
       restore();
       CFGx.accessToken = savedToken; CFGx.phoneNumberId = savedPhone;
+    }
+  });
+}
+
+// ── The one thing that needs the loop itself ──────────────────────────────────
+// Every other test in this file stays out of the campaign loop on purpose. This
+// one cannot: the bug is a race between an HTTP route and an `await` inside the
+// loop, and there is no way to observe it from outside. `fetch` is stubbed so the
+// Reset lands at exactly the wrong moment, every run, rather than sometimes.
+console.log('\na Reset that lands mid-send');
+{
+  const M = require('./server');
+  const { startLoop, flags, buildRun, startRun } = M;
+  const { CFG: CFGr } = require('./src/config');
+  const { FILES: FILESr } = require('./src/config');
+  const fsr = require('node:fs');
+
+  testAsync('a Reset during the send cannot mis-file the message or lose the stamp', async () => {
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, fetch: global.fetch,
+                    days: [...W.days], enabled: W.enabled, delay: S.config.delaySec,
+                    cap: S.config.dailyCap, run: S.currentRunId, phase: S.phase };
+    // These two files live at the repo root and the loop writes both. Snapshot
+    // them, exactly like the warm-up reconciliation test does.
+    const hadC = fsr.existsSync(FILESr.campaign);
+    const prevC = hadC ? fsr.readFileSync(FILESr.campaign) : null;
+    const hadW = fsr.existsSync(FILESr.warmup);
+    const prevW = hadW ? fsr.readFileSync(FILESr.warmup) : null;
+
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p';
+    S.config.delaySec = 1; S.config.dailyCap = 0; S.config.headerAssetId = null;
+    W.enabled = false;
+    // Already a sending day, so markWarmupDay is a no-op and writes nothing.
+    if (!W.days.includes(todayKey())) W.days.push(todayKey());
+
+    const runId = startRun('reset-mid-send');
+    buildRun(runId, [{ dialStr: '919300000001', name: 'Mid' }]);
+    S.currentRunId = runId;
+    S.phase = 'running';
+    flags.stopFlag = false; flags.pauseFlag = false;
+
+    // Meta accepts the send — and the operator presses Reset while we are still
+    // inside this await. That is the whole race, made deterministic.
+    global.fetch = async () => {
+      S.currentRunId = null;                       // what POST /api/reset does
+      return { ok: true, headers: new Map(),
+               json: async () => ({ messages: [{ id: 'wamid.midreset' }] }) };
+    };
+
+    try {
+      startLoop();
+      const until = Date.now() + 8000;
+      while (flags.running && Date.now() < until) await new Promise(r => setTimeout(r, 25));
+      assert.equal(flags.running, false, 'the loop must have finished');
+
+      const row = db.prepare('SELECT wamid, skipped_reason FROM run_recipients WHERE run_id = ? AND phone = ?')
+        .get(runId, '919300000001');
+      assert.equal(row.wamid, 'wamid.midreset',
+        'the queue row must carry the stamp — an unstamped row is a contact the resume would message a second time');
+
+      const msg = db.prepare("SELECT run_id, type FROM messages WHERE wamid = 'wamid.midreset'").get();
+      assert.equal(msg.run_id, runId,
+        'and the message belongs to the run that sent it — run_id NULL is the inbox-reply bucket, '
+        + 'so a template landing there is counted as a customer conversation for ever');
+      assert.equal(countsForRun(runId).accepted, 1, 'which is what makes it countable at all');
+    } finally {
+      global.fetch = saved.fetch;
+      CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
+      S.config.delaySec = saved.delay; S.config.dailyCap = saved.cap;
+      W.days = saved.days; W.enabled = saved.enabled;
+      S.currentRunId = saved.run; S.phase = saved.phase;
+      flags.stopFlag = false; flags.pauseFlag = false;
+      if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
+      if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
     }
   });
 }

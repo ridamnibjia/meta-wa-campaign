@@ -20,6 +20,21 @@ const META_ERRORS = {
   200:    ['Permission error on the WABA',             'The System User needs admin access to this WhatsApp Business Account. Add it under Business Settings → Users.'],
   80007:  ['WABA rate limit reached',                  'Slow down. Raise the delay, or lower the daily cap.'],
   130429: ['Throughput rate limit reached',           'Sending faster than the number is allowed to. The loop retries this contact automatically.'],
+  // Meta holds back a slice of recipients from marketing messages to measure the
+  // effect of the rest. This is that holdout. It is a fact about the RECIPIENT
+  // and about the experiment window — nothing on our side caused it, nothing on
+  // our side fixes it, and the number is perfectly fine.
+  //
+  // Deliberately NOT in RETRY. An experiment window is measured in days or
+  // weeks, so the six attempts over fifteen hours the ladder gives would all
+  // land inside the same holdout and all fail — five guaranteed-useless sends
+  // per contact, and a report that says "retrying" about people who will not be
+  // reached today. It is also NOT permanent: switching the contact off over a
+  // temporary holdout would drop a real customer from every future campaign.
+  // Left unclassified on purpose, which is exactly "reported, never retried,
+  // never written off" — this entry is here so that report is a sentence rather
+  // than a bare number.
+  130472: ['Meta held this one back for an experiment', 'This recipient is in a Meta marketing-message holdout group — a slice of users Meta excludes to measure how the rest respond. Not your error, nothing is wrong with the number, and nothing on your side fixes it. It is not retried, because these windows run for days or weeks and every attempt inside one fails the same way. Include them in a later campaign.'],
   131000: ['Meta-side error, cause unspecified',      'Transient. Retry the campaign; if every send fails, check status at metastatus.com.'],
   131008: ['A required parameter was missing',        'Template variables do not match the approved template. Re-run Check Template.'],
   131009: ['A parameter value was rejected',          'Usually a variable containing a newline, tab, or 4+ spaces. Check the CSV cell.'],

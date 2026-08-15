@@ -420,6 +420,30 @@ Re-uploading the same bytes **revives** the row rather than making a second one,
 because `sha256` is UNIQUE and the tombstone is what history points at. It is
 deliberately not a recycle bin: the bytes really are gone.
 
+**The transcript is the conversation; a refused send is not in it.**
+`services/inbox.js:VISIBLE` is `NOT (m.dir = 'out' AND m.status IS 'failed')`,
+interpolated into the thread page, the list preview, the message count and both
+search queries — one fragment, for the same reason `BUCKET_CASE` is one. A
+message Meta refused reached nobody: the customer has never seen it, cannot
+answer it, and does not know it exists, so rendering it — even tagged "Not
+delivered" — puts words in our mouth that were never spoken, and an operator
+skimming a thread before replying reads it as context the customer shares. Worse
+once the ladder runs: a contact refused and later reached has two rows for one
+message, and the thread showed the same campaign copy twice, which reads as the
+business having spammed them. **The rows are not deleted and must not be** —
+`countsForRun` counts them, `funnelQ` joins on them to reach the `gaveUp` bucket,
+`applyStatus` needs the row so a redelivered webhook is recognised rather than
+logged as unknown, and the skip report is the audit trail. Campaign history
+answers "we tried and Meta refused"; the inbox answers "what did we say to each
+other". The thread payload carries `undelivered` so the operator is told the
+count rather than left wondering, and the per-bubble error panel is gone because
+`error_code` is only ever written by `markFailed`, which also sets the status
+that hides the row. `threads.last_at` is restamped by `applyStatus` on the
+failure and backfilled once in `openDb`: it is stamped when the send is
+*accepted*, which is the only moment available, so without that a thread whose
+newest message nobody received sorted above conversations that had actually
+moved.
+
 **Disabled blocks campaigns only.** `services/inbox.js` does not import
 `services/contacts.js` and a test asserts it never will. Someone who opted out of
 promotions and then writes in with a question still deserves an answer, and
@@ -558,6 +582,15 @@ was never in doubt.
   Repeat the value instead — see `pageOfMessages` in `services/inbox.js`.
 - **Escape `%` and `_` in LIKE patterns.** Unescaped, a search for `50%` matches
   every row.
+- **`= 'x'` is not `IS 'x'` when the column can be NULL, and a negated one fails
+  open in the wrong direction.** `messages.status` is NULL on every inbound row
+  and on an outbound one Meta has not reported on yet. `NULL = 'failed'` is
+  **NULL**, not false — so `NOT (dir = 'out' AND status = 'failed')` evaluates to
+  `NOT NULL` = NULL, and a WHERE clause treats NULL as not-true. Written that
+  way, the inbox visibility rule hid *every* outbound message from the moment it
+  was sent until its delivery receipt arrived. SQLite's `IS` is null-safe
+  equality and yields a real false; the codebase already relies on it for
+  `run_id IS ?`. There is a test asserting a status-less outbound stays visible.
 - **Pagination cursors are `(at, rowid)`, not `at`.** Meta timestamps in whole
   seconds, so ties are routine, and an `at`-only cursor silently drops every
   message that ties with a page boundary.
@@ -593,6 +626,26 @@ was never in doubt.
   5%, about 1 GB on a 20 GB disk). It is neither free nor used by anything, so
   subtracting only `free` folded it into "everything else" and overstated the OS
   by a gigabyte. `volume()` returns it and `overview()` subtracts it separately.
+- **`buildState()` runs once per message sent, so nothing in it may ask twice.**
+  `lastRunSummary(already)` takes the aggregates the caller has just computed and
+  reuses them when the last run *is* the current run — which it is except in the
+  moments after a Reset. It was re-running progress, counts, funnel and nextRetry
+  independently, four aggregates including a three-table join, for numbers
+  already in scope. Passed in rather than memoised: a cache would need
+  invalidating on every webhook, and the point of deriving these numbers is that
+  there is nothing to keep in step.
+- **A sweep that runs per-request turns a defence into an amplifier.** The auth
+  rate limiter's map sweep is throttled to once a minute. Sweeping on every
+  first-sighting of an IP is O(n) per new IP, so a scan from many distinct
+  addresses — exactly what probing a public hostname looks like — made it O(n²)
+  in the number of probes. Entries expire on a clock, so a more frequent sweep
+  cannot find anything a once-per-window one misses.
+- **A CSV the operator downloads needs a UTF-8 BOM and must not be a `data:`
+  URI.** Excel on Windows decodes a BOM-less CSV as the system codepage, which
+  turns a customer's name into mojibake — not cosmetic when the file is a contact
+  list. And the `data:` URI was built into the anchor's href on every render, so
+  a large group serialised megabytes nobody had asked for and hit the browser's
+  URL cap; it is a `Blob` created on click and revoked after.
 - **Frontend scripts share one global scope** and load in the order listed in
   `index.html`. A `const` used by two views belongs in `ui.jsx`, which loads
   first.
@@ -630,6 +683,27 @@ rewritten once with `git filter-repo` to purge real data.
   `CSV-FORMAT.md` and this file.
 - `*.csv` is gitignored except `contacts-template.csv`.
 - The deployment URL and hosting details are not mentioned publicly.
+
+**`failed` holds two populations, and each row says which.** A contact lands in
+"Failed, given up on" either by exhausting all six attempts *or* by carrying a
+code `skipDisposition()` does not name — `unclassified` never retries, so those
+were tried exactly once. On a real run of 775 the bucket was thirteen contacts,
+all `130472`, all with `attempts = 0`: none of them had ever been on the ladder,
+while a hundred `131049`s were still climbing it. The count alone made that look
+impossible ("how did thirteen finish before a hundred that started earlier?"), so
+`FunnelContact` now prints `tried 6×` or `tried once · not retried` on every
+given-up row. `attempts` counts RETRIES, so the number of tries is one more —
+the CSV column follows the same rule.
+
+**`130472` is explained but deliberately unclassified.** It is Meta's marketing
+holdout: a slice of recipients excluded to measure the effect on the rest. Not in
+`RETRY`, because a holdout window runs for days or weeks and all six attempts
+would land inside the same one — five guaranteed-useless sends per contact and a
+report promising retries that cannot work. Not in `PERMANENT` either: switching
+the contact off over a temporary holdout drops a real customer from every future
+campaign. `unclassified` is exactly the behaviour wanted — reported, never
+retried, never written off — and the `META_ERRORS` entry exists so that report is
+a sentence rather than a bare number to look up.
 
 ## Known open items
 

@@ -38,6 +38,24 @@ const markFailed = db.prepare(`
    WHERE wamid = ?
 `);
 
+// threads.last_at is stamped when the send is ACCEPTED, which is the only moment
+// we have — Meta refuses hours later. So a thread whose newest message is one
+// nobody received sorted by that message's clock, and since the transcript no
+// longer renders it (services/inbox.js:VISIBLE) the inbox showed a thread at the
+// top of the list whose preview was older than its own timestamp.
+//
+// Recomputed from the messages that are still part of the conversation, using
+// the same rule the transcript does. COALESCE to last_inbound_at then to 0 for a
+// thread whose every outbound was refused and which never replied: dropping to 0
+// sorts it to the bottom, which is correct — nothing has happened in it.
+const restampThread = db.prepare(`
+  UPDATE threads SET last_at = COALESCE(
+      (SELECT max(m.at) FROM messages m
+        WHERE m.wa_id = threads.wa_id AND NOT (m.dir = 'out' AND m.status IS 'failed')),
+      last_inbound_at, 0)
+   WHERE wa_id = ?
+`);
+
 // run_id travels back with the row because a delivery failure has to be handed
 // to the queue it belongs to, and the wamid is the only thing the webhook
 // carries — see the `failed` branch below.
@@ -70,6 +88,11 @@ function applyStatus(status) {
     // genuinely distinct failure from the operator's view (F6).
     const alreadyFailed = row.status === 'failed';
     markFailed.run(now, code, title, id);
+    // The message just left the conversation, so the thread's clock has to stop
+    // counting it. Idempotent — it recomputes from the rows rather than adjusting
+    // a value — so a redelivered failure webhook costs one UPDATE and changes
+    // nothing.
+    restampThread.run(row.wa_id);
     if (!alreadyFailed) {
       S.failLog.push({ time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }), phone: row.wa_id, error: title, code, hint, source: 'webhook' });
       if (S.failLog.length > 50) S.failLog.shift();
@@ -639,14 +662,29 @@ function recipientsForRun(runId) {
 const lastRunQ = db.prepare(
   'SELECT id, started_at, label, template_lang FROM campaign_runs ORDER BY id DESC LIMIT 1');
 
-function lastRunSummary() {
+// `already` lets the caller hand in the aggregates it has just computed. Almost
+// every call comes from buildState(), which runs on every broadcast — once per
+// message sent — and had already asked progressForRun, countsForRun,
+// funnelForRun and nextRetryForRun about the CURRENT run a few lines earlier.
+// The last run is the current run except in the moments right after a Reset, so
+// that was four aggregate queries, one of them a three-table join, re-answering
+// a question whose answer was already in a local variable.
+//
+// Passed in rather than memoised on purpose: a cache here would need invalidating
+// on every webhook, and the whole point of deriving these numbers is that there
+// is nothing to keep in step. This is the caller saying "I asked a moment ago",
+// which is true within one synchronous snapshot and is not a claim about later.
+function lastRunSummary(already = null) {
   const r = lastRunQ.get();
   if (!r) return null;
-  const progress = progressForRun(r.id);
+  const same     = already && already.runId === r.id;
+  const progress = same ? already.progress : progressForRun(r.id);
   return {
     id: r.id, label: r.label, startedAt: r.started_at, language: r.template_lang,
-    progress, counts: countsForRun(r.id), funnel: funnelForRun(r.id),
-    nextRetry: nextRetryForRun(r.id),
+    progress,
+    counts:    same ? already.counts    : countsForRun(r.id),
+    funnel:    same ? already.funnel    : funnelForRun(r.id),
+    nextRetry: same ? already.nextRetry : nextRetryForRun(r.id),
     // "Unfinished" is a property of the queue, not of S.phase: a run with rows
     // still pending is unfinished even if the process died and forgot it.
     unfinished: progress.pending > 0,
