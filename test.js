@@ -18,6 +18,12 @@ process.env.WA_MEDIA_DIR = require('path').join(
 // deliberately, in its own test, by raising it — so the default here is zero.
 process.env.WA_MEDIA_MIN_FREE_BYTES = '0';
 
+// The loop refuses to send between 23:00 and 07:00 IST. The tests that drive the
+// real loop would otherwise park until morning for anyone running them at night,
+// which is a suite that passes or hangs depending on the wall clock. The gate's
+// own arithmetic is tested directly, against fixed timestamps, further down.
+process.env.WA_QUIET_HOURS = '0';
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
@@ -28,6 +34,8 @@ const {
   buildTemplatePayload, renderBody, normalizePhone, parseCSV, buildParams, verifySignature, explainError, tierToCap, META_ERRORS, S,
   warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W, graduated, dailyCount,
   sentSince, funnelForRun, startOfIstDay, nextIstMidnight, suppressIfPermanent,
+  nextPending, recordRecipientRetry, deferPastQuietHours, USER_PAUSE, progressForRun,
+  strandedWork, sweepWebhookEvents, WEBHOOK_RETENTION_DAYS, RATE_LIMIT_RETRIES,
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
@@ -1392,7 +1400,8 @@ test('the schema creates the thread and run indexes', () => {
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
   assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_cap', 'idx_messages_out_at',
                            'idx_messages_run', 'idx_messages_thread',
-                           'idx_run_recipients_retry', 'idx_run_recipients_seq']);
+                           'idx_run_recipients_pending', 'idx_run_recipients_retry',
+                           'idx_run_recipients_seq']);
 });
 // The two indexes the loop's per-message queries actually need, asserted on the
 // PLAN rather than on the schema — an index that exists but is not chosen is
@@ -1405,12 +1414,23 @@ test('the two per-message queries are answered by an index, not by a scan', () =
   const d = openDb(':memory:');
   const plan = sql => d.prepare('EXPLAIN QUERY PLAN ' + sql).all().map(r => r.detail).join(' | ');
 
-  const pending = plan("SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL "
-    + "AND (skipped_reason IS NULL OR (skipped_reason = 'retry' AND retry_after <= ?)) ORDER BY seq LIMIT 1");
-  assert.match(pending, /idx_run_recipients_seq/,
-    'nextPending must seek the run rather than scan it — this is once per message sent');
-  assert.doesNotMatch(pending, /TEMP B-TREE/,
+  // nextPending is TWO queries now, asked in order, and each half has to be its
+  // own clean seek. Merged into one disjunction they were neither: the WHERE
+  // implied no index's predicate, so SQLite fell back to the primary key plus a
+  // temp b-tree sort — a full scan of the run, once per message sent.
+  const untried = plan('SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL '
+    + 'AND skipped_reason IS NULL ORDER BY seq LIMIT 1');
+  assert.match(untried, /idx_run_recipients_pending/,
+    'the untried half must seek the run rather than scan it — this is once per message sent');
+  assert.doesNotMatch(untried, /TEMP B-TREE/,
     'and the index must supply the ORDER BY, or every send sorts the whole queue again');
+
+  const due = plan("SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL "
+    + "AND skipped_reason = 'retry' AND retry_after <= ? ORDER BY retry_after LIMIT 1");
+  assert.match(due, /idx_run_recipients_retry/,
+    'and the ladder half must use its own partial index, on (run_id, retry_after)');
+  assert.doesNotMatch(due, /TEMP B-TREE/,
+    'which orders by the deadline for free — a sort here means the index was not chosen');
 
   const cap = plan("SELECT count(*) AS n FROM (SELECT wa_id FROM messages WHERE dir = 'out' "
     + "AND type = 'template' AND at >= ? GROUP BY wa_id "
@@ -6062,7 +6082,278 @@ console.log('\na Reset that lands mid-send');
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
     }
   });
+
+  // ── A rate limit that does not clear must not own the campaign ──────────────
+  // The in-loop backoff re-sends the SAME contact, and it used to do so with no
+  // counter at all: a throughput limit the account is genuinely sitting against
+  // parked the whole run on one number, phase stuck on 'paused', every other
+  // contact untouched, and nothing on screen saying it was one number rather
+  // than the account. After RATE_LIMIT_RETRIES the contact goes to the ladder —
+  // 130429 is in skipDisposition's RETRY set — and the loop moves on.
+  testAsync('a rate limit that never clears hands the contact to the ladder instead of the campaign', async () => {
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, fetch: global.fetch,
+                    days: [...W.days], enabled: W.enabled, delay: S.config.delaySec,
+                    cap: S.config.dailyCap, run: S.currentRunId, phase: S.phase };
+    const hadC = fsr.existsSync(FILESr.campaign);
+    const prevC = hadC ? fsr.readFileSync(FILESr.campaign) : null;
+    const hadW = fsr.existsSync(FILESr.warmup);
+    const prevW = hadW ? fsr.readFileSync(FILESr.warmup) : null;
+
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p';
+    S.config.delaySec = 0; S.config.dailyCap = 0; S.config.headerAssetId = null;
+    W.enabled = false;
+    if (!W.days.includes(todayKey())) W.days.push(todayKey());
+
+    const runId = startRun('rate-limited');
+    buildRun(runId, [{ dialStr: '919300000777', name: 'Throttled' }]);
+    S.currentRunId = runId;
+    S.phase = 'running';
+    flags.stopFlag = false; flags.pauseFlag = false;
+
+    // retry-after 0 so the backoff is instant and the test does not wait three
+    // real minutes to find out whether the ceiling exists.
+    let sends = 0;
+    global.fetch = async () => {
+      sends++;
+      return { ok: false, headers: new Map([['retry-after', '0']]),
+               json: async () => ({ error: { code: 130429, message: 'Throughput rate limit reached' } }) };
+    };
+
+    try {
+      startLoop();
+      const until = Date.now() + 8000;
+      const rowQ = db.prepare('SELECT skipped_reason, error_code, attempts, retry_after FROM run_recipients WHERE run_id = ? AND phone = ?');
+      let row;
+      while (Date.now() < until) {
+        row = rowQ.get(runId, '919300000777');
+        if (row.skipped_reason === 'retry') break;
+        await new Promise(r => setTimeout(r, 25));
+      }
+      // The loop is now parked on a three-hour deadline, which is the correct
+      // place for it to be. Stop it so the suite is not.
+      flags.stopFlag = true;
+      const gone = Date.now() + 4000;
+      while (flags.running && Date.now() < gone) await new Promise(r => setTimeout(r, 25));
+
+      assert.equal(row.skipped_reason, 'retry',
+        'the contact belongs on the ladder — a rate limit is about the moment, so it is not a failure to report');
+      assert.equal(row.error_code, 130429, 'stamped with what Meta actually said, for the skip report');
+      assert.ok(row.retry_after > Date.now(),
+        'and parked on a real deadline rather than retried in a tight loop');
+      assert.equal(sends, RATE_LIMIT_RETRIES + 1,
+        `the ceiling has to bite: one send plus ${RATE_LIMIT_RETRIES} in-loop backoffs, then the ladder — `
+        + 'without it this contact is re-sent for as long as the limit lasts and nobody else is reached');
+      assert.equal(flags.running, false, 'and the loop lets go');
+    } finally {
+      global.fetch = saved.fetch;
+      CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
+      S.config.delaySec = saved.delay; S.config.dailyCap = saved.cap;
+      W.days = saved.days; W.enabled = saved.enabled;
+      S.currentRunId = saved.run; S.phase = saved.phase;
+      flags.stopFlag = false; flags.pauseFlag = false;
+      if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
+      if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
+    }
+  });
 }
+
+// ── The send queue's order, and the plan that makes it affordable ─────────────
+test('a contact nobody has tried yet comes before a retry that is due', () => {
+  const runId = startRun('queue-order');
+  buildRun(runId, [
+    { dialStr: '919000000501', name: 'Early' },   // seq 0 — will be put on the ladder
+    { dialStr: '919000000502', name: 'Later' },   // seq 1 — never attempted
+  ]);
+  // Seq 0 failed and its deadline passed an hour ago. Under the old single
+  // query — one WHERE, ORDER BY seq — this row won, because a retry keeps the
+  // seq it was staged with. On a real run that meant a failure at seq 12 coming
+  // due jumped ahead of six hundred people the campaign had never tried once,
+  // spending the day's cap on second attempts while first attempts waited.
+  recordRecipientRetry(runId, '919000000501', 131049, Date.now() - 3600000);
+
+  assert.equal(nextPending(runId).phone, '919000000502',
+    'reaching everyone once is what a campaign is for — the ladder is what happens afterwards');
+
+  // With the untried one out of the way the due retry is next, and not before.
+  db.prepare('UPDATE run_recipients SET wamid = ? WHERE run_id = ? AND phone = ?')
+    .run('wamid.q502', runId, '919000000502');
+  assert.equal(nextPending(runId).phone, '919000000501',
+    'and the ladder still runs — it just runs second');
+});
+
+test('a retry whose deadline has not arrived is not pending', () => {
+  const runId = startRun('queue-deadline');
+  buildRun(runId, [{ dialStr: '919000000503', name: 'Parked' }]);
+  recordRecipientRetry(runId, '919000000503', 131049, Date.now() + 3600000);
+  assert.equal(nextPending(runId), null, 'a deadline in the future is the whole point of the column');
+  // `now` is a parameter so this does not need an hour to pass.
+  assert.equal(nextPending(runId, Date.now() + 3700000).phone, '919000000503',
+    'and it becomes pending on its own, with nothing having to remember it');
+});
+
+// ── Quiet hours are a fact about the clock, not about the deadline ────────────
+// scheduleRetry defers what it WRITES, which is right and already covered. This
+// is the other half: the loop asks the same question of `now` before every send,
+// because a deadline is a promise about when a contact becomes sendable and not
+// about when the loop gets to them. A rung due at 21:30 that a backlog only
+// reaches at 00:02 sends at 00:02 — production did exactly that, 113 marketing
+// templates between midnight and 01:00 IST on a run whose every retry_after had
+// been correctly deferred.
+test('the send gate closes at night and reopens at 08:00, whatever the deadline said', () => {
+  const IST = 5.5 * 3600000;
+  const istAt = (h, m = 0) => Date.UTC(2026, 7, 16, h, m) - IST;   // 2026-08-16 h:m IST
+
+  const at0002 = istAt(0, 2);
+  assert.ok(deferPastQuietHours(at0002) > at0002,
+    '00:02 is inside quiet hours, so a send attempted then must be held');
+  assert.equal(new Date(deferPastQuietHours(at0002) + IST).getUTCHours(), 8,
+    'and held until 08:00 IST, not 07:00 — releasing a whole night at 07:00 sharp wakes people');
+
+  const at1030 = istAt(10, 30);
+  assert.equal(deferPastQuietHours(at1030), at1030,
+    'daytime passes through untouched, or the gate would park a working campaign');
+  const at2200 = istAt(22, 0);
+  assert.equal(deferPastQuietHours(at2200), at2200, '22:00 is still evening, not night');
+  const at2330 = istAt(23, 30);
+  assert.ok(deferPastQuietHours(at2330) > at2330 + 8 * 3600000,
+    '23:30 rolls to the NEXT morning — the pre-midnight half of the window is the one that rolls over');
+});
+
+// ── A crash inside a pause the loop gave itself ───────────────────────────────
+// Every pause except the operator's re-derives its own condition on the next
+// iteration, so resuming costs nothing. Not resuming was a trap: the run sat at
+// 'paused' with no loop behind it, and 'paused' is in ACTIVE_PHASES, so
+// campaignBlocker() then refused every Start and every CSV upload with "a
+// campaign is paused part-way through" until someone found the Stop button.
+test('a restart resumes the loop\'s own pause and respects the operator\'s', () => {
+  const fs2 = require('node:fs');
+  const FILES2 = require('./src/config').FILES;
+  const had = fs2.existsSync(FILES2.campaign);
+  const prev = had ? fs2.readFileSync(FILES2.campaign) : null;
+  const saved = { run: S.currentRunId, phase: S.phase, reason: S.pauseReason };
+  try {
+    const runId = startRun('crash-in-pause');
+    buildRun(runId, [{ dialStr: '919000000504', name: 'Owed a message' }]);
+    assert.equal(progressForRun(runId).pending, 1, 'the queue has someone left, or this proves nothing');
+
+    S.currentRunId = runId;
+    S.phase = 'paused';
+    S.pauseReason = 'Daily cap reached (1000/day). Resumes in 6h 12m.';
+    saveCampaignNow();
+    S.phase = 'idle'; S.pauseReason = null;      // as a fresh boot starts
+
+    resumeIfInterrupted();
+    assert.match(S.pauseReason || '', /Server restarted/,
+      'a cap or quiet-hours pause must pick itself back up — nothing else ever will');
+
+    S.phase = 'paused'; S.pauseReason = USER_PAUSE; saveCampaignNow();
+    S.phase = 'idle'; S.pauseReason = null;
+    resumeIfInterrupted();
+    assert.equal(S.pauseReason, USER_PAUSE,
+      'but a campaign the operator paused stays paused — restarting it is not the server\'s call');
+
+    // A campaign.json from before pauseReason was persisted cannot say who
+    // paused it, and the first boot after an upgrade must not guess "the loop"
+    // and restart a campaign someone stopped on purpose.
+    const fileNow = JSON.parse(fs2.readFileSync(FILES2.campaign, 'utf8'));
+    delete fileNow.pauseReason;
+    fs2.writeFileSync(FILES2.campaign, JSON.stringify(fileNow));
+    S.phase = 'idle'; S.pauseReason = null;
+    resumeIfInterrupted();
+    assert.equal(S.pauseReason, null,
+      'an upgrade with no pauseReason recorded fails closed — it stays paused rather than resuming');
+  } finally {
+    S.currentRunId = saved.run; S.phase = saved.phase; S.pauseReason = saved.reason;
+    if (had) fs2.writeFileSync(FILES2.campaign, prev);
+    else fs2.rmSync(FILES2.campaign, { force: true });
+  }
+});
+
+// ── People an older campaign still owes a message to ─────────────────────────
+test('contacts left on a superseded run are counted, and the current run is not', () => {
+  const saved = S.currentRunId;
+  try {
+    const oldRun = startRun('superseded');
+    buildRun(oldRun, [
+      { dialStr: '919000000601', name: 'Parked' },
+      { dialStr: '919000000602', name: 'Never tried' },
+      { dialStr: '919000000603', name: 'Reached' },
+    ]);
+    recordRecipientRetry(oldRun, '919000000601', 131049, Date.now() + 3600000);
+    recordRecipientSent(oldRun, '919000000603', 'wamid.stranded.603');
+
+    // A new upload opens a new run and makes it current — which is exactly the
+    // moment the old run's unresolved rows stop being anybody's job.
+    const newRun = startRun('the-one-that-is-live');
+    buildRun(newRun, [{ dialStr: '919000000604', name: 'In the live run' }]);
+    S.currentRunId = newRun;
+
+    // Scoped to the runs this test made: earlier tests in the suite leave
+    // unresolved rows of their own, and asserting on the global total would make
+    // this test fail whenever an unrelated one is added.
+    const s = strandedWork(newRun);
+    const row = s.runs.find(r => r.id === oldRun);
+    assert.equal(row.contacts, 2,
+      'one parked on the ladder and one never attempted — a person owed a message is owed it either way');
+    assert.equal(row.retrying, 1, 'and the mid-retry half is named, because it is the one that looks finished');
+    assert.equal(row.label, 'superseded', 'named by the campaign it belonged to, not by a bare id');
+    assert.ok(!s.runs.some(r => r.id === newRun),
+      'the CURRENT run is excluded — a loop is walking it, so its pending rows are progress, not a leak');
+    assert.ok(s.contacts >= row.contacts,
+      'the headline counts every stranded run, not only the ones the banner has room to list');
+
+    // After a Reset there is no current run at all, and `<> NULL` is NULL —
+    // which a WHERE treats as not-true, so an unguarded query would drop every
+    // stranded row from this answer at precisely the moment the operator has no
+    // campaign open and is most likely to be looking for them.
+    S.currentRunId = null;
+    const afterReset = strandedWork(null);
+    assert.equal(afterReset.runs.find(r => r.id === newRun)?.contacts, 1,
+      'with no campaign open, even the last run\'s own unresolved rows are stranded');
+    assert.ok(afterReset.contacts > s.contacts,
+      'so the total can only grow when the current run stops being current');
+  } finally { S.currentRunId = saved; }
+});
+
+// ── Raw envelopes have a lifetime; the replay queue does not ─────────────────
+test('the sweep removes old processed envelopes and never the unprocessed ones', () => {
+  const old = Date.now() - (WEBHOOK_RETENTION_DAYS + 1) * 86400000;
+  const keptId    = recordEnvelope('{"recent":true}');
+  const sweptId   = recordEnvelope('{"old":true}');
+  const replayId  = recordEnvelope('{"old":true,"unparseable":true}');
+  markEnvelopeProcessed(keptId);
+  markEnvelopeProcessed(sweptId);
+  // Age both old rows past the cutoff. The third stays unprocessed on purpose.
+  db.prepare('UPDATE webhook_events SET received_at = ? WHERE id IN (?, ?)').run(old, sweptId, replayId);
+
+  const before = unprocessedWebhookCount();
+  sweepWebhookEvents();
+  const seen = id => db.prepare('SELECT count(*) AS n FROM webhook_events WHERE id = ?').get(id).n;
+
+  assert.equal(seen(sweptId), 0, 'a processed envelope past the window is an audit trail nobody reads');
+  assert.equal(seen(keptId), 1, 'and one inside the window stays');
+  assert.equal(seen(replayId), 1,
+    'but an UNPROCESSED envelope is the only copy of something the parser could not read — '
+    + 'Meta\'s API is push-only, so sweeping one deletes it for good');
+  assert.equal(unprocessedWebhookCount(), before, 'the replay queue is untouched, whatever its age');
+});
+
+// ── A repeated number is merged, and the operator is told ────────────────────
+test('a CSV that lists the same number twice reports the merge rather than hiding it', () => {
+  const csv = Buffer.from(
+    'Name,Phone\n'
+    + 'Asha,+919000000701\n'
+    + 'Rahul,+919000000702\n'
+    + 'Asha again,919000000701\n'      // same number, different formatting
+    + 'Marco,not a phone number\n');
+  const { contacts, skipped, duplicates } = parseCSV(csv);
+
+  assert.equal(contacts.length, 2, 'the merge itself is right — messaging one person twice is the worst outcome here');
+  assert.equal(duplicates.length, 1, 'but it is reported, or a 25-row loss looks the same as a clean file');
+  assert.equal(duplicates[0].row, 4, 'named by the row an operator can go and look at');
+  assert.equal(duplicates[0].firstRow, 2, 'and by the row it collided with, which is the one they have to compare it to');
+  assert.equal(skipped.length, 1, 'a row with no usable number is still a different problem, counted separately');
+});
 
 Promise.all(pending).then(() => {
   console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);

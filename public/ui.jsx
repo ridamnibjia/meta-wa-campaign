@@ -231,6 +231,30 @@ const FUNNEL_ROWS = [
     hint: 'Never attempted. Tapped “Stop promotions”, or you disabled them.' },
 ];
 
+// How many times this contact was actually put on the wire. `attempts` counts
+// RETRIES, so for most rows the answer is one more than the column — but not for
+// all of them, and the two exceptions are the ones an operator would misread:
+//
+//   skipped_reason 'disabled' — switched off BEFORE the queue reached them.
+//     Nothing was sent and nothing was billed, so the honest number is zero.
+//     This is how a contact lands in `optedOut`, and it is also one of the two
+//     populations inside `unreachable` (disabled by an earlier run's hard
+//     failure, never attempted here).
+//   bucket 'retrying' — the next attempt has not happened yet, so the tries so
+//     far are `attempts`, not `attempts + 1`.
+//
+// routes/campaign.js:/campaign/skips already draws exactly these distinctions.
+// This is the same rule on the other screen, and it must not disagree with it.
+const triesFor = r =>
+  (r.skipped_reason === 'disabled' || r.bucket === 'pending') ? 0
+  : r.bucket === 'retrying' ? (r.attempts || 0)
+  : (r.attempts || 0) + 1;
+
+// The same words in the downloaded report as on the card. Derived from the rows
+// rather than typed twice, so a relabelled bucket cannot mean one thing on
+// screen and another in the file someone forwards to a colleague.
+const FUNNEL_LABEL = Object.fromEntries(FUNNEL_ROWS.map(r => [r.key, r.label]));
+
 // One contact inside an opened bucket. The sentence explaining what happened is
 // composed on the SERVER (services/messages.js:recipientsForRun) rather than
 // reassembled from skipped_reason and status here — the log, the API and this
@@ -247,11 +271,17 @@ const FunnelContact = ({ r, live }) => (
         tried this person six times" and "we tried once and the code was never
         retryable" are the two completely different stories inside one bucket,
         and the operator could not tell them apart. */}
+    {/* triesFor, not attempts + 1: a contact switched off before the queue
+        reached them was never put on the wire at all, and "tried once" about
+        someone nothing was sent to is the report inventing an attempt. That is
+        the other population inside `unreachable` — disabled by an earlier run's
+        hard failure — sitting beside contacts this run really did try. */}
     {(r.bucket === 'failed' || r.bucket === 'unreachable')
       ? <span className="text-muted-foreground">
-          {r.attempts > 0 ? `tried ${r.attempts + 1}×` : 'tried once · not retried'}
+          {triesFor(r) === 0 ? 'never attempted'
+            : triesFor(r) > 1 ? `tried ${triesFor(r)}×` : 'tried once · not retried'}
         </span>
-      : r.attempts > 0 ? <span className="text-muted-foreground">tried {r.attempts + 1}×</span> : null}
+      : triesFor(r) > 1 ? <span className="text-muted-foreground">tried {triesFor(r)}×</span> : null}
     {/* The scheduled time is shown only while something is still walking the
         queue. On a stopped run the column still holds a deadline nothing will
         act on, and printing "next 01:21" beside a campaign that ended an hour
@@ -316,12 +346,38 @@ function Funnel({ funnel, recipients, title, live = true }) {
   //
   // Attempts is `attempts + 1` for the same reason the row on screen says so —
   // the column counts retries, and a contact tried once has had zero.
-  const csvFor = key => {
-    const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const head = 'Name,Phone,Outcome,Meta code,Attempts,What happened\n';
-    return '﻿' + head + rowsFor(key).map(r =>
-      [r.name, '+' + r.phone, key, r.code ?? '', (r.attempts ?? 0) + 1, r.explanation ?? '']
-        .map(esc).join(',')).join('\n') + '\n';
+  const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const row = (r, bucket) => [
+    r.name, '+' + r.phone, FUNNEL_LABEL[bucket] || bucket,
+    r.wasRead ? 'yes' : '', r.code ?? '', triesFor(r), r.explanation ?? '',
+  ].map(esc).join(',');
+  const HEAD = 'Name,Phone,Outcome,Read,Meta code,Times tried,What happened\n';
+
+  const csvFor = key => '﻿' + HEAD + rowsFor(key).map(r => row(r, key)).join('\n') + '\n';
+
+  // The whole campaign in one file: the counts an operator quotes to someone
+  // else, then every contact behind them. Two shapes in one CSV on purpose —
+  // a spreadsheet reads ragged rows without complaint, and the alternative is
+  // handing over two files that can be separated from each other.
+  //
+  // The summary is `f`, the same funnel object the card above renders, so the
+  // downloaded file and the screen cannot disagree. The contact rows are
+  // `recipients`, already stamped server-side with the bucket the counts were
+  // made of — nothing here re-derives an outcome.
+  //
+  // Times tried is `attempts + 1`: the column counts RETRIES, so a contact
+  // tried once has had zero of them.
+  const fullReport = () => {
+    const lines = [
+      'Campaign report', '',
+      'Metric,Contacts',
+      `${esc('Total in your CSV')},${f.total}`,
+      ...FUNNEL_ROWS.map(r => `${esc(r.label)},${f[r.key] || 0}`),
+      `${esc('  of which read (already counted in Delivered)')},${f.read || 0}`,
+      '', 'Every contact', HEAD.trim(),
+    ];
+    for (const r of (recipients || [])) lines.push(row(r, r.bucket));
+    return '﻿' + lines.join('\n') + '\n';
   };
 
   // A Blob, not a data: URI. The whole CSV used to be percent-encoded into the
@@ -329,9 +385,9 @@ function Funnel({ funnel, recipients, title, live = true }) {
   // group of twenty thousand contacts built a multi-megabyte string on every
   // render, and browsers cap data: URLs well below where that lands. Built on
   // click, handed over, and revoked, so nothing is held.
-  const downloadCsv = key => {
-    const url = URL.createObjectURL(new Blob([csvFor(key)], { type: 'text/csv;charset=utf-8' }));
-    const a = Object.assign(document.createElement('a'), { href: url, download: `${key}-contacts.csv` });
+  const downloadCsv = (name, text) => {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+    const a = Object.assign(document.createElement('a'), { href: url, download: name });
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -342,11 +398,22 @@ function Funnel({ funnel, recipients, title, live = true }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{title || 'Every contact in this campaign'} — {num(f.total)} from your CSV</CardTitle>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <CardTitle>{title || 'Every contact in this campaign'} — {num(f.total)} from your CSV</CardTitle>
+          {/* Only where the contact rows are actually loaded, which is History.
+              The live Dashboard renders this same card from the state broadcast,
+              and that broadcast deliberately does not carry the list. */}
+          {drillable && (
+            <Button size="sm" variant="outline"
+              onClick={() => downloadCsv('campaign-report.csv', fullReport())}>
+              Download full report
+            </Button>
+          )}
+        </div>
         <CardDescription>
           Each person appears once, and the rows add up to {num(f.total)}.
           Read is counted inside Delivered, not beside it.
-          {drillable && ' Click any row to see exactly who is in it.'}
+          {drillable && ' Click any row to see exactly who is in it, or download the whole campaign as a spreadsheet.'}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-1">
@@ -392,7 +459,7 @@ function Funnel({ funnel, recipients, title, live = true }) {
                     <span className="text-[11px] text-muted-foreground">
                       {num(filtered.length)} of {num(openRows.length)}
                     </span>
-                    <button type="button" onClick={() => downloadCsv(r.key)}
+                    <button type="button" onClick={() => downloadCsv(`${r.key}-contacts.csv`, csvFor(r.key))}
                        className="text-[11px] font-medium text-primary underline underline-offset-2">
                       Download CSV
                     </button>

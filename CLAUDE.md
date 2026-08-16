@@ -323,7 +323,7 @@ re-runs stored envelopes, so an unguarded version would walk a contact down the
 whole ladder without a single extra attempt being made — and would un-send a
 newer attempt when a stale failure for an older wamid arrived late.
 
-**Quiet hours are a deferral, applied before the row is written.**
+**Quiet hours are asked TWICE — of the deadline, and of the clock.**
 `lib/schedule.js` pushes any deadline landing 23:00–07:00 IST to 08:00. Night
 notifications are what recipients block and report, and that feeds the quality
 rating which gates the messaging tier. It is applied inside `scheduleRetry`
@@ -335,6 +335,19 @@ releasing that herd at 07:00 sharp releases it while people are still asleep. Th
 wrap-across-midnight branch is load-bearing — a plain range check is wrong, and
 there is a test for a non-wrapping window that proves it.
 
+That was only half the guard, and the missing half shipped: **a deadline is a
+promise about when a contact becomes SENDABLE, not about when the loop gets to
+them.** A rung due at 21:30 that a backlog only reaches at 00:02 sends at 00:02,
+and production did exactly that — 113 marketing templates between midnight and
+01:00 IST on a run whose every `retry_after` had been correctly deferred.
+`campaignLoop` now asks the same function of `Date.now()` before every send and
+parks until 08:00 if the answer moves. It gates the first pass too: a campaign
+started at 23:30 is the same notification at the same hour, and the quality
+rating does not care which rung woke the recipient up. `QUIET_HOURS` in
+`config.js` exists for `test.js`, which drives the real loop and would otherwise
+park until morning for anyone running the suite at night — it is opt-OUT, env
+only, and deliberately not in the UI.
+
 **The phase string is `waiting`; every label says "In progress".** State and
 presentation are allowed to differ. `ACTIVE_PHASES` (in `src/state.js`),
 `campaignBlocker()`, `resumeIfInterrupted()`, `statusForRun()` and the
@@ -344,6 +357,18 @@ two-loops-on-one-queue double send got in before. The label changed because the
 ladder now runs for up to a day, and an operator who reads "waiting" assumes the
 campaign is stuck and presses Stop — abandoning exactly the contacts it exists to
 recover.
+
+**A pause the loop gave itself resumes after a crash; the operator's does not.**
+`resumeIfInterrupted` used to pick up only `running` and `waiting`, which made a
+crash inside the daily-cap, rate-limit or quiet-hours pause unrecoverable: the
+run sat at `paused` with no loop behind it, and `paused` is in `ACTIVE_PHASES`,
+so `campaignBlocker()` then refused every Start and every CSV upload with "a
+campaign is paused part-way through" until someone thought to press Stop. Every
+automatic pause re-derives its own condition on the next iteration, so resuming
+one costs nothing. The two are told apart by `pauseReason`, which is now in the
+`campaign.json` snapshot for exactly this and is written from the `USER_PAUSE`
+constant rather than a literal — `/api/pause` and the boot check have to agree on
+the string or the trap comes back silently.
 
 **`flags.running` is owned by the loop.** It means "a loop is executing", and only
 `startLoop()` and the loop's own exit may write it. Routes set `stopFlag` /
@@ -559,21 +584,58 @@ message row was filed under `run_id NULL`, the inbox-reply bucket
 `countsForRun(null)` exists to keep clean. One mis-filed template send and one
 contact who would be messaged twice on a resume.
 
+**`nextPending` is TWO queries, and the order is the point twice over.**
+Untried contacts first, then retries that have come due. One `ORDER BY seq` over
+both could not express that, because a retry row keeps the seq it was staged
+with — so a failure at seq 12 coming due jumped ahead of six hundred people the
+run had never attempted, spending the day's cap on second attempts while first
+attempts waited. Reaching everyone once is what a campaign is for; the ladder is
+what happens afterwards. Split, each half is also a clean index seek, which the
+merged version was not: the first is exactly `idx_run_recipients_pending`
+(partial, and it SHRINKS as the run drains), the second exactly
+`idx_run_recipients_retry`, `ORDER BY retry_after` included. The retry half is
+ordered by deadline rather than by seq, because within the ladder the honest
+queue is whose turn came up first.
+
 **An index that exists but is not chosen is worse than no index.** It costs a
 write on every insert and buys nothing, and both of this app's per-message
 queries regressed exactly that way. `nextPending` had a partial index carrying
 `WHERE wamid IS NULL AND skipped_reason IS NULL`; the retry ladder widened the
-query's WHERE into a disjunction that no longer *implies* that predicate, so
+query's WHERE into a disjunction that no longer *implied* that predicate, so
 SQLite silently stopped selecting it and fell back to the primary key plus a temp
-b-tree sort — a full scan of the run, once per message. `idx_run_recipients_seq`
-is plain `(run_id, seq)` for that reason, and the old partial index is dropped in
-`openDb`. `sentSince` (today's cap) grouped by `wa_id`, which made SQLite prefer
+b-tree sort — a full scan of the run, once per message. It was dropped, correctly
+at the time; splitting the query above makes the predicate exact again, so it is
+back and `idx_run_recipients_seq` is left to the report queries that walk a whole
+run in order. `sentSince` (today's cap) grouped by `wa_id`, which made SQLite prefer
 `idx_messages_thread (wa_id, at)` — no way to seek on `at`, so it scanned the
 whole message history on every send, a cost that grows with age rather than with
 load. `idx_messages_cap` is covering, so the range seek answers it without
-touching the table. Both are asserted on the **query plan** in `test.js`, not on
-the schema: the schema test only proves the index exists, which is the half that
-was never in doubt.
+touching the table. All three are asserted on the **query plan** in `test.js`, not
+on the schema: the schema test only proves the index exists, which is the half
+that was never in doubt.
+
+**A rung does not come due all at once, and announcing the gaps was the bug.**
+Each contact's `retry_after` is written when that contact's own failure webhook
+lands, so a rung of a hundred is a hundred deadlines smeared across however long
+the previous rung took to send. `nextPending` returns only what is due this
+instant, so the loop drains them one at a time — send one, nothing due for three
+seconds, send the next. Taking the full `waiting` path for that three-second gap
+is a log line, a **synchronous fsync** (`saveCampaignNow`) and two whole
+`buildState()` rebuilds; on a real 775-contact run it fired **340 times for 549
+retry sends**, the rung took hours instead of minutes, and the ladder's deadlines
+then cascaded past midnight — which is how the quiet-hours bug above got its
+backlog. Waits under `ANNOUNCE_WAIT_MS` are now spent silently: same sleep, no
+phase flap, no fsync, no broadcast. Nothing an operator can act on happens in a
+gap that short.
+
+**`broadcast()` is coalesced, and the trailing edge is what makes that safe.**
+One `buildState()` is eight aggregates over four tables including a three-table
+join, and it is called after every send, every webhook envelope, every phase
+change and every queue write — and Meta batches statuses. Leading edge fires
+straight away so a single event still feels instant; a broadcast dropped inside
+the window is not dropped but deferred to the end of it, so the LAST state always
+arrives. Nothing is cached — every send is a fresh derivation, so a client can be
+shown a slightly late number, never a stale one.
 
 ## Gotchas
 
@@ -694,6 +756,27 @@ impossible ("how did thirteen finish before a hundred that started earlier?"), s
 `FunnelContact` now prints `tried 6×` or `tried once · not retried` on every
 given-up row. `attempts` counts RETRIES, so the number of tries is one more —
 the CSV column follows the same rule.
+
+**"How many times did we try" has three answers, and `triesFor()` in `ui.jsx` is
+the only place that knows them.** `attempts + 1` for a contact that was actually
+sent to; **zero** for `skipped_reason = 'disabled'` — switched off before the
+queue reached them, so nothing went out and nothing was billed, and "tried once"
+about someone we never messaged is the report inventing an attempt; and
+`attempts` exactly for a `retrying` row, whose next go has not happened yet.
+`routes/campaign.js:/campaign/skips` already drew these distinctions and the
+funnel card did not, so the same contact was "never attempted" on one screen and
+"tried once" on the other. The Download-full-report CSV and the on-screen row
+both read this one function.
+
+**The full-campaign report is built in the browser from rows already on screen.**
+`Funnel`'s "Download full report" writes the funnel counts as a `Metric,Contacts`
+block, a blank line, then every contact — one ragged CSV, because two files can
+be separated from each other and a spreadsheet reads ragged rows without
+complaint. The summary is the same `funnel` object the card renders and the rows
+carry the server-stamped `bucket`, so the file and the screen cannot disagree;
+nothing in it re-derives an outcome. It appears only where the contact rows are
+actually loaded — History — because the live state broadcast deliberately does
+not carry the list. UTF-8 BOM and `Blob`-on-click, for the reasons in Gotchas.
 
 **`130472` is explained but deliberately unclassified.** It is Meta's marketing
 holdout: a slice of recipients excluded to measure the effect on the rest. Not in

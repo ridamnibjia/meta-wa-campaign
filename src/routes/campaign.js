@@ -13,7 +13,7 @@ const { fetchAccountInfo } = require('../services/graph');
 const { skipDisposition, explainError } = require('../lib/errors');
 const {
   sendTemplate, missingParams, startLoop, saveCampaignNow, clearCampaignFile,
-  campaignBlocker, campaignActive, suppressIfPermanent,
+  campaignBlocker, campaignActive, suppressIfPermanent, USER_PAUSE,
 } = require('../services/campaign');
 
 const router = express.Router();
@@ -137,7 +137,9 @@ router.post('/start', async (req, res) => {
   res.json({ ok: true });
 });
 
-router.post('/pause',  (req, res) => { flags.pauseFlag = true;  S.phase = 'paused'; S.pauseReason = 'Paused by user'; saveCampaignNow(); broadcast(); log('info', 'Paused'); res.json({ ok: true }); });
+// USER_PAUSE, not a literal: this exact string is what resumeIfInterrupted reads
+// on the next boot to tell an operator's pause from one the loop gave itself.
+router.post('/pause',  (req, res) => { flags.pauseFlag = true;  S.phase = 'paused'; S.pauseReason = USER_PAUSE; saveCampaignNow(); broadcast(); log('info', 'Paused'); res.json({ ok: true }); });
 router.post('/resume', (req, res) => { flags.pauseFlag = false; S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast(); log('info', 'Resumed'); if (!flags.running) startLoop(); res.json({ ok: true }); });
 // stopFlag is a request, not a fact: the loop reads it within a second and then
 // clears `running` itself. Setting `running = false` from here was a lie the loop

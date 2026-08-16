@@ -37,7 +37,7 @@ router.post('/upload-csv', (req, res, next) => {
     // list out from under a running send is not.
     const blocked = campaignBlocker();
     if (blocked) return res.json({ ok: false, error: blocked });
-    const { contacts: parsed, skipped } = parseCSV(req.file.buffer);
+    const { contacts: parsed, skipped, duplicates } = parseCSV(req.file.buffer);
     // The durable list is updated before the send queue, and the upsert
     // deliberately does not touch `enabled`: re-uploading a CSV must never
     // resurrect someone who opted out.
@@ -56,6 +56,14 @@ router.post('/upload-csv', (req, res, next) => {
     if (skipped.length) {
       log('warn', `CSV — ${skipped.length} row(s) had no usable phone number and were not loaded (rows ${skipped.slice(0, 10).map(s => s.row).join(', ')}${skipped.length > 10 ? '…' : ''})`);
     }
+    // Said out loud for the same reason, and at the same level. Collapsing a
+    // repeated number is right — messaging one person twice in one campaign is
+    // the worst outcome available — but a file that lost rows to a broken export
+    // and a file that simply lists a dealer twice are indistinguishable from the
+    // count alone, and only one of them is fine.
+    if (duplicates.length) {
+      log('warn', `CSV — ${duplicates.length} row(s) repeated a number already in the file and were merged, so ${parsed.length} contacts will be messaged once each (rows ${duplicates.slice(0, 10).map(d => d.row).join(', ')}${duplicates.length > 10 ? '…' : ''})`);
+    }
     broadcast();
 
     const rate     = rateFor(S.config.templateCategory);
@@ -63,6 +71,7 @@ router.post('/upload-csv', (req, res, next) => {
     res.json({
       ok: true, count: parsed.length, sample: parsed.slice(0, 5),
       skipped: skipped.length, skippedRows: skipped.slice(0, 20),
+      duplicates: duplicates.length, duplicateRows: duplicates.slice(0, 20),
       newCount: upload.newCount,
       billable, estimate: estimateCost(billable, rate), rate,
     });

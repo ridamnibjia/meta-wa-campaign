@@ -72,6 +72,33 @@ function sweepMedia({ now = Date.now() } = {}) {
   return { swept, freed, errors, previews: previews.length };
 }
 
+// ── Raw webhook envelopes ──────────────────────────────────────────────────────
+// The one store in this app that had no lifetime at all. Every envelope Meta
+// delivers is written before the 200 OK — that is the durability boundary, and
+// it is not optional — but once processed the row is an audit trail, not state:
+// everything it means is already in `messages`, `threads` and `media`.
+//
+// `processed_at IS NOT NULL` is the whole guard, and it is load-bearing. An
+// UNPROCESSED row is the replay queue (services/ingest.js:replayUnprocessed) —
+// an envelope this app stored but could not interpret, kept precisely because it
+// is the only copy of something a parser bug ate. Meta's API is push-only, so
+// deleting one is deleting it for good. Those are never swept, however old.
+//
+// 90 days matches the inbound-media window, so there is one number to remember.
+const WEBHOOK_RETENTION_DAYS = 90;
+
+const oldEnvelopes = db.prepare(`
+  DELETE FROM webhook_events
+   WHERE processed_at IS NOT NULL AND received_at < ?`);
+
+function sweepWebhookEvents({ now = Date.now() } = {}) {
+  const removed = oldEnvelopes.run(now - WEBHOOK_RETENTION_DAYS * DAY_MS).changes;
+  if (removed) {
+    log('info', `Retention sweep removed ${removed} processed webhook envelope(s) — raw envelopes are kept ${WEBHOOK_RETENTION_DAYS} days. Unprocessed ones are never removed.`);
+  }
+  return { removed };
+}
+
 // Once at boot, so a box that was off for a week catches up, and daily after.
 // unref() so the timer never holds the process open — a sweep is housekeeping,
 // not work worth delaying a shutdown for.
@@ -79,10 +106,11 @@ function sweepMedia({ now = Date.now() } = {}) {
 // ponytail: setInterval, not a cron dependency. The requirement is "about once
 // a day", and a restart resetting the clock costs nothing.
 function startRetention() {
-  sweepMedia();
-  const t = setInterval(() => sweepMedia(), DAY_MS);
+  const sweep = () => { sweepMedia(); sweepWebhookEvents(); };
+  sweep();
+  const t = setInterval(sweep, DAY_MS);
   t.unref();
   return t;
 }
 
-module.exports = { sweepMedia, startRetention, DAY_MS };
+module.exports = { sweepMedia, sweepWebhookEvents, startRetention, DAY_MS, WEBHOOK_RETENTION_DAYS };

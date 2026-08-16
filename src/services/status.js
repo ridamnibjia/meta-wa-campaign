@@ -4,7 +4,7 @@ const { S, emit, todayKey } = require('../state');
 const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap, graduated, dailyCount } = require('./warmup');
 const { counts: contactCounts } = require('./contacts');
 const { countsForRun, progressForRun, funnelForRun, nextPending, billableForRun,
-        nextRetryForRun, lastRunSummary } = require('./messages');
+        nextRetryForRun, lastRunSummary, strandedWork } = require('./messages');
 const { rateFor, estimateCost, spentCost } = require('../lib/pricing');
 const inbox = require('./inbox');
 
@@ -62,6 +62,12 @@ function buildState() {
     // its own derived object rather than being assembled in the browser.
     funnel:         f,
     nextRetry:      retry,
+    // Contacts a PREVIOUS run still owes a message to. Nothing walks an old
+    // run's queue, so these people are never reached and no other number on this
+    // screen counts them — the funnel is scoped to the current run by design.
+    // One aggregate over an indexed grouping, and it is normally an empty
+    // result: the common case is a run that finished with nothing left in it.
+    stranded:       strandedWork(S.currentRunId),
     // What the last send actually did, read from campaign_runs rather than from
     // the current run — so it still answers the question after a Reset, which
     // is exactly when it gets asked.
@@ -127,6 +133,32 @@ function buildState() {
   };
 }
 
-function broadcast() { emit('state', buildState()); }
+// ── Coalesced, because buildState() is not cheap and every caller is a firehose ─
+// One buildState() is eight aggregates over four tables, one of them a
+// three-table join. It is called after every send, after every webhook envelope,
+// after every phase change and after every queue write — and Meta batches
+// statuses, so a busy minute is hundreds of full rebuilds pushed down the socket
+// to render numbers that changed by one. A browser paints once either way.
+//
+// Leading edge fires straight away, so a single event still feels instant. The
+// trailing edge is what makes this safe rather than lossy: a broadcast dropped
+// inside the window is not dropped, it is deferred to the end of it, so the LAST
+// state is always delivered. Nothing here is a cache — every send is a fresh
+// derivation, so a client can never be shown a stale number, only a slightly
+// late one.
+//
+// unref'd: a pending repaint must never be the reason the process stays alive.
+const MIN_BROADCAST_MS = 250;
+let timer = null, missed = false;
+
+function broadcast() {
+  if (timer) { missed = true; return; }
+  emit('state', buildState());
+  timer = setTimeout(() => {
+    timer = null;
+    if (missed) { missed = false; broadcast(); }
+  }, MIN_BROADCAST_MS);
+  timer.unref?.();
+}
 
 module.exports = { buildState, broadcast };

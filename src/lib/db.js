@@ -160,16 +160,25 @@ CREATE TABLE IF NOT EXISTS run_recipients (
   attempted_at   INTEGER,
   PRIMARY KEY (run_id, phone)
 );
--- (run_id, seq) and NOT partial, deliberately. There used to be a partial index
--- here carrying "WHERE wamid IS NULL AND skipped_reason IS NULL", and the retry
--- ladder silently killed it: nextPending's WHERE became a DISJUNCTION — pending
--- OR a 'retry' row whose deadline has passed — which no longer implies that
--- predicate, so SQLite stopped choosing the index and fell back to the primary
--- key plus a temp b-tree sort on every call. The loop asks this once per message,
--- so that is a full scan of the run per send: 3.6ms each at 20k recipients, and
--- it grows with the queue. Plain (run_id, seq) is usable whatever the ladder does
--- to the filter, because the run_id seek and the ORDER BY are all it is asked for.
+-- Plain (run_id, seq), for the report queries that walk a whole run in order —
+-- recipientsQ, skippedQ, buildRun's readback.
 CREATE INDEX IF NOT EXISTS idx_run_recipients_seq ON run_recipients(run_id, seq);
+-- The loop's own index, and it is partial on exactly the predicate nextPending's
+-- first half asks: contacts nobody has attempted yet, in send order.
+--
+-- It was dropped once, correctly at the time. The retry ladder had widened
+-- nextPending's WHERE into a DISJUNCTION — untried OR a 'retry' row whose
+-- deadline has passed — which no longer implies this predicate, so SQLite
+-- stopped choosing the index while still paying to maintain it on every write.
+-- Splitting that query back into two (services/messages.js) makes the predicate
+-- exact again, and the index earns its keep: without it the seek degrades to a
+-- scan over every already-resolved row in the run before reaching the first
+-- untried one — O(n) per message, so O(n²) per campaign.
+--
+-- It also SHRINKS as the run drains, which is the property the plain index does
+-- not have: at the end of a 20k run it holds nothing at all.
+CREATE INDEX IF NOT EXISTS idx_run_recipients_pending ON run_recipients(run_id, seq)
+  WHERE wamid IS NULL AND skipped_reason IS NULL;
 
 CREATE TABLE IF NOT EXISTS messages (
   wamid       TEXT PRIMARY KEY,
@@ -280,13 +289,6 @@ function openDb(file) {
   d.exec(`CREATE INDEX IF NOT EXISTS idx_run_recipients_retry
             ON run_recipients(run_id, retry_after)
             WHERE skipped_reason = 'retry' AND wamid IS NULL`);
-  // The partial index idx_run_recipients_seq replaces. Every database created
-  // before this change still carries it, and it is not merely unused: SQLite
-  // maintains it on every insert and every UPDATE that touches wamid or
-  // skipped_reason — which is both of the writes this table exists for — to
-  // answer a query that no longer selects it. IF EXISTS, so this is a no-op on a
-  // fresh install and runs once on an upgrade.
-  d.exec('DROP INDEX IF EXISTS idx_run_recipients_pending');
   // A file an operator deleted while history still pointed at it. The row stays
   // so the template and the sent message can still name what they sent; the
   // bytes are gone. NULL means the file is really here.

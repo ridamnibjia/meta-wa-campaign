@@ -1,0 +1,21 @@
+[Unit]
+Description=Run the WA Campaign backup nightly
+
+[Timer]
+# 21:30 UTC = 03:00 IST. Two reasons for that hour and not another:
+#
+#   It is inside the app's own quiet-hours window (23:00-07:00 IST), so the
+#   campaign loop is parked and the database is at its quietest.
+#
+#   It is ninety minutes before the disk snapshot schedule at 23:00 UTC, so
+#   every snapshot carries a backup taken that same night. The snapshot is what
+#   gets the files off the machine; this is what makes them restorable in
+#   seconds instead of as a new disk, a new VM and a new public IP.
+OnCalendar=*-*-* 21:30:00 UTC
+# A box that was off overnight still backs up when it comes back, rather than
+# skipping silently until tomorrow.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

@@ -80,6 +80,34 @@ function Dashboard() {
         </Alert>
       )}
 
+      {/* ── People an older campaign still owes a message to ──────────────
+          Only the CURRENT run has a loop walking it. Upload a new CSV over a
+          campaign that had contacts parked on the retry ladder and those people
+          are stranded: the ladder deliberately refuses to reopen a run nothing
+          points at (it would promise an attempt that will never be made), and
+          every number on this screen is scoped to the current run, so nothing
+          else counts them. They were invisible — production had a contact
+          sitting on an old run with four attempts behind it and a deadline a day
+          and a half in the past, on no screen anywhere.
+
+          It says what happened and what to do, and stops there. A button that
+          reopened the old run is how a campaign messages people twice. */}
+      {ss.stranded && ss.stranded.contacts > 0 && (
+        <Alert variant="warning" title={`${num(ss.stranded.contacts)} ${ss.stranded.contacts === 1 ? 'contact from an earlier campaign was' : 'contacts from earlier campaigns were'} never reached`}>
+          Nothing is walking those campaigns any more, so no further attempt will be made —
+          starting a new campaign is what leaves them behind, and it is not undone by finishing this one.
+          Put them in a later CSV to try again.
+          <span className="mt-1 block">
+            {ss.stranded.runs.map(r => (
+              <span key={r.id} className="mr-3 inline-block whitespace-nowrap">
+                {r.label || `run ${r.id}`}: {num(r.contacts)}
+                {r.retrying > 0 && ` (${num(r.retrying)} mid-retry)`}
+              </span>
+            ))}
+          </span>
+        </Alert>
+      )}
+
       {/* ── The last campaign ────────────────────────────────────────
           Derived from campaign_runs, so it survives a Reset and a restart and
           still answers "what did the last send actually do". `unfinished` is a

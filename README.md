@@ -12,7 +12,8 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 - **Warm-up ladder.** A brand-new number climbs `20 → 50 → 100 → 250 → 500 → 1000` per sending day, holds its rung if quality drops to YELLOW or RED, and graduates off the ladder entirely once it has walked the whole thing at good quality.
 - **One-tap opt-out.** A "Stop promotions" button on every template; taps arrive by webhook and disable that contact for campaigns — while leaving them replyable in the inbox.
 - **Two-way inbox with attachments.** Inbound replies are threaded, and you can reply free-form — text or a file — inside Meta's 24-hour customer-service window. Files come from a reusable library, so one price list is uploaded once and sent to any number of contacts.
-- **Campaign history.** Every past campaign with its start and end, the message body *as it was sent*, and who was reached, delivered to, read by, or missed and why.
+- **Campaign history, with a downloadable report.** Every past campaign with its start and end, the message body *as it was sent*, and who was reached, delivered to, read by, or missed and why — plus a one-click spreadsheet of the whole thing: totals per outcome, then every contact with Meta's code, how many times they were tried, and what it means.
+- **A retry ladder that respects the night.** A failure about the moment rather than about the number goes back on the queue — six attempts, three hours apart — entered both from the send response *and* from the late `failed` webhook Meta actually uses. Nothing goes out between 23:00 and 07:00 IST, checked against the clock at send time and not only when the deadline is written.
 - **Storage management.** One page showing what the disk holds, what it is filled with, and what can safely be removed — with a hard line between files you uploaded and customer files under a retention promise.
 - **Cost estimates** before you start and a running spend figure while you send, per Meta's per-message pricing.
 - **Password gate.** The whole API and the socket sit behind one password. Without `APP_PASSWORD` set, the app refuses to serve anything rather than opening up.
@@ -283,6 +284,13 @@ Headers are matched by name, so extra columns and any column order are fine.
 Numbers are stripped to digits, given a `91` prefix if they are a bare 10 digits,
 and de-duplicated. Toll-free prefixes are dropped.
 
+**A repeated number is merged, and you are told.** The same number twice in one
+file is one contact and one message — messaging a person twice in one campaign is
+the worst outcome available here — but the upload reports how many rows were
+merged and which line numbers they were on. A file that lost 25 rows to a broken
+export and a file that simply lists 25 dealers twice produce the same contact
+count, and only one of them is fine.
+
 **[Full format rules, edge cases and gotchas → CSV-FORMAT.md](CSV-FORMAT.md)**
 
 Fields are parsed per RFC 4180, so a quoted name like `"Doe, John"` does not
@@ -360,11 +368,36 @@ A send that fails for a reason about the **moment** rather than about the
 Meta fault, or `131049` (the per-person marketing cap, which is counted across
 every business messaging that person and has nothing to do with your settings).
 
-Six attempts in all — the original, then five more three hours apart. Any rung
-that would land between 23:00 and 07:00 IST is deferred to 08:00, because a
-notification at 3am is what gets a business blocked and reported, and that feeds
-the quality rating which gates your messaging limit. The ladder is therefore 15
-hours of sending time spread over at most about a day.
+Six attempts in all — the original, then five more three hours apart. The ladder
+is therefore 15 hours of sending time spread over at most about a day.
+
+**The ladder has two entrances, and the second is the busy one.** Meta answers
+most sends with HTTP 200 and a message id and only decides minutes or hours later
+that it will not deliver, over a `failed` status webhook — which is how `131049`
+almost always arrives. Both the send-time failure and the late webhook feed the
+same ladder and the same whitelist, so a run does not close with a contact that
+Meta accepted and then refused.
+
+### Quiet hours
+
+Nothing goes out between **23:00 and 07:00 IST**. A notification at 3am is what
+gets a business blocked and reported, and that feeds the quality rating which
+gates your messaging limit.
+
+This is checked twice, because once was not enough:
+
+- Any retry deadline that would land in the window is moved to **08:00** when it
+  is written. (08:00 and not 07:00 on purpose — a whole night of deferred retries
+  comes due at one instant, and releasing that herd at 07:00 sharp releases it
+  while people are still asleep.)
+- The loop also checks the **clock** before every single send, retry or not. A
+  deadline is a promise about when a contact becomes sendable, not about when the
+  loop reaches them: a backlog due at 21:30 that the loop only gets to at 00:02
+  sends at 00:02, and that is exactly what happened before this check existed.
+  A campaign started at 23:30 parks until 08:00 for the same reason.
+
+Set `WA_QUIET_HOURS=0` to disable it. There is no UI switch — sending marketing
+at 3am should take writing it down in a file.
 
 The deadline is a column on the queue row (`run_recipients.retry_after`), not a
 timer in memory, so it survives a restart and the campaign resumes its own wait.
@@ -385,6 +418,20 @@ sent inside that window is subject to the cap, or to template pricing.
 Before this, one DNS blip at contact #340 dropped that person from the run
 permanently, and the only way to reach them was re-uploading the CSV — which
 opens a new run and messages everyone a second time.
+
+**Untried contacts always come before due retries.** A retry keeps the CSV
+position it was staged with, so ordering the queue by position alone let a
+failure near the top of the list jump ahead of hundreds of people the campaign
+had never attempted — spending the day's cap on second attempts while first
+attempts waited. Reaching everyone once is what a campaign is for; the ladder is
+what happens afterwards.
+
+**Uploading a new CSV strands whatever the last campaign had not finished.** Only
+the current run has a loop walking it, so contacts parked on an old run's ladder
+are never reached — and the ladder deliberately refuses to reopen a campaign
+nothing points at, because that would promise an attempt nobody will make. The
+Dashboard says so: a banner names how many contacts from earlier campaigns were
+never reached, and which campaigns they were on. Put them in a later CSV.
 
 ### Search
 
@@ -432,6 +479,19 @@ does not rewrite history — plus the breakdown below and the full recipient lis
 **Click any group to see exactly who is in it** — name, number, Meta's code, how
 many attempts were made and a plain-English explanation — with a search box and a
 CSV download of that group.
+
+**Download full report** gives you the whole campaign in one spreadsheet: the
+group counts as a summary block, then every contact with their outcome, whether
+they read it, Meta's code, how many times they were tried, and the plain-English
+explanation. The summary is the same object the card on screen renders and each
+row carries the outcome the server stamped on it, so the file and the page cannot
+disagree. It carries a UTF-8 byte-order mark, so Excel on Windows does not turn a
+customer's name into mojibake.
+
+"How many times tried" is honest about three different cases: a contact switched
+off before the queue reached them shows **0** — nothing was sent and nothing was
+billed — a contact still on the ladder shows the tries made *so far*, and
+everyone else shows the total.
 
 Nothing here is stored as a summary. Both the count and the list behind it come
 from one SQL rule applied to one table, so the number on the card and the names
@@ -503,6 +563,11 @@ WhatsApp id, a status only ever moves forward, and an already-recorded opt-out
 is not recorded again. An envelope that still cannot be parsed is kept rather
 than marked done, because it is the only copy of what Meta sent.
 
+Raw envelopes are swept after **90 days**, on the same daily timer as the media
+retention sweep. Only *processed* ones: an unprocessed envelope is the replay
+queue, and Meta's API is push-only, so deleting one deletes it for good — those
+are kept however old they get.
+
 ---
 
 ## 7. Project Structure
@@ -530,10 +595,19 @@ meta-wa-campaign/
 │   ├── app.jsx          API client, session gate, socket, hash router
 │   └── views/           dashboard, campaign, inbox, settings, diagnostics
 │
-├── test.js              Self-check for the pure functions — `node test.js`
-│                        No framework. Covers template validation, payload
-│                        building, phone normalising, pricing maths, the 24h
-│                        reply window, webhook durability and auth
+├── scripts/
+│   ├── backup.sh        Nightly VACUUM INTO + state files, keep 7
+│   ├── vacuum-into.js   The consistent DB copy, verified before it counts
+│   ├── wa-backup.service
+│   └── wa-backup.timer  systemd units — 21:30 UTC / 03:00 IST
+│
+├── test.js              Self-check — `node test.js`, ~5s, no framework and no
+│                        fixtures. Runs against an in-memory database and temp
+│                        directories, so it never touches the repo's own state.
+│                        Covers template validation, payload building, phone
+│                        normalising, pricing maths, the 24h reply window, the
+│                        retry ladder and quiet hours, queue ordering and its
+│                        query PLANS, webhook durability, retention and auth
 │
 ├── CSV-FORMAT.md        What the contact CSV parser accepts
 ├── contacts-template.csv  Sample contact list to fill in
@@ -602,11 +676,14 @@ from the built-in `node:sqlite` module this app stores messages in, and it is
 deliberately not suppressed: it is Node's own way of telling a self-hoster if
 that module's behaviour is about to change in a future release.
 
-Run the self-check any time — no framework, no network, ~1 second:
+Run the self-check any time — no framework, no network, ~5 seconds:
 
 ```bash
-node test.js     # 176 cases
+npm test         # 564 cases
 ```
+
+It runs against an in-memory database and temp directories, so it never touches
+the repo's own state files. Run it before every commit.
 
 ### The three-step flow
 
@@ -742,16 +819,61 @@ server therefore produces a backup that is silently missing recent messages,
 statuses and queue rows — and Meta's API is push-only, so nothing lost that way
 can be fetched back.
 
-Either stop the service first, or let SQLite do it live:
+`scripts/backup.sh` does it correctly, and is safe to run while a campaign is
+sending:
 
 ```bash
-sqlite3 wa.db ".backup '/backups/wa-$(date +%F).db'"   # safe while running
+sh scripts/backup.sh          # writes ~/backups/<ISO timestamp>/
 ```
 
-Back up `warmup.json` and `campaign.json` beside it. Nothing else on disk is
-state — `.env` is credentials, and `media/` and `uploads/` are files you can
-re-upload. `warmup.json` is reconciled against the message store at every boot,
-so losing it alone is recoverable; losing the database is not.
+It uses SQLite's `VACUUM INTO`, which takes a read transaction — consistent as of
+the instant it starts, no service stop, no lock on the app — then **opens the
+copy and runs `PRAGMA integrity_check` on it**. A copy nobody has read is not a
+backup. It also copies `warmup.json`, `campaign.json` and a tarball of
+`uploads/`, keeps the newest 7, and publishes each night's directory only once
+everything above succeeded, so a run that died half way through can never be
+mistaken for last night's.
+
+`media/` is deliberately **not** backed up: inbound customer files expire at 90
+days by design, and restoring them past their own retention would undo a promise
+the UI made. `.env` is credentials, not state — keep it wherever you keep
+secrets. `warmup.json` is reconciled against the message store at every boot, so
+losing it alone is recoverable; losing the database is not.
+
+To run it nightly, install the two units in `scripts/`:
+
+```bash
+sudo cp scripts/wa-backup.service scripts/wa-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wa-backup.timer
+systemctl list-timers wa-backup.timer      # confirm the next run
+```
+
+The timer fires at 21:30 UTC — 03:00 IST, inside the app's own quiet-hours
+window, so the database is at its quietest. `Persistent=true` means a box that
+was off overnight backs up when it returns rather than skipping silently.
+
+**Restoring** is a file copy, which is the whole point of doing this on top of
+whatever disk-level snapshots your host takes:
+
+```bash
+sudo systemctl stop wa-campaign
+cp ~/backups/<stamp>/wa.db       ~/app/wa.db
+rm -f ~/app/wa.db-wal ~/app/wa.db-shm    # the copy is already checkpointed
+cp ~/backups/<stamp>/warmup.json ~/app/warmup.json
+tar -xzf ~/backups/<stamp>/uploads.tar.gz -C ~/app
+sudo systemctl start wa-campaign
+```
+
+Deleting the `-wal` and `-shm` sidecars matters: they belong to the database you
+just replaced, and leaving them beside a different file is how a restore turns
+into a corrupt database.
+
+If you are on a cloud VM, take disk snapshots as well — they cover losing the
+machine, which a backup on that same machine does not. The two are complements:
+snapshots restore a *host*, this restores a *database*, including from the case a
+snapshot cannot help with — a database that is intact but wrong, and has been
+faithfully snapshotted that way every night.
 
 ---
 
@@ -920,22 +1042,42 @@ querying `messages`, not incremented by hand.
 while true:
   if stopFlag → exit
   if pauseFlag → sleep 500ms, continue
-  ask the queue for the next contact (SQL, never a counter)
+
+  ask the queue for the next contact (SQL, never a counter):
+      first an untried row, in CSV order
+      then a retry row whose deadline has passed, soonest first
   if none right now:
-      if any contact is on the retry ladder → phase = waiting,
-          sleep in 1s slices until the earliest deadline, continue
+      if any contact is on the retry ladder:
+          near deadline (<60s) → sleep to it quietly and continue
+          further off        → phase = waiting, announce it, sleep in 1s
+                               slices to the deadline, continue
       else → phase = done, exit
-  if daily cap reached → sleep until midnight IST, continue
-  if contact was disabled since the queue was built → record 'disabled', continue
+
+  if daily cap reached      → sleep until midnight IST, continue
+  if inside quiet hours     → sleep until 08:00 IST, continue
+  if contact disabled since the queue was built → record 'disabled', continue
+
   POST to Meta API with template name + recipient phone
-  if 429 rate limit → sleep retry-after seconds, retry same contact
-  if the error code is retryable and attempts remain
-      → stamp retry_after on the row (1h → 2h → 4h), continue
-  if skip code (opted out / undeliverable) → record 'skipped', continue
-  if other error → increment failed, log it, continue
-  increment accepted, sleep delaySec seconds
-  broadcast updated state to all connected browsers via Socket.io
+
+  if rate limited  → sleep retry-after, retry the SAME contact,
+                     up to 3 times; after that fall through to the ladder
+  if retryable and attempts remain
+                   → stamp retry_after on the row (+3h, deferred past
+                     quiet hours), continue
+  if undeliverable → disable the contact, record it, continue
+  if other error   → record 'failed' on the queue row, log it, continue
+
+  stamp the queue row, then write the message row, sleep delaySec
+  broadcast the derived state to all browsers (coalesced, 4/second max)
 ```
+
+The "quietly" in that third branch is not a detail. Each contact's retry deadline
+is written when its own failure webhook lands, so a rung of a hundred is a
+hundred deadlines smeared over minutes — and taking the full announce-and-save
+path for every three-second gap between them cost a log line, a synchronous
+`fsync` and two whole state rebuilds *per contact*. On a real 775-contact run
+that fired 340 times, the rung took hours instead of minutes, and the deadlines
+it pushed out then cascaded past midnight.
 
 **Meta API call (one send):**
 ```
@@ -960,7 +1102,11 @@ Response from Meta:
 { "messages": [{ "id": "wamid.HBgL..." }] }
 ```
 
-The message ID is stored in `S.msgIndex`. When the webhook later reports `delivered` or `read` for that ID, the counter is incremented and broadcast to the UI.
+That message id is written to the `messages` table and stamped onto the queue
+row. When the webhook later reports `delivered`, `read` or `failed` for it, the
+row is updated — and every counter on screen is a `GROUP BY` over those rows
+rather than an integer somebody incremented, so there is nothing that can drift
+out of step with the messages it counts.
 
 **Phone normalisation:** Indian numbers in any format (`9000000001`, `+91 90000 00001`, `09000000001`) are all normalised to `919000000001` — the format Meta requires (no `+`, digits only, country code prefix). A bare 10-digit number is assumed Indian; outside India write the full international form. Full rules in [CSV-FORMAT.md](CSV-FORMAT.md).
 
@@ -1032,6 +1178,15 @@ a working default.
 | `TEMPLATE_CATEGORY` | `MARKETING` | Drives the cost estimate. |
 | `API_VERSION` | `v23.0` | Meta Graph API version. |
 | `PORT` | `3000` | Server port. |
+| `WA_QUIET_HOURS` | on | Set to `0` to let campaigns send between 23:00 and 07:00 IST. Deliberately env-only — there is no UI switch, because night notifications are what get a number blocked and reported. |
+
+### Backup (`scripts/backup.sh` only — the app never reads these)
+
+| Variable | Default | Description |
+|---|---|---|
+| `WA_APP_DIR` | `/home/earlyearnly/app` | Where `wa.db` and the state files live. |
+| `WA_BACKUP_DIR` | `/home/earlyearnly/backups` | Where nightly backups are written. |
+| `WA_BACKUP_KEEP` | `7` | How many nightly directories to keep. |
 
 ### Inbound media safety
 
@@ -1042,6 +1197,7 @@ See [Inbound customer media](#inbound-customer-media) for what these actually do
 | `CLAMAV_ADDRESS` | unset | Unix socket path (`/var/run/clamav/clamd.ctl`) or `host:port` for `clamd`. Unset disables scanning and files are labelled "not virus-scanned". Set but unreachable **refuses saves** rather than silently passing them. Budget ~1 GB RAM for `clamd` and ~4 GB on the machine; under 3 GB the app warns at boot. |
 | `CLAMAV_TIMEOUT_MS` | `30000` | How long to wait for a scan verdict before refusing the save. |
 | `WA_MEDIA_RETENTION_DAYS` | `90` | How long a saved inbound file stays on this server. The row survives the sweep; only the bytes go. |
+| `WA_MEDIA_PREVIEW_HOURS` | `24` | How long a file you only *previewed* is kept before the same sweep removes it. |
 | `WA_MEDIA_MAX_BYTES` | `104857600` | Largest inbound file this server will download (100 MB — Meta's own document maximum). |
 | `WA_MEDIA_MIN_FREE_BYTES` | `2147483648` | Free-disk floor (2 GB) below which saves are refused, so a download cannot fill the disk out from under SQLite. |
 
@@ -1065,15 +1221,16 @@ estimate.** Set these to your own country's rates from
 
 The **App behavior** column is `skipDisposition()` in `src/lib/errors.js`, and it
 is the same table the skip report groups by. `retry` puts the contact back on the
-queue (1h → 2h → 4h, four attempts); `fix` means retrying unchanged just
-reproduces the failure once per contact.
+queue (six attempts, three hours apart, never at night); `fix` means retrying
+unchanged just reproduces the failure once per contact.
 
 | Code | Meaning | App behavior |
 |---|---|---|
 | `131026` | Not on WhatsApp, or blocked by Meta on quality grounds | `permanent` — contact disabled `failed_hard`, never retried |
 | `131049` | Per-person marketing cap, counted across every business | `retry` — nothing on your side caused it or fixes it |
 | `131000`, `131016` | Meta fault it tells you is transient | `retry` |
-| `130429`, `80007`, `4` | Rate limit | Slept off in the loop; `retry` if one survives that |
+| `130429`, `80007`, `4` | Rate limit | Slept off in the loop **three times**, then handed to the ladder so one throttled number cannot own the campaign |
+| `130472` | Meta held this recipient back for a marketing experiment | `unclassified` on purpose — a holdout window runs for days, so all six attempts would land inside it, but the contact is fine and must not be written off |
 | `-1` | Network error (no response from Meta) | `retry` — the blip that used to drop one contact from a run forever |
 | `131047` | Re-engagement window expired | `fix` — we sent the wrong kind of message |
 | `132000`, `132001` | Template not found / not approved | `fix` — check the name, or approve it in the dashboard |

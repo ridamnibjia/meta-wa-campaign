@@ -318,21 +318,35 @@ const insertRecipient = db.prepare(`
   VALUES (?, ?, ?, ?, ?, NULL)
 `);
 
-// LIMIT 1, ORDER BY seq, on the partial index. The loop asks this once per
-// message rather than holding the list in memory.
+// TWO queries, asked in order, rather than one with a disjunction — and the
+// order is the point twice over.
 //
-// A 'retry' row whose retry_after has passed is pending again — that is the
-// whole retry feature, expressed as a widening of this WHERE rather than as a
-// second queue the loop would have to merge. `attempts` comes back with it so
-// the caller can decide whether this is the last go.
+// Behaviour: a contact nobody has tried yet comes before a retry that has come
+// due. One ORDER BY seq over both could not express that, because a retry row
+// keeps the seq it was staged with — so a failure at seq 12 coming due jumped
+// ahead of six hundred people the run had never attempted, spending the day's
+// cap on second attempts while first attempts waited. Reaching everyone once is
+// what a campaign is for; the ladder is what happens afterwards.
 //
-// The two `?` for the clock are the same value bound twice: node:sqlite binds
-// anonymous placeholders strictly by position and throws if you mix in ?2.
-const nextPendingQ = db.prepare(`
+// Plan: each half is a clean index seek, which the merged version was not. The
+// disjunction implied neither index's predicate, so SQLite fell back to the
+// primary key plus a temp b-tree sort — a full scan of the run, once per
+// message. Split, the first half is exactly idx_run_recipients_pending and the
+// second is exactly idx_run_recipients_retry, ORDER BY included. Both are
+// asserted on the query plan in test.js.
+const nextUntriedQ = db.prepare(`
   SELECT phone, name, seq, attempts, retry_after FROM run_recipients
-   WHERE run_id = ? AND wamid IS NULL
-     AND (skipped_reason IS NULL OR (skipped_reason = 'retry' AND retry_after <= ?))
+   WHERE run_id = ? AND wamid IS NULL AND skipped_reason IS NULL
    ORDER BY seq LIMIT 1
+`);
+
+// Ordered by DEADLINE, not by seq: within the ladder the honest queue is "whose
+// turn came up first", and idx_run_recipients_retry is (run_id, retry_after) so
+// this is the same seek that answers nextRetryAtQ.
+const nextDueRetryQ = db.prepare(`
+  SELECT phone, name, seq, attempts, retry_after FROM run_recipients
+   WHERE run_id = ? AND wamid IS NULL AND skipped_reason = 'retry' AND retry_after <= ?
+   ORDER BY retry_after LIMIT 1
 `);
 
 // The soonest a row waiting on backoff becomes sendable, or null when none are.
@@ -585,7 +599,8 @@ function buildRun(runId, contacts, disabledFor = () => null) {
 // `now` is a parameter rather than a Date.now() inside the query so a test can
 // ask "what is pending at 9pm" without waiting until 9pm.
 const nextPending = (runId, now = Date.now()) =>
-  (runId == null ? null : nextPendingQ.get(runId, now) || null);
+  (runId == null ? null
+    : nextUntriedQ.get(runId) || nextDueRetryQ.get(runId, now) || null);
 
 const recordRecipientSent = (runId, phone, wamid) =>
   markSent.run(wamid, Date.now(), runId, phone);
@@ -652,6 +667,75 @@ function recipientsForRun(runId) {
     disabledReason: r.disabled_reason,
     at: r.status_at || r.sent_at || r.attempted_at || null,
   }));
+}
+
+// ── People a finished campaign still owes a message to ─────────────────────────
+// Only S.currentRunId has anything walking it. A campaign ends, the operator
+// uploads a new CSV — which opens a new run and makes it current — and every row
+// the old run had not resolved is stranded: parked on the retry ladder with no
+// loop to pick it up, or never attempted because the run was stopped.
+//
+// handleDeliveryFailure already refuses to requeue those (it returns 'stale'),
+// and that is the right call — reopening a run nothing points at promises an
+// attempt that will never be made. But the operator was never TOLD. Production
+// had one contact sitting on run 9 with attempts = 4 and a deadline 32 hours in
+// the past, invisible on every screen, and the only honest thing to do with a
+// person still owed a message is say so.
+//
+// Deliberately a COUNT and a run list, not a re-send: what to do about it is the
+// operator's call — usually putting those numbers in the next CSV — and a button
+// that silently reopened an old run is how a campaign messages people twice.
+//
+// TWO queries again, and for the same reason nextPending is two: one WHERE
+// carrying `skipped_reason IS NULL OR skipped_reason = 'retry'` implies neither
+// partial index's predicate, so SQLite would scan the whole table — every run
+// ever, on a query that runs on every broadcast. Split, each arm scans only its
+// own partial index, and those hold ONLY unresolved rows: at rest, one is the
+// current run's remainder and the other is whatever is parked. Both are
+// typically near-empty, which is what makes asking this often affordable.
+//
+// `IS NOT ?` rather than `<> ?`: currentRunId is null after a Reset, and
+// `<> NULL` is NULL, which a WHERE treats as not-true — so every stranded row in
+// the database would vanish from this answer at exactly the moment the operator
+// has no campaign open and is most likely to be looking.
+const strandedUntriedQ = db.prepare(`
+  SELECT run_id, count(*) AS n FROM run_recipients
+   WHERE run_id IS NOT ? AND wamid IS NULL AND skipped_reason IS NULL
+   GROUP BY run_id`);
+
+const strandedRetryQ = db.prepare(`
+  SELECT run_id, count(*) AS n FROM run_recipients
+   WHERE run_id IS NOT ? AND wamid IS NULL AND skipped_reason = 'retry'
+   GROUP BY run_id`);
+
+const runLabelQ = db.prepare('SELECT id, label, started_at FROM campaign_runs WHERE id = ?');
+
+function strandedWork(currentRunId = S.currentRunId) {
+  const id = currentRunId ?? null;
+  const byRun = new Map();
+  const add = (rows, key) => {
+    for (const r of rows) {
+      const e = byRun.get(r.run_id) || { contacts: 0, retrying: 0 };
+      e.contacts += r.n || 0;
+      if (key === 'retrying') e.retrying += r.n || 0;
+      byRun.set(r.run_id, e);
+    }
+  };
+  add(strandedUntriedQ.all(id), 'untried');
+  add(strandedRetryQ.all(id),   'retrying');
+
+  const all = [...byRun.entries()].sort((a, b) => b[0] - a[0]);
+  // The headline counts EVERY stranded run; only the per-run breakdown is
+  // capped, because the banner cannot list fifty of them. Summing the slice
+  // instead would quietly under-report the moment there were more than twenty —
+  // a number that leaves people out is the one thing this banner exists to stop.
+  const contacts = all.reduce((n, [, e]) => n + e.contacts, 0);
+  const runs = all.slice(0, 20).map(([runId, e]) => {
+    const row = runLabelQ.get(runId);
+    return { id: runId, label: row?.label ?? null, startedAt: row?.started_at ?? null, ...e };
+  });
+
+  return { contacts, runs };
 }
 
 // ── The last campaign ──────────────────────────────────────────────────────────
@@ -778,6 +862,6 @@ module.exports = {
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
   recordRecipientRetry, requeueFailedRecipient, recipientFor,
-  nextRetryForRun, lastRunSummary, sentSince, sendingDays,
+  nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
 };

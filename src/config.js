@@ -54,6 +54,16 @@ const LIMITS = {
 
 const OPT_OUT_LABEL = 'Stop promotions';
 
+// The campaign loop refuses to send between 23:00 and 07:00 IST — night
+// notifications are what recipients block and report, and that feeds the quality
+// rating which gates the messaging tier.
+//
+// The knob exists for the test suite, which drives the real loop and would
+// otherwise park until morning for anyone who runs `npm test` after 23:00. It is
+// deliberately opt-OUT and not surfaced in the UI: an operator who wants to
+// message people at 3am should have to write it down in a file.
+const QUIET_HOURS = process.env.WA_QUIET_HOURS !== '0';
+
 const FILES = {
   optOuts:  path.join(ROOT, 'opt-outs.json'),
   warmup:   path.join(ROOT, 'warmup.json'),
@@ -115,5 +125,5 @@ const MEDIA_LIMITS = {
 // requiring the app, exactly like WA_DB_PATH. It is not a deployment knob.
 const UPLOAD_DIR = process.env.WA_UPLOAD_DIR || path.join(ROOT, 'uploads');
 
-module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, FILES, PUBLIC_DIR, MEDIA_DIR, UPLOAD_DIR, ROOT,
+module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, QUIET_HOURS, FILES, PUBLIC_DIR, MEDIA_DIR, UPLOAD_DIR, ROOT,
                    CLAMAV, MEDIA_LIMITS };

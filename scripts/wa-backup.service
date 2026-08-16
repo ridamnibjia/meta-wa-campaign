@@ -1,0 +1,15 @@
+[Unit]
+Description=WA Campaign nightly application backup (VACUUM INTO + state files)
+# Not After=wa-campaign.service on purpose: the backup opens the database
+# read-only and is correct whether the app is up, down or mid-campaign. Coupling
+# them would mean an app that failed to start also silently stopped the backups,
+# which is the exact moment they matter.
+
+[Service]
+Type=oneshot
+User=earlyearnly
+WorkingDirectory=/home/earlyearnly/app
+Environment=WA_APP_DIR=/home/earlyearnly/app
+Environment=WA_BACKUP_DIR=/home/earlyearnly/backups
+Environment=WA_BACKUP_KEEP=7
+ExecStart=/bin/sh /home/earlyearnly/app/scripts/backup.sh

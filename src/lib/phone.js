@@ -74,7 +74,14 @@ function parseCSV(buffer) {
   const extraCols = hdr.map((h, i) => i)
     .filter(i => i !== firstI && i !== lastI && i !== nameI && !phoneCols.includes(i) && hdr[i]);
 
-  const contacts = [], skipped = [], seen = new Set();
+  // `seen` maps a normalized number to the row it first appeared on, so a
+  // duplicate can be REPORTED rather than only dropped. Collapsing them is
+  // right — messaging one person twice in one campaign is the worst outcome
+  // here — but doing it in silence meant an operator uploaded 800 rows, was
+  // told "775 contacts", and had no way to learn where the other 25 went. A
+  // file that lost 25 rows to a broken export and one that lists 25 dealers
+  // twice look identical from the outside, and only one of them is fine.
+  const contacts = [], skipped = [], duplicates = [], seen = new Map();
   for (let i = 1; i < lines.length; i++) {
     const p = splitCsvLine(lines[i]);
     // A modern Google export splits the name across two columns; an older one
@@ -93,13 +100,16 @@ function parseCSV(buffer) {
       const d = normalizePhone(raw);
       if (!d) continue;
       usable = true;                       // the row had a number; a duplicate
-      if (seen.has(d)) continue;           // is not a row that failed to parse
-      seen.add(d);
+      if (seen.has(d)) {                   // is not a row that failed to parse
+        duplicates.push({ row: i + 1, name, dialStr: d, firstRow: seen.get(d) });
+        continue;
+      }
+      seen.set(d, i + 1);
       contacts.push({ name, phone: raw, dialStr: d, fields });
     }
     if (!usable) skipped.push({ row: i + 1, name, reason: 'no usable phone number in this row' });
   }
-  return { contacts, skipped };
+  return { contacts, skipped, duplicates };
 }
 
 module.exports = { normalizePhone, parseCSV, splitCsvLine };

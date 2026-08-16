@@ -1,5 +1,5 @@
 'use strict';
-const { CFG, FILES } = require('../config');
+const { CFG, FILES, QUIET_HOURS } = require('../config');
 const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
 const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep } = require('../state');
 const { broadcast } = require('./status');
@@ -25,9 +25,21 @@ const writer = debouncedWriter(FILES.campaign, 2000);
 // queue lives in run_recipients and the resume point is derived from it, so all
 // that is left here is the pacing state a database row has no opinion about:
 // which run is current, and how much of today's cap is spent.
+
+// The exact sentence /api/pause writes, and the one thing that distinguishes an
+// operator's pause from one the loop gave itself. A crash during a daily-cap or
+// rate-limit pause used to be unrecoverable: resumeIfInterrupted only picked up
+// 'running' and 'waiting', so the run sat at 'paused' with no loop behind it —
+// and 'paused' is in ACTIVE_PHASES, so campaignBlocker() then refused every
+// Start and every CSV upload until someone found the Stop button.
+const USER_PAUSE = 'Paused by user';
+
 const snapshot = () => ({
   phase:        S.phase,
   config:       S.config,
+  // Persisted for one reason only: telling an operator's pause from the loop's
+  // own on the next boot. See USER_PAUSE above.
+  pauseReason:  S.pauseReason,
   // Without this a restart forgets which run is current, applyStatus/recordOutbound
   // fall back to run_id NULL, and a resumed send merges into the inbox-reply /
   // migrated-legacy bucket that countsForRun(null) used to expose (see F1).
@@ -57,6 +69,7 @@ function loadCampaign() {
   // restart re-reads it rather than trusting a number written before the crash.
   Object.assign(S, {
     phase:        d.phase        || 'idle',
+    pauseReason:  d.pauseReason  ?? null,
     currentRunId: d.currentRunId,
   });
   if (d.config) Object.assign(S.config, d.config);
@@ -202,6 +215,31 @@ async function sendTemplate(contact) {
 // WHICH failures come back here is lib/errors.js:skipDisposition, not a list
 // kept here. A code has to be named 'retry' there to get a second attempt.
 const RETRY_BACKOFF_MS = [3, 3, 3, 3, 3].map(h => h * 3600000);
+
+// Below this, a wait for the next retry deadline is spent silently — see the
+// long note at the `waiting` branch in campaignLoop. One minute rather than a
+// few seconds because the deadlines inside one rung are smeared across however
+// long the previous rung took to send, and every gap inside that smear is a gap
+// nothing useful can be said about.
+const ANNOUNCE_WAIT_MS = 60000;
+
+// How many times in a row the loop will sleep off a rate limit for ONE contact
+// before handing them to the retry ladder and moving on.
+//
+// The in-loop backoff is right for a burst: Meta says "wait 60s", the loop
+// waits, the send goes through, nobody is inconvenienced. It is wrong for a
+// throughput limit the account is genuinely sitting against, because that branch
+// re-sends the SAME contact with no counter — a persistent 130429 parked a whole
+// campaign on contact #340 indefinitely, with the phase stuck on 'paused', every
+// other contact untouched, and nothing on screen saying it was one number rather
+// than the account.
+//
+// Three, because the useful case is a burst that clears in a minute or two.
+// After that it is not a hiccup, and the honest thing is to park that contact on
+// the ladder — 130429 / 80007 / 4 are all in skipDisposition's RETRY set, so the
+// hand-off costs nothing and picks them up hours later — and let the loop reach
+// everyone else in the meantime.
+const RATE_LIMIT_RETRIES = 3;
 
 const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
   { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
@@ -391,6 +429,11 @@ function startLoop() {
 
 async function campaignLoop() {
   log('info', `Campaign started — ${progressForRun(S.currentRunId).pending} contacts queued`);
+  // Which contact the rate-limit branch is currently sleeping off, and how many
+  // times in a row it has done so. Loop-local rather than on S: it is about this
+  // walk of the queue and means nothing across a restart, and the durable answer
+  // — the ladder — is a column on the row.
+  let rateLimited = { phone: null, n: 0 };
   while (true) {
     // The phase is only set here if nobody has already set it. /stop and /reset
     // say 'idle' the moment they are called, and overwriting that with 'done' a
@@ -406,6 +449,24 @@ async function campaignLoop() {
       // them; declaring it done here is what used to lose those people.
       const retry = nextRetryForRun(S.currentRunId);
       if (retry) {
+        // A rung does not come due all at once. Each contact's retry_after is
+        // written when that contact's OWN failure webhook lands, so a rung of a
+        // hundred is a hundred deadlines smeared across however long the
+        // previous rung took to send. nextPending only returns what is due this
+        // instant, so the loop drains them one at a time — send one, nothing due
+        // for three seconds, send the next.
+        //
+        // Announcing that three-second gap is what turned a working ladder into
+        // a crawl. The block below is a log line, a SYNCHRONOUS fsync
+        // (saveCampaignNow) and two full buildState() rebuilds — eight SQL
+        // aggregates including a three-table join — and on the 775-contact run
+        // in production it fired 340 times for 549 retry sends. The rung took
+        // hours instead of minutes, and the ladder's deadlines then cascaded
+        // past midnight, which is the other half of the bug below.
+        //
+        // Nothing an operator can act on happens in a wait this short, so it is
+        // spent silently: same sleep, no phase flap, no fsync, no broadcast.
+        if (retry.at - Date.now() <= ANNOUNCE_WAIT_MS) { await sleepUntil(retry.at); continue; }
         S.phase = 'waiting';
         // "In progress", not "Waiting". The ladder runs for up to a day now, and
         // an operator who reads this as stalled presses Stop — which abandons
@@ -476,7 +537,38 @@ async function campaignLoop() {
       broadcast();
       continue;   // no delay: nothing was sent
     }
-    log('info', `${n} ${contact.name} +${contact.dialStr}`);
+    // ── Quiet hours, asked of the clock rather than of the deadline ───────────
+    // scheduleRetry defers the retry_after it WRITES, and that is right, but a
+    // deadline is a promise about when a contact becomes sendable — not about
+    // when the loop gets to them. A rung due at 21:30 that the loop only reaches
+    // at 00:02 sends at 00:02, and production did exactly that: 113 marketing
+    // templates went out between midnight and 01:00 IST on a run whose every
+    // retry_after had been correctly deferred.
+    //
+    // Same function as the scheduler uses, so there is one definition of night.
+    // It applies to the first pass too: a campaign started at 23:30 is the same
+    // notification at the same hour, and the quality rating that gates the
+    // messaging tier does not care which rung woke the recipient up.
+    const gate = QUIET_HOURS ? deferPastQuietHours(Date.now()) : 0;
+    if (gate > Date.now()) {
+      S.phase = 'paused';
+      S.pauseReason = `Quiet hours — sending pauses 23:00–07:00 IST and resumes at ${clockIST(gate)}.`;
+      log('info', S.pauseReason);
+      saveCampaignNow(); broadcast();
+      await sleepUntil(gate);
+      if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
+      continue;
+    }
+    // `attempt` is on the line because the index in front of it moves BACKWARDS
+    // when the webhook ladder un-stamps a wamid, and a reader with no other
+    // signal reads that as the loop starting over.
+    const attempt = (c.attempts || 0) + 1;
+    // The counter only ever describes the contact in hand. Moving on to anyone
+    // else means the last one's rate-limit history is spent — otherwise a contact
+    // handed to the ladder here would come back hours later already at the
+    // ceiling and skip its inline backoff, which is the cheap fix for a burst.
+    if (rateLimited.phone !== contact.dialStr) rateLimited = { phone: null, n: 0 };
+    log('info', `${n} ${contact.name} +${contact.dialStr}${attempt > 1 ? ` — attempt ${attempt}` : ''}`);
     const result = await sendTemplate(contact);
     if (result.ok) {
       markWarmupDay();
@@ -507,8 +599,16 @@ async function campaignLoop() {
         recordRecipientSkipped(runId, contact.dialStr, 'skipped', result.errorCode);
         log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
       }
-    } else if (result.rateLimit) {
-      log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s. ${result.hint || result.error} [${result.errorCode}]`);
+    } else if (result.rateLimit && rateLimited.n < RATE_LIMIT_RETRIES) {
+      // Counted per contact — the reset above guarantees this counter is about
+      // the contact in hand. A limit that clears after one wait is a burst and
+      // costs nobody anything; this branch re-sends the SAME contact with no
+      // counter, so a limit the account is genuinely sitting against parked the
+      // whole campaign on one number. Past the ceiling this condition is false
+      // and the row falls through to scheduleRetry below — 130429 / 80007 / 4
+      // are all in skipDisposition's RETRY set, so the ladder takes them.
+      rateLimited = { phone: contact.dialStr, n: rateLimited.n + 1 };
+      log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s (${rateLimited.n} of ${RATE_LIMIT_RETRIES}). ${result.hint || result.error} [${result.errorCode}]`);
       S.phase = 'paused'; S.pauseReason = 'Rate limit — auto-resuming'; broadcast();
       // Same reason as the daily cap above: Meta's retry-after is minutes, not
       // seconds, and a Stop must not wait it out.
@@ -557,7 +657,23 @@ function resumeIfInterrupted() {
   // 'waiting' resumes exactly like 'running': the backoff deadline is a column
   // on the queue row, so the wait carries on across the restart by itself — the
   // loop simply re-derives how long is left.
-  if (!['running', 'waiting'].includes(saved.phase) || p.pending <= 0) {
+  //
+  // 'paused' resumes too, unless the operator is the one who paused it. Every
+  // other pause is the loop's own — the daily cap, a rate limit, quiet hours —
+  // and each of them re-derives its condition on the next iteration, so
+  // resuming costs nothing and NOT resuming was a trap: the run sat at 'paused'
+  // with no loop behind it, and 'paused' is in ACTIVE_PHASES, so
+  // campaignBlocker() then refused every Start and every CSV upload with "a
+  // campaign is paused part-way through" until someone thought to press Stop.
+  //
+  // A campaign.json written BEFORE this field existed carries no pauseReason at
+  // all, and the truthiness check is what makes that case fail closed: the first
+  // boot after upgrading must not restart a campaign the operator had paused on
+  // purpose, just because the file cannot say who paused it. Every file written
+  // from now on carries the field, so this only ever applies once.
+  const autoResumable = saved.phase === 'paused'
+    && !!saved.pauseReason && saved.pauseReason !== USER_PAUSE;
+  if (!(['running', 'waiting'].includes(saved.phase) || autoResumable) || p.pending <= 0) {
     log('info', `Campaign restored — ${p.sent + p.skipped}/${p.total} done, phase ${S.phase}`);
     return;
   }
@@ -586,4 +702,5 @@ module.exports = {
   CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun, suppressIfPermanent,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
   campaignActive, campaignBlocker, scheduleRetry, handleDeliveryFailure, RETRY_BACKOFF_MS,
+  USER_PAUSE, RATE_LIMIT_RETRIES,
 };
