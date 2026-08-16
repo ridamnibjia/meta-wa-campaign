@@ -29,7 +29,13 @@ function buildState() {
   const retry    = nextRetryForRun(S.currentRunId);
   return {
     phase:          S.phase,
-    currentIdx:     p.sent + p.skipped,
+    // Contacts ATTEMPTED, not contacts resolved. It was `p.sent + p.skipped`,
+    // which the webhook ladder walked backwards: a failure webhook nulls the
+    // wamid, the contact drops out of `sent`, and the progress bar on two
+    // screens slid to the left while the run was still going forwards. What is
+    // still owed to those people is `retrying`, which both screens already
+    // render beside this number — the bar is not the place to say it twice.
+    currentIdx:     p.attempted,
     total:          p.total,
     // The MESSAGE-TABLE view of this run: every outbound row stamped with it,
     // which includes test sends (/api/test-send stamps the current run but

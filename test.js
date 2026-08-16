@@ -537,6 +537,21 @@ console.log('\nwarm-up ladder');
     setup(new Array(50).fill(0).map((_, i) => 'd' + i)); S.config.dailyCap = 0;
     assert.equal(effectiveCap(), null);
   });
+  // The shipped default, read from a pristine copy of the module rather than
+  // from the S every other test has been writing to. It was 1000, and a number
+  // this file invents is a number nothing on screen can explain: it outlived the
+  // warm-up ladder in campaign.json, so a graduated number sat at "Meta's tier
+  // is the limit now / 0 of 1,000" and campaigns stopped at a thousand with
+  // nothing naming what stopped them.
+  test('the app ships with no daily cap of its own', () => {
+    const id = require.resolve('./src/state');
+    const held = require.cache[id];
+    delete require.cache[id];
+    const fresh = require('./src/state').S;
+    require.cache[id] = held;   // everything else still holds the original singleton
+    assert.equal(fresh.config.dailyCap, 0,
+      'a cap the operator never chose is one they cannot find to turn off');
+  });
 
   Object.assign(W, { days: restore.days, enabled: restore.enabled });
   S.quality = restore.quality; S.config.dailyCap = restore.cap;
@@ -2273,7 +2288,8 @@ console.log('\nrun_recipients — the send queue');
 
     recordRecipientSent(run, p[2].dialStr, 'wamid.c');
     assert.equal(nextPending(run), null, 'an exhausted queue is null, not an index past the end');
-    assert.deepEqual(progressForRun(run), { total: 3, sent: 2, skipped: 1, disabled: 0, retrying: 0, pending: 0 });
+    assert.deepEqual(progressForRun(run),
+      { total: 3, sent: 2, skipped: 1, disabled: 0, retrying: 0, pending: 0, attempted: 3 });
   });
 
   // The whole reason this table exists. The old design saved an integer, and an
@@ -2368,7 +2384,8 @@ console.log('\nrun_recipients — the send queue');
   });
 
   test('progress for no run at all is zeroes, never a throw', () => {
-    assert.deepEqual(progressForRun(null), { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0 });
+    assert.deepEqual(progressForRun(null),
+      { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0, attempted: 0 });
     assert.equal(nextPending(null), null);
     assert.deepEqual(skippedForRun(null), []);
   });
@@ -2839,6 +2856,30 @@ console.log('\ndelivery failures that arrive over the webhook');
     assert.equal(row.wamid, null, 'the accept stamp is what made the queue call them done');
     assert.equal(row.attempts, 1);
     assert.ok(row.retry_after > Date.now() + RETRY_BACKOFF_MS[0] - 5000, 'due about three hours out');
+  });
+
+  test('the progress counter does not walk backwards when the ladder requeues', () => {
+    const run = newRun();
+    const p = people(3);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.mono1');
+    accepted(run, p[1], 'w.mono2');
+    const before = progressForRun(run);
+    assert.equal(before.attempted, 2, 'two people have been messaged');
+
+    assert.equal(webhook('w.mono2', 131049), 'retrying');
+
+    const after = progressForRun(run);
+    // The whole point. `sent + skipped` is what the screens used to count, and it
+    // really does drop here — the queue has un-resolved that attempt on purpose,
+    // so nextPending can see the row again. What the operator is watching is how
+    // far through their list the run has got, and that has not gone anywhere: we
+    // messaged that person, Meta refused after the fact, and another go is owed.
+    assert.equal(after.sent + after.skipped, 1, 'the queue really did un-resolve that send');
+    assert.equal(after.attempted, before.attempted,
+      'but the number on screen must never count down while the run goes forwards');
+    assert.equal(after.retrying, 1, 'and what is still owed to them is said beside it');
+    assert.ok(after.attempted <= after.total, 'a contact on their second go is not a second contact');
   });
 
   test('the same failure delivered twice does not cost a second rung', () => {

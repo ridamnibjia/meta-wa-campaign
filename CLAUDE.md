@@ -201,6 +201,21 @@ operator's own "no cap", and `effectiveCap()` returns null when neither applies 
 `num(null)` is `"0"` and reads as a cap that blocks every send. The config route
 uses an explicit presence check rather than `if (dailyCap)` for the same reason.
 
+**The app ships with `dailyCap: 0`, and the tile names the cap actually in
+force.** The default was `1000` — a number this repo invented, not one any
+operator chose — and `campaign.json` persists it on the first save, so it
+outlived the warm-up ladder it was shadowing. Production ran for weeks showing
+`0 / 1,000` under the caption "Warm-up complete — Meta's tier is the limit now":
+two true sentences and one impossible screen, with campaigns stopping at a
+thousand and nothing anywhere naming what stopped them. `effectiveCap()` was
+right throughout; the caption printed the warm-up sentence whatever the number
+above it was. `dashboard.jsx` now derives `capSource` from `config.dailyCap`
+against the published cap and says which ceiling won — your own cap (the only one
+that screen can turn off), today's warm-up rung, or none at all. There is a test
+that re-requires `src/state.js` from a pristine module cache to assert the
+shipped default, because every other test writes to the shared `S`. A cap the
+operator never chose is a cap they cannot find to turn off.
+
 **`warmup.json` is reconciled against the message rows at every boot.**
 `reconcileWarmupDays()` merges the distinct IST send-days in `messages` into
 `W.days`. That file is the smallest and most losable thing in a deployment — it
@@ -252,8 +267,22 @@ failure appears in both — a webhook failure is inside `accepted` *and* inside
 `failed`; an API refusal is inside
 `S.failed` *and* inside `skipped`, because it is written to the queue as
 `skipped_reason = 'failed'`. The dashboard summed them and read "74 of 57
-processed, 130%". Anything meaning "contacts resolved" reads `currentIdx`
-(`p.sent + p.skipped`) — one table, one question.
+processed, 130%". Anything meaning "contacts attempted" reads `currentIdx`
+(`p.attempted`) — one table, one question.
+
+**`currentIdx` counts contacts ATTEMPTED, and that is the only figure here that
+cannot go down.** It was `p.sent + p.skipped`, which the webhook ladder walks
+backwards: `requeueAfterDelivery` nulls the wamid so `nextPending` can see the
+row again, the contact leaves `sent`, and the `[663/775]` in the log and the
+progress bar on two screens counted *down* while the run was going forwards —
+which reads as the loop starting over. `progressForRun().attempted` is
+`sent + skipped + retrying`, and it is monotonic because a row leaves "never
+tried" exactly once and can never return to it. The loop's own index adds one
+only for an untried row (`c.skipped_reason` is what `nextPending`'s two halves
+are told apart on), so a contact on their second go is not counted twice and the
+index can never pass the total. What is still owed to a requeued contact is
+`retrying`, which every screen already renders beside this number — do not fold
+it into the bar as well, and do not "fix" the bar back to counting resolutions.
 
 **`countsForRun(null)` returns zeroes.** `run_id IS NULL` is not "no campaign" —
 it is the bucket inbox replies and migrated legacy rows deliberately land in.

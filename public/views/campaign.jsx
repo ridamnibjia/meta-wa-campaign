@@ -382,7 +382,7 @@ function Campaign() {
     headerFormat: '', headerText: '', headerSample: '', headerAssetId: null, buttons: [],
     addOptOut: true, category: 'MARKETING', language: 'en', submitting: false, errors: [],
   });
-  const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 1000 });
+  const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 0 });
 
   // `??`, not `||`: a dailyCap of 0 is a real setting — "no cap of mine" — and
   // `||` would swap it back for the default here and then POST that default on

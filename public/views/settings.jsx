@@ -4,7 +4,7 @@ function SettingsView() {
   const { ss, account } = useApp();
   const { warmup: warm, pricing = {} } = ss;
 
-  const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 1000 });
+  const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 0 });
   const [prices,   setPrices]   = useState({ MARKETING: 0, UTILITY: 0, AUTHENTICATION: 0, currency: '₹' });
   const [creds,    setCreds]    = useState({ phoneId: '', token: '', wabaId: '' });
   const [saved,    setSaved]    = useState('');

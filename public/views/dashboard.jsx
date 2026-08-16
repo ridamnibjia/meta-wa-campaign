@@ -21,8 +21,12 @@ function Dashboard() {
   const unreachable = f.unreachable || 0;
   const accepted    = delivered + (f.sent || 0);
 
-  // "Processed" is a count of CONTACTS resolved, and the only place that can
-  // answer it is the queue — which is what currentIdx (p.sent + p.skipped) is.
+  // "Attempted" is a count of CONTACTS, and the only place that can answer it is
+  // the queue — which is what currentIdx (p.attempted) is. Attempted rather than
+  // resolved on purpose: a contact the webhook ladder put back is still owed a
+  // message, but we did send them one, and counting them out again made this bar
+  // slide backwards mid-run. The retry line under it is what says they are not
+  // finished with.
   //
   // It used to be `accepted + failed + skipped`, and that double-counted:
   // `accepted` counted message ROWS while `failed` and `skipped` counted queue
@@ -40,6 +44,21 @@ function Dashboard() {
   const rate = n => (total > 0 ? Math.round((n / total) * 100) + '% of the list' : '—');
   const cur  = pricing.currency || '₹';
   const unread = threads.reduce((n, t) => n + (t.unread || 0), 0);
+
+  // Which of the two ceilings produced the number beside "Sent today". The
+  // server has already picked the lower of them (effectiveCap), so this only
+  // has to say which one it was — and a cap of the operator's own is the one
+  // worth naming, because it is the only one they can turn off from here.
+  // `own` is null at 0: zero is "no limit of mine", never a limit of zero.
+  const ownCap = ss.config?.dailyCap > 0 ? ss.config.dailyCap : null;
+  const capSource =
+    dailyCap == null
+      ? (warmup?.graduated
+          ? `Warm-up complete after ${num(warmup.daysSent)} sending days — Meta's tier is the limit now`
+          : 'No ceiling here — Meta\'s messaging tier is the only limit')
+    : dailyCap === ownCap
+      ? `Your own daily cap of ${num(ownCap)} — Settings › Pacing, set it to 0 to remove it`
+      : `Warm-up day ${warmup?.daysSent || 1} — today's ceiling is ${num(dailyCap)}`;
 
   const PHASE = {
     running: ['success', 'Sending'],
@@ -225,7 +244,7 @@ function Dashboard() {
               <>
                 <div>
                   <div className="mb-1.5 flex items-baseline justify-between text-sm">
-                    <span className="font-medium">{num(done)} of {num(total)} processed</span>
+                    <span className="font-medium">{num(done)} of {num(total)} attempted</span>
                     <span className="tabular-nums text-muted-foreground">{pct}%</span>
                   </div>
                   <Progress value={pct} />
@@ -237,13 +256,14 @@ function Dashboard() {
                         num(null) is "0", which would read as a cap that blocks
                         every send — the opposite of what null means. */}
                     <p className="text-lg font-semibold tabular-nums">{num(dailyCount)} <span className="text-sm font-normal text-muted-foreground">{dailyCap == null ? '· no cap' : `/ ${num(dailyCap)}`}</span></p>
-                    <p className="text-[11px] text-muted-foreground">
-                      {warmup?.graduated
-                        ? `Warm-up complete after ${num(warmup.daysSent)} sending days — Meta's tier is the limit now`
-                        : warmup?.enabled
-                          ? `Warm-up day ${warmup.daysSent || 1} — ceiling ${num(warmup.cap)}`
-                          : 'Warm-up off'}
-                    </p>
+                    {/* The caption has to name the ceiling that is ACTUALLY in
+                        force. It used to print the warm-up sentence whatever the
+                        number above it was, so a graduated ladder read "Meta's
+                        tier is the limit now" directly over `0 / 1,000` — and
+                        that 1,000 was the app's own shipped default daily cap,
+                        which the operator had never chosen and nothing on the
+                        screen named. Two true sentences, one impossible screen. */}
+                    <p className="text-[11px] text-muted-foreground">{capSource}</p>
                     <p className="text-[11px] text-muted-foreground">
                       Sends Meta later refused do not count here.
                     </p>

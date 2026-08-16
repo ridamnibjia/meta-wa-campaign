@@ -522,7 +522,12 @@ async function campaignLoop() {
     // when nextPending returned it.
     const runId = S.currentRunId;
     const p = progressForRun(runId);
-    const n = `[${p.sent + p.skipped + 1}/${p.total}]`;
+    // Contacts attempted, this one included. `p.attempted` already counts a row
+    // the ladder put back, so a contact on their second go must not be added a
+    // second time — untried is the only state that has not been counted yet,
+    // and `skipped_reason` is what nextPending's two halves are told apart on.
+    // This is why the index cannot pass the total, and why it never counts down.
+    const n = `[${p.attempted + (c.skipped_reason ? 0 : 1)}/${p.total}]`;
 
     // Re-checked here, not only at run build: a customer can tap "Stop
     // promotions" while the run this row belongs to is halfway through it.

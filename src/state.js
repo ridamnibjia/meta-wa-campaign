@@ -29,7 +29,14 @@ const S = {
   quality:    null,     // last quality_rating seen from Meta — gates the warm-up climb
   config: {
     delaySec:         2,
-    dailyCap:         1000,
+    // 0 is "no limit of mine" — Meta's messaging tier, and the warm-up ladder
+    // while it is still running, are the ceilings. It shipped as 1000, which is
+    // a number nobody chose: it survived in campaign.json long after the warm-up
+    // ladder had graduated, so the screen said "Meta's tier is the limit now"
+    // over a cap this file had invented, and campaigns stopped at a thousand
+    // with nothing anywhere naming what stopped them. A cap the operator wants
+    // is one they can type; a cap they never asked for should not exist.
+    dailyCap:         0,
     templateName:     CFG.templateName,
     templateLanguage: CFG.templateLanguage,
     templateCategory: CFG.templateCategory,

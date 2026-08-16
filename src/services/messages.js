@@ -632,13 +632,25 @@ function nextRetryForRun(runId) {
 }
 
 function progressForRun(runId) {
-  if (runId == null) return { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0 };
+  if (runId == null) {
+    return { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0, attempted: 0 };
+  }
   const r = progressQ.get(runId);
   const total = r.total || 0, sent = r.sent || 0, skipped = r.skipped || 0;
+  const retrying = r.retrying || 0;
   // `pending` therefore includes the rows waiting on backoff. That is the point:
   // the run is not finished while any of them are outstanding.
-  return { total, sent, skipped, disabled: r.disabled || 0, retrying: r.retrying || 0,
-           pending: total - sent - skipped };
+  //
+  // `attempted` is the one figure here that only ever goes UP: a row leaves
+  // "never tried" exactly once and can never return to it. `sent + skipped`
+  // cannot say that — requeueAfterDelivery nulls the wamid, so a contact Meta
+  // accepted and later refused moves back OUT of `sent`, and the "663 of 775"
+  // an operator was watching counted down. Nothing had been un-sent; the queue
+  // had simply stopped calling that attempt finished. Retries are inside it for
+  // the same reason: we did message that person, and the ladder owing them
+  // another go is what `pending` and `retrying` are for.
+  return { total, sent, skipped, disabled: r.disabled || 0, retrying,
+           pending: total - sent - skipped, attempted: sent + skipped + retrying };
 }
 
 const billableForRun  = runId => (runId == null ? 0 : billableQ.get(runId).n || 0);

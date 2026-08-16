@@ -11,5 +11,5 @@ User=earlyearnly
 WorkingDirectory=/home/earlyearnly/app
 Environment=WA_APP_DIR=/home/earlyearnly/app
 Environment=WA_BACKUP_DIR=/home/earlyearnly/backups
-Environment=WA_BACKUP_KEEP=7
+Environment=WA_BACKUP_DAYS=7
 ExecStart=/bin/sh /home/earlyearnly/app/scripts/backup.sh

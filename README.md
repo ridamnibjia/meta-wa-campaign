@@ -222,10 +222,14 @@ midnight rollover or a replayed webhook to leave disagreeing with the rows.
 
 ### Removing the cap
 
-Set **Daily cap** to `0` in Settings. That removes *your* limit; Meta's
-messaging tier still applies, and the warm-up ladder below still applies until
-it finishes. Both are shown on the Settings page, so you can always see which
-one is holding a campaign back.
+There is no cap of your own until you set one: **Daily cap** ships at `0`, which
+means "no limit of mine". Meta's messaging tier still applies, and the warm-up
+ladder below still applies until it finishes.
+
+Set it back to `0` at any time to remove a limit you have set. The Dashboard
+names whichever ceiling is actually in force under **Sent today** — your own cap,
+today's warm-up rung, or none at all — so a campaign that stops early always has
+something on screen saying what stopped it.
 
 ### The warm-up ladder
 
@@ -596,7 +600,7 @@ meta-wa-campaign/
 │   └── views/           dashboard, campaign, inbox, settings, diagnostics
 │
 ├── scripts/
-│   ├── backup.sh        Nightly VACUUM INTO + state files, keep 7
+│   ├── backup.sh        Nightly VACUUM INTO + state files, swept at 7 days
 │   ├── vacuum-into.js   The consistent DB copy, verified before it counts
 │   ├── wa-backup.service
 │   └── wa-backup.timer  systemd units — 21:30 UTC / 03:00 IST
@@ -829,16 +833,26 @@ sh scripts/backup.sh          # writes ~/backups/<ISO timestamp>/
 It uses SQLite's `VACUUM INTO`, which takes a read transaction — consistent as of
 the instant it starts, no service stop, no lock on the app — then **opens the
 copy and runs `PRAGMA integrity_check` on it**. A copy nobody has read is not a
-backup. It also copies `warmup.json`, `campaign.json` and a tarball of
-`uploads/`, keeps the newest 7, and publishes each night's directory only once
-everything above succeeded, so a run that died half way through can never be
-mistaken for last night's.
+backup. It also copies `warmup.json` and `campaign.json`, and publishes each
+night's directory only once everything above succeeded, so a run that died half
+way through can never be mistaken for last night's.
 
-`media/` is deliberately **not** backed up: inbound customer files expire at 90
-days by design, and restoring them past their own retention would undo a promise
-the UI made. `.env` is credentials, not state — keep it wherever you keep
-secrets. `warmup.json` is reconciled against the message store at every boot, so
-losing it alone is recoverable; losing the database is not.
+Retention is by **age, not count**: anything in the backup directory older than
+`WA_BACKUP_DAYS` (7) is removed, hand-made pre-deploy copies included. Those are
+the ones that otherwise accumulate — a multi-megabyte database copy, sometimes an
+`.env` with live tokens in it, kept long after the deploy it was taken for. The
+sweep runs only after a new backup has been published, so it can never be the
+thing that leaves you with none.
+
+Two directories are deliberately **not** backed up. `media/` is inbound customer
+files, which expire at 90 days by design — restoring them past their own
+retention would undo a promise the UI made. `uploads/` is template headers and
+inbox sends: tens of megabytes that rarely change, so tarring them nightly wrote
+the same bytes seven times over for a copy your **disk snapshots** already hold.
+Restore uploads from a snapshot; restore the database from here. `.env` is
+credentials, not state — keep it wherever you keep secrets. `warmup.json` is
+reconciled against the message store at every boot, so losing it alone is
+recoverable; losing the database is not.
 
 To run it nightly, install the two units in `scripts/`:
 
@@ -861,7 +875,6 @@ sudo systemctl stop wa-campaign
 cp ~/backups/<stamp>/wa.db       ~/app/wa.db
 rm -f ~/app/wa.db-wal ~/app/wa.db-shm    # the copy is already checkpointed
 cp ~/backups/<stamp>/warmup.json ~/app/warmup.json
-tar -xzf ~/backups/<stamp>/uploads.tar.gz -C ~/app
 sudo systemctl start wa-campaign
 ```
 
@@ -1186,7 +1199,7 @@ a working default.
 |---|---|---|
 | `WA_APP_DIR` | `/home/earlyearnly/app` | Where `wa.db` and the state files live. |
 | `WA_BACKUP_DIR` | `/home/earlyearnly/backups` | Where nightly backups are written. |
-| `WA_BACKUP_KEEP` | `7` | How many nightly directories to keep. |
+| `WA_BACKUP_DAYS` | `7` | Age, in days, past which anything in the backup directory is swept — hand-made copies included. |
 
 ### Inbound media safety
 
