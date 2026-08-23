@@ -51,8 +51,14 @@ function processEnvelope(body) {
       // 'button'; the same label from an interactive message arrives as
       // button_reply. Everything — including the opt-out tap — is also recorded
       // in the inbox, so the operator can see what the customer actually did.
-      const profileName = change.value?.contacts?.[0]?.profile?.name;
+      // Resolved per MESSAGE, not per change: Meta batches several senders'
+      // messages into one change.value with parallel messages[]/contacts[]
+      // arrays, and reading contacts[0] for everyone stamped sender A's profile
+      // name onto sender B's thread — and recorded B's opt-out under A's name.
+      // find() on wa_id covers the single-entry case too.
+      const contactsArr = change.value?.contacts || [];
       for (const m of (change.value?.messages || [])) {
+        const profileName = contactsArr.find(c => c.wa_id === m.from)?.profile?.name;
         inbox.recordInbound(m, profileName);
 
         const label = m.button?.text || m.interactive?.button_reply?.title;

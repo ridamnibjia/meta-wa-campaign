@@ -462,9 +462,15 @@ untenable. `campaignActive()` — `flags.running || ACTIVE_PHASES.includes(phase
 it was being re-typed at each call site.
 
 **A deleted asset that history points at becomes a tombstone, not a gap.**
-SQLite does not enforce the `REFERENCES` on `messages.asset_id` or
-`templates.header_asset` — `foreign_keys` is never turned on — so a forced delete
-would silently orphan three tables. `deleteAsset(id, { force: true })` unlinks
+**`node:sqlite` enforces FOREIGN KEY constraints by default** — an earlier
+version of this file claimed the opposite, and code was written on that claim:
+a dangling id bound into `messages.run_id` or `campaign_runs.header_asset`
+throws `FOREIGN KEY constraint failed` at INSERT time, which is why
+`loadCampaign` validates a restored `currentRunId` against `campaign_runs`,
+`startRun` validates the picked header against the library, and `deleteAsset`
+clears `S.config.headerAssetId` when it deletes the picked file. The tombstone
+still earns its place: it is what lets history NAME what was sent, not just
+survive the delete. `deleteAsset(id, { force: true })` unlinks
 the bytes and stamps `media_assets.deleted_at` instead of deleting the row, so a
 campaign report can still name what it sent. A plain delete still refuses. The
 tombstone is invisible to `listAssets()` (picking it would build a send that

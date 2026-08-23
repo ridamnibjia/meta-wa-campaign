@@ -32,6 +32,12 @@ router.post('/test-send', async (req, res) => {
   if (S.config.templateStatus !== 'APPROVED') {
     return res.json({ ok: false, error: `Template "${S.config.templateName}" is ${S.config.templateStatus || 'not found'} — only APPROVED templates can be sent` });
   }
+  // Same guard as /start: a media-header template sent with no file attached
+  // fails at Meta with a code the operator has to look up. Refuse it here with
+  // the fix instead.
+  if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(S.config.headerFormat) && !S.config.headerAssetId) {
+    return res.json({ ok: false, error: 'This template has a media header — choose the file to send in step 2, then test again.' });
+  }
 
   const results = [];
   for (const n of raw) {
@@ -101,6 +107,14 @@ router.post('/start', async (req, res) => {
     return res.json({ ok: false, error: `Could not verify template: ${e.message}` });
   }
 
+  // A media-header template with no file chosen would go out with no header
+  // component at all, and Meta refuses that per contact — a whole run of
+  // identical failures. The UI blocks this too, but the server is the one that
+  // counts, and adoptTemplate above has just refreshed both fields.
+  if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(S.config.headerFormat) && !S.config.headerAssetId) {
+    return res.json({ ok: false, error: 'This template has a media header — choose the file to send in step 2, then start again.' });
+  }
+
   // adoptTemplate just resized the slots from Meta's current copy of the body,
   // so an empty one here means the template really does have a variable nobody
   // filled in — not a stale count from a previously selected template.
@@ -140,7 +154,18 @@ router.post('/start', async (req, res) => {
 // USER_PAUSE, not a literal: this exact string is what resumeIfInterrupted reads
 // on the next boot to tell an operator's pause from one the loop gave itself.
 router.post('/pause',  (req, res) => { flags.pauseFlag = true;  S.phase = 'paused'; S.pauseReason = USER_PAUSE; saveCampaignNow(); broadcast(); log('info', 'Paused'); res.json({ ok: true }); });
-router.post('/resume', (req, res) => { flags.pauseFlag = false; S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast(); log('info', 'Resumed'); if (!flags.running) startLoop(); res.json({ ok: true }); });
+router.post('/resume', (req, res) => {
+  // A pause the loop gave itself — daily cap, quiet hours, rate limit — is a
+  // condition Resume cannot beat: the loop is asleep in sleepUntil(), which
+  // only wakes on stop/pause flags, so flipping the phase here painted
+  // "Sending" over hours of silence and deleted the one sentence (pauseReason)
+  // that explained it. Refuse with that sentence instead. Only the operator's
+  // own pause (USER_PAUSE) is theirs to resume.
+  if (S.phase === 'paused' && S.pauseReason && S.pauseReason !== USER_PAUSE) {
+    return res.json({ ok: false, error: S.pauseReason });
+  }
+  flags.pauseFlag = false; S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast(); log('info', 'Resumed'); if (!flags.running) startLoop(); res.json({ ok: true });
+});
 // stopFlag is a request, not a fact: the loop reads it within a second and then
 // clears `running` itself. Setting `running = false` from here was a lie the loop
 // had not yet caught up with, and campaignBlocker() believed it — long enough for
@@ -183,7 +208,14 @@ const timeIST = ms => new Date(ms).toLocaleTimeString('en-IN',
 // campaign that ended an hour ago is the report lying to them.
 function detailFor(r, active) {
   if (r.skipped_reason === 'disabled') {
-    return 'Switched off before this run was built — nothing was attempted, and nothing was billed.';
+    // attempts > 0 means the ladder reached this contact BEFORE they were
+    // switched off — the loop parks them as 'disabled' when their retry comes
+    // due. "Nothing was attempted" about someone this run really messaged
+    // would be the report lying; the count is `attempts` exactly, because each
+    // completed try already incremented it and the next one never happened.
+    return (r.attempts || 0) > 0
+      ? `Tried ${r.attempts}×, then the contact was switched off before the next attempt.`
+      : 'Switched off before this run was built — nothing was attempted, and nothing was billed.';
   }
   const meaning = explainError(r.error_code)
     || `Meta returned code ${r.error_code ?? 'none'}, which this app has no description for. Look it up in Meta's error reference before deciding what to do.`;
@@ -216,9 +248,10 @@ router.get('/campaign/skips', (req, res) => {
       reason: r.skipped_reason, code: r.error_code,
       explanation: explainError(r.error_code),
       detail: detailFor(r, active),
-      // A disabled row was never sent to, so its attempt count is zero — not the
-      // "one attempt" every other row has had by the time it lands here.
-      attempts: r.skipped_reason === 'disabled' ? 0
+      // A disabled row is usually never sent to — attempt count zero — except
+      // one the ladder reached first and the opt-out interrupted, whose count
+      // is `attempts` exactly, like a retrying row (see detailFor above).
+      attempts: r.skipped_reason === 'disabled' ? (r.attempts || 0)
               : r.skipped_reason === 'retry'    ? (r.attempts || 0)
               : (r.attempts || 0) + 1,
       retryAt: r.skipped_reason === 'retry' ? r.retry_after : null,

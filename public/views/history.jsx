@@ -29,8 +29,11 @@ function RunDetail({ id, onBack }) {
 
   useEffect(() => {
     setD(null); setError('');
+    // req() only throws on 401 or a network failure — the route's deliberate
+    // 404 body resolves normally, and rendering it as a run crashed the app on
+    // d.recipients. The error field is the answer, not an exception.
     api.get(`/api/runs/${id}`)
-      .then(setD)
+      .then(r => (r && r.error ? setError(r.error) : setD(r)))
       .catch(() => setError('That campaign no longer exists.'));
   }, [id]);
 

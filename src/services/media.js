@@ -115,6 +115,20 @@ function saveUpload(file) {
   // last month's price list is still last month's price list.
   const existing = byHash.get(sha);
   if (existing && !existing.deleted_at) {
+    // The row can outlive its bytes — a wa.db restored without the uploads
+    // directory. Re-uploading the identical file is the natural repair, and a
+    // dedupe that writes nothing would leave every later send failing with an
+    // ENOENT dressed up as a network error. Same bytes, same row; only the
+    // missing file is put back.
+    if (!fs.existsSync(assetPath(existing))) {
+      const free = freeBytes(UPLOAD_DIR);
+      if (free - size < MEDIA_LIMITS.minFreeBytes) {
+        return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Nothing was saved.` };
+      }
+      fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+      fs.writeFileSync(assetPath(existing), file.buffer);
+      log('warn', `Upload "${file.originalname}" restored the missing bytes of asset ${existing.id} ("${existing.filename}")`);
+    }
     touchRow.run(Date.now(), existing.id);
     log('info', `Upload "${file.originalname}" matched an existing file — reusing asset ${existing.id}`);
     return { ok: true, asset: byId.get(existing.id), deduped: true };
@@ -182,9 +196,9 @@ function saveUpload(file) {
 // refusing any delete that would break history.
 //
 // Three tables reference an asset, and all three are checked by name rather than
-// by a foreign-key sweep: SQLite does not enforce REFERENCES unless
-// foreign_keys is ON, and a silently-orphaned row here shows up months later as
-// a campaign report that cannot say what it sent.
+// left to the FK layer: node:sqlite enforces REFERENCES, so an unchecked DELETE
+// of a referenced row would throw a bare "FOREIGN KEY constraint failed" — and
+// the check is what turns that into a sentence naming what still points at it.
 const assetRefs = {
   templates:     db.prepare('SELECT count(*) AS n FROM templates     WHERE header_asset = ?'),
   campaign_runs: db.prepare('SELECT count(*) AS n FROM campaign_runs WHERE header_asset = ?'),
@@ -250,10 +264,10 @@ function busyNow(asset) {
 const tombstoneRow = db.prepare('UPDATE media_assets SET deleted_at = ? WHERE id = ?');
 
 // `force` is the operator saying "delete it anyway" to a file history points at.
-// It is never what a plain delete does: SQLite does not enforce the REFERENCES
-// on these columns (foreign_keys is off), so a forced delete silently orphans
-// three tables unless the row survives to be found. That is what the tombstone
-// is — deliberately not a recycle bin, because the bytes really are gone.
+// A forced delete keeps the ROW and drops only the bytes — the tombstone — so
+// the three referencing tables can still name what was sent (and node:sqlite's
+// enforced REFERENCES would refuse deleting the row out from under them anyway).
+// Deliberately not a recycle bin, because the bytes really are gone.
 function deleteAsset(id, { force = false } = {}) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: 'That file is not in the library.' };
@@ -302,11 +316,23 @@ function deleteAsset(id, { force = false } = {}) {
 
   if (referenced) {
     tombstoneRow.run(Date.now(), asset.id);
+    if (S.config.headerAssetId === asset.id) {
+      S.config.headerAssetId = null;
+      log('warn', `"${asset.filename}" was the campaign's picked header — the pick was cleared, choose another file before sending`);
+    }
     log('warn', `Force-deleted "${asset.filename}" — still referenced, record kept so history can name it. Freed ${mb(freed)}`);
     return { ok: true, freed, filename: asset.filename, tombstoned: true };
   }
 
   deleteAssetRow.run(asset.id);
+  // If this was the campaign's picked header (deletable while idle — busyNow
+  // only guards a live campaign), the pick has to go with it: a dangling id
+  // left in S.config would be bound into the next run's header_asset, and
+  // node:sqlite enforces that REFERENCES.
+  if (S.config.headerAssetId === asset.id) {
+    S.config.headerAssetId = null;
+    log('warn', `"${asset.filename}" was the campaign's picked header — the pick was cleared, choose another file before sending`);
+  }
   log('info', `Deleted "${asset.filename}" from the library — freed ${mb(freed)}`);
   return { ok: true, freed, filename: asset.filename };
 }
@@ -736,7 +762,9 @@ function discardInbound(mediaId) {
     return { ok: false, error: 'This file could not be removed — the server logged why. Nothing was deleted.' };
   }
   log('info', `Discarded inbound media ${row.media_id}${r.shared ? ' (bytes kept — another message shares them)' : ''}`);
-  return { ok: true, media: getInbound(mediaId) };
+  // freed travels back so the Storage page's "freeing X" can report inbound
+  // discards honestly; 0 when siblings share the file, which is the true number.
+  return { ok: true, freed: r.freed || 0, media: getInbound(mediaId) };
 }
 
 // A file saved before ClamAV was installed is marked `skipped` forever, which

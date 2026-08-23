@@ -65,9 +65,14 @@ function validateTemplateInput({ displayName, bodyText, footerText, sampleValues
   vars.forEach((n, i) => {
     if (n !== i + 1) errors.push(`Variables must run {{1}}, {{2}}… with no gaps — found {{${n}}} at position ${i + 1}`);
   });
-  if (vars.length && sampleValues.filter(v => String(v || '').trim()).length !== vars.length) {
-    errors.push(`Provide a sample value for each of the ${vars.length} variable(s) — Meta requires them`);
-  }
+  // Positional, because buildTemplatePayload reads sampleValues by index: a
+  // count of non-empty values ANYWHERE let ['', 'Asha'] pass for one variable,
+  // and Meta then reviewed the 'there' fallback instead of the operator's word.
+  vars.forEach((n, i) => {
+    if (!String(sampleValues[i] || '').trim()) {
+      errors.push(`Provide a sample value for {{${n}}} — Meta requires one to review the template`);
+    }
+  });
   if (/^\s*\{\{\s*\d+\s*\}\}/.test(body)) errors.push('Body cannot start with a variable');
   if (/\{\{\s*\d+\s*\}\}\s*$/.test(body)) errors.push('Body cannot end with a variable');
 
@@ -221,6 +226,11 @@ async function fetchTemplates(name) {
 
 // Validate template — fetches status, category, language, body text from Meta
 async function validateTemplate(templateName) {
+  // An empty name would make fetchTemplates omit the &name= filter, list the
+  // whole WABA, and adoptTemplate would then adopt the FIRST template's status
+  // and body under a name nobody chose — enough to launch a run whose every
+  // send posts template.name '' and fails with 132001.
+  if (!String(templateName || '').trim()) return { found: false, name: templateName };
   const r = await fetchTemplates(templateName);
   if (r.error) return r;
   if (!r.found) return { found: false, name: templateName };
@@ -244,6 +254,14 @@ function adoptTemplate(name, result) {
     if (result && result.found === false) S.config.templateStatus = 'NOT_FOUND';
     return;
   }
+  // Read BEFORE templateName is overwritten: re-adopting the template that is
+  // already active must not clobber the attachment the operator picked this
+  // session. This function runs on every validate-template call and on the
+  // 15-second status poll, and each of those used to reset headerAssetId to
+  // the row's approval-time asset — null for a template created outside this
+  // app — so the file chosen in the Attachment picker vanished within seconds
+  // and the screen went back to "choose the file to send".
+  const samePick = S.config.templateName === name;
   S.config.templateName     = name;
   // adoptTemplate is the single funnel through which Meta's shaped template
   // reaches S.config, which is what lets startRun keep its one-argument
@@ -254,7 +272,12 @@ function adoptTemplate(name, result) {
   // externally created template is still recognisably a media template.
   const row = getTemplateRow(name);
   S.config.headerFormat     = row?.header_format ?? t.headerFormat ?? null;
-  S.config.headerAssetId    = row?.header_asset ?? null;
+  // The row is a fallback, never an override: switching templates (or a cleared
+  // selection — /api/config sets null on purpose) restores the approval-time
+  // asset, but the operator's live choice for the active template wins.
+  S.config.headerAssetId    = samePick && S.config.headerAssetId != null
+    ? S.config.headerAssetId
+    : row?.header_asset ?? null;
   S.config.templateStatus   = t.status;
   S.config.templateCategory = t.category;
   S.config.templateLanguage = t.language;

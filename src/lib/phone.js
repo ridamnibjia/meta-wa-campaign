@@ -59,7 +59,10 @@ const isPhoneHeader = h => /phone|mobile/i.test(h);
 function parseCSV(buffer) {
   const lines = buffer.toString('utf8').split('\n')
     .map(l => l.replace(/\r$/, '')).filter(l => l.trim());
-  if (!lines.length) return { contacts: [], skipped: [] };
+  // The same three keys as the normal return: the route destructures all of
+  // them, and an empty file that omits `duplicates` threw a TypeError AFTER a
+  // fresh empty run had already been staged and made current.
+  if (!lines.length) return { contacts: [], skipped: [], duplicates: [] };
 
   const hdr    = splitCsvLine(lines[0]);
   const firstI = hdr.findIndex(h => /^first.?name/i.test(h));

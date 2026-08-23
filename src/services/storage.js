@@ -78,13 +78,22 @@ const dueForSweep = db.prepare(`
    WHERE path IS NOT NULL AND downloaded_at IS NOT NULL
      AND ((provisional = 0 AND downloaded_at < ?) OR (provisional = 1 AND downloaded_at < ?))`);
 
+// The one answer to "what will the next sweep take" — the Storage page and the
+// Diagnostics page both read it, because two hand-written copies of the two
+// cutoffs is how the screens drift (Diagnostics used a single 90-day clock and
+// missed every previewed file the 24-hour clock was about to remove).
+function sweepDue(now = Date.now()) {
+  const due = dueForSweep.get(
+    now - MEDIA_LIMITS.retentionDays * DAY_MS,
+    now - MEDIA_LIMITS.previewHours * 60 * 60 * 1000);
+  return { files: due.files || 0, bytes: due.bytes || 0 };
+}
+
 function overview({ now = Date.now() } = {}) {
   const vol = volume(MEDIA_DIR);
   const a   = assetTotals.get();
   const i   = inboundTotals.get();
-  const due = dueForSweep.get(
-    now - MEDIA_LIMITS.retentionDays * DAY_MS,
-    now - MEDIA_LIMITS.previewHours * 60 * 60 * 1000);
+  const due = sweepDue(now);
 
   // file_size is what Meta declared, which is close but not identical to what
   // the bytes weigh on disk. The breakdown is honest about which is which
@@ -273,8 +282,8 @@ function removeMany(items) {
       // behaviour wanted here — the check does not need repeating, and
       // repeating it is how the two would drift apart.
       const r = discardInbound(String(id));
-      if (r.ok && !r.already) removed++;
-      results.push({ store, id, ok: r.ok, error: r.error || null, freed: 0 });
+      if (r.ok && !r.already) { removed++; freed += r.freed || 0; }
+      results.push({ store, id, ok: r.ok, error: r.error || null, freed: r.freed || 0 });
     } else {
       results.push({ store: store || null, id: id ?? null, ok: false, error: 'Unknown store.' });
     }
@@ -285,4 +294,4 @@ function removeMany(items) {
   return { ok: true, removed, failed: failed.length, freed, results };
 }
 
-module.exports = { overview, listStored, renameAsset, removeMany, volume };
+module.exports = { overview, listStored, renameAsset, removeMany, volume, sweepDue };

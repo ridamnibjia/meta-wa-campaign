@@ -63,7 +63,12 @@ router.post('/config', (req, res) => {
   // returns to — nothing here writes to disk, matching how credentials behave.
   if (prices && typeof prices === 'object') {
     for (const k of ['MARKETING', 'UTILITY', 'AUTHENTICATION']) {
-      const v = Number(prices[k]);
+      // Blank is skipped, the same way dailyCap above treats it: an untouched
+      // empty form field serialises as '', and Number('') is 0 — a valid price
+      // this loop would otherwise adopt, silently zeroing every spend figure.
+      const raw = prices[k];
+      if (raw === undefined || raw === null || String(raw).trim() === '') continue;
+      const v = Number(raw);
       if (Number.isFinite(v) && v >= 0) PRICES[k] = v;
     }
     if (typeof prices.currency === 'string' && prices.currency.trim()) {

@@ -146,8 +146,12 @@ function Dashboard() {
           <CardContent className="space-y-2">
             <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
               <span><strong className="text-foreground tabular-nums">{num(lastRun.progress.sent)}</strong> of {num(lastRun.progress.total)} sent</span>
-              <span><strong className="text-foreground tabular-nums">{num(lastRun.counts.delivered)}</strong> delivered</span>
-              <span><strong className="text-foreground tabular-nums">{num(lastRun.counts.failed)}</strong> failed</span>
+              {/* The funnel, not countsForRun: this card sits beside tiles that
+                  read the funnel, and the message-table numbers disagree with
+                  them the moment a test send or a webhook failure exists —
+                  "2 failed · 2 retrying" about the same two people. */}
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.funnel.delivered)}</strong> delivered</span>
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.funnel.failed)}</strong> failed</span>
               <span><strong className="text-foreground tabular-nums">{num(lastRun.progress.skipped)}</strong> skipped</span>
               {lastRun.progress.retrying > 0 && (
                 <span><strong className="text-warning tabular-nums">{num(lastRun.progress.retrying)}</strong> retrying</span>
@@ -181,14 +185,21 @@ function Dashboard() {
               hint="gave up after every attempt" />
         <Stat label="Not on WhatsApp" value={num(unreachable)}
               tone={unreachable ? 'text-destructive' : undefined} hint="Meta says undeliverable" />
-        <Stat label="Skipped"   value={num(skipped)}   hint="opted out or switched off" />
+        {/* funnel.optedOut, not progress.skipped: the queue's `skipped` also
+            counts API refusals (skipped_reason 'failed'/'skipped'), which the
+            Failed tile already shows — the same person counted twice on one
+            row, under a hint about opting out that nobody did. */}
+        <Stat label="Skipped"   value={num(f.optedOut || 0)}   hint="opted out or switched off" />
         {retrying > 0 && (
           <Stat label="Waiting" value={num(retrying)} tone="text-warning"
                 hint={nextRetry ? `next attempt ${new Date(nextRetry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'queued for another try'} />
         )}
       </div>
 
-      <Funnel funnel={funnel} />
+      {/* live must track the phase: after a Stop the run's funnel is still
+          published, and the default live=true promised retries no loop will
+          make — while History said the opposite about the same run. */}
+      <Funnel funnel={funnel} live={['running', 'waiting', 'paused'].includes(phase)} />
 
       <div className="grid gap-4 lg:grid-cols-3">
         {/* Cost */}

@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const { CFG } = require('../config');
-const { S, log } = require('../state');
+const { S, log, campaignActive } = require('../state');
 const { broadcast } = require('../services/status');
 const { explainError } = require('../lib/errors');
 const { graphSend, resolveWabaId } = require('../services/graph');
@@ -51,6 +51,13 @@ router.post('/template/create', async (req, res) => {
     headerAssetId: req.body.headerAssetId || null,
     buttons:       req.body.buttons       || [],
   };
+  // A headerAssetId on a TEXT or absent header is a stray: nothing uploads it,
+  // but lines below would persist it into S.config and templates.header_asset —
+  // after which every send of this template carries a media header component
+  // the approved template does not have, and Meta refuses each contact (132000).
+  // With enforced FKs a nonexistent id would also make saveTemplateRow throw
+  // AFTER Meta accepted the template. Nulled once, here, for all three sinks.
+  if (!['IMAGE', 'VIDEO', 'DOCUMENT'].includes(input.headerFormat)) input.headerAssetId = null;
 
   const errors = validateTemplateInput(input);
   if (errors.length) return res.json({ ok: false, errors });
@@ -144,7 +151,11 @@ router.get('/template/status', async (req, res) => {
 // turn every remaining contact into a failure.
 router.delete('/template/:name', async (req, res) => {
   const name = req.params.name;
-  if (S.phase === 'running' && S.config.templateName === name) {
+  // campaignActive(), not S.phase === 'running': a campaign parked on the retry
+  // ladder ('waiting', rendered as "In progress") or in an automatic pause
+  // ('paused') still owns its queue, and deleting the template it is sending
+  // turns every remaining contact into a 132001 failure when the loop wakes.
+  if (campaignActive() && S.config.templateName === name) {
     return res.status(409).json({
       ok: false,
       error: 'This template is being sent right now. Stop the campaign before deleting it.',

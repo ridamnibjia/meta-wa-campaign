@@ -38,6 +38,13 @@ router.post('/upload-csv', (req, res, next) => {
     const blocked = campaignBlocker();
     if (blocked) return res.json({ ok: false, error: blocked });
     const { contacts: parsed, skipped, duplicates } = parseCSV(req.file.buffer);
+    // Refused BEFORE stageRun: staging replaces the queue and opens a new run,
+    // and an empty file must not swap a real campaign's queue for nothing.
+    if (!parsed.length) {
+      return res.json({ ok: false, error: skipped.length
+        ? `No usable contacts — all ${skipped.length} row(s) lacked a phone number this app can read. Check the column headers and country codes.`
+        : 'That CSV is empty — nothing was loaded.' });
+    }
     // The durable list is updated before the send queue, and the upsert
     // deliberately does not touch `enabled`: re-uploading a CSV must never
     // resurrect someone who opted out.

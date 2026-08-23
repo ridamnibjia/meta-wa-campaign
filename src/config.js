@@ -33,6 +33,17 @@ const CFG = {
   port:               parseInt(process.env.PORT)       || 3000,
 };
 
+// `Number(x) || fallback` cannot express zero, and zero is a legitimate setting
+// twice over: PRICE_UTILITY=0 (utility inside the service window is genuinely
+// free in some markets) and WA_MEDIA_MIN_FREE_BYTES=0 (a dedicated media disk
+// may want no floor). An unset or unparseable variable still falls back.
+// Declared above PRICES because PRICES is its first consumer.
+const num = (raw, fallback) => {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
 // ── Pricing ────────────────────────────────────────────────────────────────────
 // Meta switched to per-message pricing on 1 July 2025: each *delivered* template
 // message is billed at a per-category, per-country rate. These defaults are the
@@ -41,9 +52,9 @@ const CFG = {
 // labelled approximate.
 const PRICES = {
   currency:    process.env.CURRENCY        || '₹',
-  MARKETING:      Number(process.env.PRICE_MARKETING) || 0.78,
-  UTILITY:        Number(process.env.PRICE_UTILITY)   || 0.115,
-  AUTHENTICATION: Number(process.env.PRICE_AUTH)      || 0.125,
+  MARKETING:      num(process.env.PRICE_MARKETING, 0.78),
+  UTILITY:        num(process.env.PRICE_UTILITY,   0.115),
+  AUTHENTICATION: num(process.env.PRICE_AUTH,      0.125),
 };
 
 // ── Official Meta character limits ─────────────────────────────────────────────
@@ -99,15 +110,6 @@ const CLAMAV = {
 // stops a save filling the boot disk out from under SQLite, which handles a
 // full filesystem by refusing writes: an unbounded media save would take the
 // message store down with it, which is far worse than a refused Save.
-// `Number(x) || fallback` cannot express zero, and zero is a legitimate setting
-// for the free-space floor: a self-hoster on a dedicated media disk may not want
-// one at all. An unset or unparseable variable still falls back.
-const num = (raw, fallback) => {
-  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
-};
-
 const MEDIA_LIMITS = {
   maxBytes:      num(process.env.WA_MEDIA_MAX_BYTES,      100 * 1024 * 1024),
   minFreeBytes:  num(process.env.WA_MEDIA_MIN_FREE_BYTES, 2 * 1024 * 1024 * 1024),

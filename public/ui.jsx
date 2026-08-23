@@ -245,8 +245,12 @@ const FUNNEL_ROWS = [
 //
 // routes/campaign.js:/campaign/skips already draws exactly these distinctions.
 // This is the same rule on the other screen, and it must not disagree with it.
+// A disabled row with attempts > 0 was reached by the ladder BEFORE the
+// opt-out landed — the loop parks it as 'disabled' when the retry comes due —
+// so its tries are `attempts` exactly, like a retrying row: the next attempt
+// never happened. Zero only for the common case, switched off before any send.
 const triesFor = r =>
-  (r.skipped_reason === 'disabled' || r.bucket === 'pending') ? 0
+  (r.skipped_reason === 'disabled' || r.bucket === 'pending') ? (r.attempts || 0)
   : r.bucket === 'retrying' ? (r.attempts || 0)
   : (r.attempts || 0) + 1;
 

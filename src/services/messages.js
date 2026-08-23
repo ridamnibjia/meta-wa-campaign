@@ -76,6 +76,20 @@ function applyStatus(status) {
   const now = Date.now();
 
   if (st === 'failed') {
+    // A device that has acknowledged delivery cannot un-receive the message.
+    // Meta redelivers statuses and promises no order, so a `failed` landing
+    // after `delivered`/`read` for the SAME wamid is a stale or contradictory
+    // event, never a real refusal — and acting on it walked a contact whose
+    // message was on their phone onto the retry ladder, re-sending the same
+    // campaign copy every three hours. `advance` already refuses the mirror
+    // case (a `delivered` after a `failed`); this is the same rank rule, from
+    // the other side. markFailed is unguarded below only for rows that have
+    // not reached `delivered`, where a later failure genuinely can carry a
+    // better error code than an earlier one.
+    if (row.status === 'delivered' || row.status === 'read') {
+      log('warn', `stale "failed" for ${id} ignored — already ${row.status}`);
+      return;
+    }
     const code  = status.errors?.[0]?.code ?? null;
     const title = status.errors?.[0]?.title ?? null;
     const hint  = explainError(code);
@@ -268,12 +282,22 @@ const insertRun = db.prepare(`
 // ?? null on every bind is required: node:sqlite throws on an undefined bind,
 // and a campaign.json saved before this change carries no headerAssetId.
 function startRun(label) {
+  // The picked header is validated against the library before it is bound:
+  // node:sqlite enforces the header_asset REFERENCES, so a pick whose row was
+  // since deleted would make this INSERT throw "FOREIGN KEY constraint failed"
+  // and every CSV upload with it. A tombstoned pick is nulled too — its bytes
+  // are gone and every send of it would be refused by name anyway.
+  let headerAsset = S.config.headerAssetId ?? null;
+  if (headerAsset != null) {
+    const a = require('./media').getAsset(headerAsset);
+    if (!a || a.deleted_at) headerAsset = S.config.headerAssetId = null;
+  }
   const id = Number(insertRun.run(
     Date.now(),
     label ?? null,
     S.config.templateBody     ?? null,
     S.config.templateLanguage ?? null,
-    S.config.headerAssetId    ?? null,
+    headerAsset,
   ).lastInsertRowid);
   S.currentRunId = id;
   return id;
@@ -334,8 +358,12 @@ const insertRecipient = db.prepare(`
 // message. Split, the first half is exactly idx_run_recipients_pending and the
 // second is exactly idx_run_recipients_retry, ORDER BY included. Both are
 // asserted on the query plan in test.js.
+// skipped_reason and error_code travel with the row: the loop's progress index
+// adds one only for an untried row (a due retry is already inside `attempted`
+// as `retrying`), and the disabled branch preserves the ladder's last error
+// code — neither can work if the column stays behind in the table.
 const nextUntriedQ = db.prepare(`
-  SELECT phone, name, seq, attempts, retry_after FROM run_recipients
+  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code FROM run_recipients
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason IS NULL
    ORDER BY seq LIMIT 1
 `);
@@ -344,7 +372,7 @@ const nextUntriedQ = db.prepare(`
 // turn came up first", and idx_run_recipients_retry is (run_id, retry_after) so
 // this is the same seek that answers nextRetryAtQ.
 const nextDueRetryQ = db.prepare(`
-  SELECT phone, name, seq, attempts, retry_after FROM run_recipients
+  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code FROM run_recipients
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason = 'retry' AND retry_after <= ?
    ORDER BY retry_after LIMIT 1
 `);
@@ -722,6 +750,11 @@ const strandedRetryQ = db.prepare(`
 
 const runLabelQ = db.prepare('SELECT id, label, started_at FROM campaign_runs WHERE id = ?');
 
+// For loadCampaign's sanity check on a restored id: node:sqlite enforces the
+// run_id REFERENCES, so a campaign.json that outlived its database must not
+// hand the loop a run nothing can insert against.
+const runExists = id => !!runLabelQ.get(Number(id));
+
 function strandedWork(currentRunId = S.currentRunId) {
   const id = currentRunId ?? null;
   const byRun = new Map();
@@ -873,7 +906,7 @@ module.exports = {
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
-  recordRecipientRetry, requeueFailedRecipient, recipientFor,
+  recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists,
   nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
 };

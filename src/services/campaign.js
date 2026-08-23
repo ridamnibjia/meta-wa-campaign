@@ -7,7 +7,7 @@ const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
 const { W, warmupCap, effectiveCap, markWarmupDay, dailyCount } = require('./warmup');
 const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
-        requeueFailedRecipient, recipientFor,
+        requeueFailedRecipient, recipientFor, runExists,
         nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition } = require('../lib/errors');
@@ -62,6 +62,20 @@ function loadCampaign() {
     if (Array.isArray(d.contacts) && d.contacts.length) {
       log('warn', `campaign.json is from before the durable send queue — its ${d.contacts.length} contacts were NOT resumed. Re-upload the CSV to start a run; anyone already messaged is in the thread list.`);
     }
+    return null;
+  }
+  // A campaign.json that outlived its database — a wa.db restored from an older
+  // backup, or recreated — points at a run that does not exist. node:sqlite
+  // enforces the run_id REFERENCES, so restoring that id would make the first
+  // test-send's INSERT throw "FOREIGN KEY constraint failed" outside any
+  // try/catch and kill the process; and a saved active phase with no real run
+  // behind it leaves campaignBlocker() refusing every Start until Stop is
+  // pressed. Same state-file/DB skew reconcileWarmupDays exists for.
+  if (d.currentRunId != null && !runExists(d.currentRunId)) {
+    log('warn', `campaign.json points at run ${d.currentRunId}, which is not in the database — the state files and wa.db are out of step, so starting idle`);
+    // The operator's own settings are still theirs; only the phantom run and
+    // the phase that depended on it are dropped.
+    if (d.config) Object.assign(S.config, d.config);
     return null;
   }
   // dailyCount / dailyDate are not restored, and a file that still carries them
@@ -244,6 +258,14 @@ const RATE_LIMIT_RETRIES = 3;
 const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
   { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
 
+// The one rule for all three sites that touch the night: the loop's clock gate
+// and both retry-deadline writers. WA_QUIET_HOURS=0 is the operator's sanctioned
+// opt-out, and it used to apply only to the clock gate — a failure at 23:30 was
+// still deferred to 08:00, so the deployment that explicitly disabled quiet
+// hours parked all night anyway. Not pushed into lib/schedule.js: the suite runs
+// with the flag off and still has to test the deferral arithmetic itself.
+const deferIfQuiet = t => (QUIET_HOURS ? deferPastQuietHours(t) : t);
+
 // True when the contact was put back in the queue; false when the caller should
 // record a terminal skip. `row.attempts` is how many retries this contact has
 // already had — the SQL increments it, so it cannot drift.
@@ -262,7 +284,7 @@ function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
   // what nextPending compares against and what the "next attempt" sentence shows
   // the operator, so nudging the deadline anywhere else would leave the queue
   // and the screen disagreeing about when this contact is due.
-  const at = deferPastQuietHours(Date.now() + RETRY_BACKOFF_MS[made]);
+  const at = deferIfQuiet(Date.now() + RETRY_BACKOFF_MS[made]);
   recordRecipientRetry(runId, contact.dialStr, result.errorCode, at);
   log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
   return true;
@@ -348,7 +370,7 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
     log('warn', `+${waId} — still not delivered after ${made + 1} attempts, giving up [${code}]`);
     return 'exhausted';
   }
-  const at = deferPastQuietHours(Date.now() + RETRY_BACKOFF_MS[made]);
+  const at = deferIfQuiet(Date.now() + RETRY_BACKOFF_MS[made]);
   if (!requeueFailedRecipient(runId, waId, wamid, code, at)) return 'stale';
   log('warn', `+${waId} — back on the queue, retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
 
@@ -536,7 +558,11 @@ async function campaignLoop() {
       // number is undeliverable" are the same skip to the loop and completely
       // different problems to the operator.
       const why = getRow(contact.dialStr)?.disabled_reason || 'disabled';
-      recordRecipientSkipped(runId, contact.dialStr, 'disabled', null);
+      // c.error_code, not null: a contact parked on the retry ladder and then
+      // disabled mid-run was really attempted — nulling the code here made the
+      // skip report claim "nothing was attempted" about someone this run
+      // messaged. NULL for a fresh row, so this is a no-op on the common path.
+      recordRecipientSkipped(runId, contact.dialStr, 'disabled', c.error_code ?? null);
       log('warn', `${n} skipped — ${contact.name} is disabled (${why})`);
       saveCampaign();
       broadcast();
@@ -554,7 +580,7 @@ async function campaignLoop() {
     // It applies to the first pass too: a campaign started at 23:30 is the same
     // notification at the same hour, and the quality rating that gates the
     // messaging tier does not care which rung woke the recipient up.
-    const gate = QUIET_HOURS ? deferPastQuietHours(Date.now()) : 0;
+    const gate = deferIfQuiet(Date.now());
     if (gate > Date.now()) {
       S.phase = 'paused';
       S.pauseReason = `Quiet hours — sending pauses 23:00–07:00 IST and resumes at ${clockIST(gate)}.`;

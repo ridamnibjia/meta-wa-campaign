@@ -227,6 +227,27 @@ test('the opt-out button is emitted first, before the operator\'s own', () => {
   assert.equal(b[1].url,  'https://example.com/0');
 });
 
+test('a blank sample slot is caught positionally, not by counting non-blanks elsewhere', () => {
+  const errs = validateTemplateInput({ displayName: 'x', bodyText: 'Hi {{1}}', sampleValues: ['', 'Asha'] });
+  assert.ok(errs.some(e => /\{\{1\}\}/.test(e)),
+    "['', 'Asha'] passed the old count-based check and Meta reviewed the 'there' fallback instead of the operator's word");
+});
+
+test('an empty CSV still answers with all three keys', () => {
+  // The route destructures `duplicates`; the old two-key early return threw a
+  // TypeError AFTER an empty run had already replaced the queue.
+  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [] });
+});
+
+testAsync('an empty template name never matches the whole WABA', async () => {
+  // fetchTemplates('') omits the &name= filter and lists every template, so
+  // adoptTemplate('') used to adopt the first one's body and status under a
+  // name nobody chose — enough to start a run that fails for every contact.
+  const { validateTemplate } = require('./server');
+  assert.deepEqual(await validateTemplate(''),   { found: false, name: '' });
+  assert.deepEqual(await validateTemplate('  '), { found: false, name: '  ' });
+});
+
 console.log('\ntemplate row memory');
 test('a saved template row round-trips its header asset link', () => {
   const name = `plan_test_${Date.now()}`;
@@ -238,6 +259,58 @@ test('a saved template row round-trips its header asset link', () => {
   assert.equal(row.header_format, 'DOCUMENT');
   assert.equal(row.var_count,     1);
 });
+
+console.log('\nadopting a template — the attachment picked this session survives the poll');
+{
+  const { adoptTemplate } = require('./server');
+  // adoptTemplate runs on every validate-template call and on the UI's
+  // 15-second status poll. Each run used to reset headerAssetId to the row's
+  // approval-time asset — null for a template created outside this app — so
+  // the file the operator picked in the Attachment picker vanished within
+  // seconds and the Start button went back to "choose the file to send".
+  const shapedFor = name => ({ found: true, templates: [{
+    name, status: 'APPROVED', category: 'MARKETING', language: 'en',
+    bodyText: 'Hi {{1}}', headerFormat: 'IMAGE', headerText: null,
+    qualityScore: null, rejectedReason: null, buttons: [],
+  }] });
+  const before = JSON.parse(JSON.stringify(S.config));
+  // node:sqlite enforces the REFERENCES on templates.header_asset, so the rows
+  // these templates point at have to exist.
+  const mkAsset = sha => Number(db.prepare(
+    `INSERT INTO media_assets (sha256, path, filename, mime_type, file_size, kind, uploaded_at, last_used_at)
+     VALUES (?, ?, 'a.jpg', 'image/jpeg', 10, 'image', 1, 1)`).run(sha, sha).lastInsertRowid);
+  const approvedAsset = mkAsset('adopt-a'.padEnd(64, '0'));
+  const otherAsset    = mkAsset('adopt-b'.padEnd(64, '0'));
+  const pickedAsset   = mkAsset('adopt-c'.padEnd(64, '0'));
+
+  test('the first adopt restores the approval-time asset from the row', () => {
+    saveTemplateRow({ name: 'adopt_media', displayName: 'Adopt', headerFormat: 'IMAGE',
+                      headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
+    S.config.templateName = '';
+    adoptTemplate('adopt_media', shapedFor('adopt_media'));
+    assert.equal(S.config.headerAssetId, approvedAsset);
+  });
+  test('re-adopting the active template keeps the operator\'s own pick', () => {
+    S.config.headerAssetId = pickedAsset;              // /api/config, Attachment picker
+    adoptTemplate('adopt_media', shapedFor('adopt_media'));  // the 15s status poll
+    assert.equal(S.config.headerAssetId, pickedAsset,
+      'the poll must not clobber a file the operator chose seconds ago');
+  });
+  test('a cleared selection is refilled from the row, as /api/config promises', () => {
+    S.config.headerAssetId = null;
+    adoptTemplate('adopt_media', shapedFor('adopt_media'));
+    assert.equal(S.config.headerAssetId, approvedAsset);
+  });
+  test('switching templates restores that template\'s own approval-time asset', () => {
+    saveTemplateRow({ name: 'adopt_other', displayName: 'Other', headerFormat: 'IMAGE',
+                      headerAssetId: otherAsset, bodyText: 'Yo {{1}}', varCount: 1, status: 'APPROVED' });
+    adoptTemplate('adopt_other', shapedFor('adopt_other'));
+    assert.equal(S.config.headerAssetId, otherAsset,
+      'a session pick belongs to the template it was picked for');
+  });
+
+  Object.assign(S.config, before);   // adoptTemplate writes broadly; leave S as found
+}
 
 console.log('\nbuildParams');
 const slots = (...v) => { resizeParamValues(v.length); S.config.paramValues = v; };
@@ -717,6 +790,27 @@ console.log("\ntoday's send count — refused sends give the slot back");
     assert.equal(require('./server').sendingDays().includes('2031-02-02'), false,
       'a day on which nothing was actually delivered is no evidence the number sends steadily');
   });
+
+  // Meta redelivers statuses and promises no order. A `failed` arriving after
+  // `delivered` for the same wamid used to overwrite the status and return a
+  // retry descriptor — which walked a contact whose message was on their phone
+  // onto the retry ladder, re-sending the same copy every three hours.
+  test('a failure webhook landing after delivered is stale and changes nothing', () => {
+    out({ wamid: 'day-5', waId: '919600000005', name: 'Five', body: 'x', at: BASE, runId: run });
+    applyStatus({ id: 'day-5', status: 'delivered' });
+    const r = applyStatus({ id: 'day-5', status: 'failed', errors: [{ code: 131049, title: 'refused' }] });
+    assert.equal(r, undefined, 'no descriptor — a delivered message must never be requeued');
+    const row = db.prepare('SELECT status, error_code FROM messages WHERE wamid = ?').get('day-5');
+    assert.equal(row.status, 'delivered', 'the device acknowledged it; a later failure is the stale event');
+    assert.equal(row.error_code, null, 'nothing about the stale failure is recorded on the row');
+    assert.equal(sentSince(since), 3, 'the delivered send keeps its cap slot');
+  });
+  test('a read message shrugs off a stale failure the same way', () => {
+    out({ wamid: 'day-6', waId: '919600000006', name: 'Six', body: 'x', at: BASE, runId: run });
+    applyStatus({ id: 'day-6', status: 'read' });
+    assert.equal(applyStatus({ id: 'day-6', status: 'failed', errors: [{ code: 131049 }] }), undefined);
+    assert.equal(db.prepare('SELECT status FROM messages WHERE wamid = ?').get('day-6').status, 'read');
+  });
 }
 
 console.log('\nthe funnel — every contact in exactly one bucket');
@@ -936,11 +1030,13 @@ test('failed records the error code and title', () => {
   assert.equal(r.error_code, 131026);
   assert.equal(r.error_title, 'Message undeliverable');
 });
-test('failed overwrites a prior delivered', () => {
+test('a failure after delivered is the stale event and is ignored', () => {
   seedOut('m6');
   applyStatus({ id: 'm6', status: 'delivered' });
-  applyStatus({ id: 'm6', status: 'failed', errors: [{ code: 470, title: 'Expired' }] });
-  assert.equal(statusOf('m6').status, 'failed');
+  const r = applyStatus({ id: 'm6', status: 'failed', errors: [{ code: 470, title: 'Expired' }] });
+  assert.equal(statusOf('m6').status, 'delivered',
+    'the device acknowledged receipt — a message cannot un-deliver, so the failure is the lie');
+  assert.equal(r, undefined, 'and no retry descriptor, or the ladder would re-send a delivered message');
 });
 test('failed is terminal — a late delivered or read cannot resurrect it', () => {
   seedOut('m5b');
@@ -1547,6 +1643,19 @@ console.log('\nmedia — saveUpload');
     assert.equal(r.ok, true, r.error);
     assert.equal(r.deduped, true, 'a byte-identical re-upload must reuse the existing row');
     assert.equal(listAssets().length, before, 'dedupe must not add a row');
+  });
+
+  test('a re-upload restores bytes the row still claims but the disk lost', () => {
+    // A wa.db restored without the uploads directory: the row survives, the
+    // file does not. Re-uploading the identical file is the natural repair,
+    // and a dedupe that writes nothing left every later send failing with an
+    // ENOENT dressed up as a network error.
+    const first = saveUpload(file(pdf, 'price-list.pdf', 'application/pdf'));
+    fsx.unlinkSync(assetPath(first.asset));
+    const again = saveUpload(file(pdf, 'price-list.pdf', 'application/pdf'));
+    assert.equal(again.ok, true, again.error);
+    assert.equal(again.deduped, true, 'still the same row');
+    assert.ok(fsx.existsSync(assetPath(again.asset)), 'and the bytes are back on disk');
   });
 
   test('rejects an image over 5 MB, naming the limit', () => {
@@ -2633,20 +2742,24 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       'even spacing is what makes the ladder explainable to an operator');
   });
 
-  test('a stored retry deadline never lands in the middle of the night', () => {
+  test('with WA_QUIET_HOURS=0 the stored deadline is exactly the backoff — the opt-out reaches the ladder too', () => {
+    // The suite runs with quiet hours off, and that flag used to apply only to
+    // the loop's clock gate: scheduleRetry still deferred every night-time
+    // deadline to 08:00, so a deployment that explicitly opted out of quiet
+    // hours parked all night anyway. The deferral arithmetic itself is tested
+    // against deferPastQuietHours directly, above.
     const run = newRun();
     const p = people(1);
     const saved = S.currentRunId;
     S.currentRunId = run;
     try {
       buildRun(run, p);
+      const before = Date.now();
       scheduleRetry({ name: p[0].name, dialStr: p[0].dialStr }, { attempts: 0 },
         { errorCode: 131049, error: 'cap' }, '[t]');
       const at = rowFor(run, p[0].dialStr).retry_after;
-      const hourIST = new Date(at + IST_OFFSET_MS).getUTCHours();
-      assert.ok(hourIST >= 7 && hourIST < 23,
-        `a retry was stored for ${hourIST}:00 IST — the deferral has to happen before the ` +
-        'row is written, or the queue and the operator disagree about when this contact is due');
+      assert.ok(Math.abs(at - (before + 3 * 3600000)) < 60000,
+        'under WA_QUIET_HOURS=0 the deadline must be the bare three-hour rung, whatever the wall clock says');
     } finally { S.currentRunId = saved; }
   });
 
@@ -3145,12 +3258,27 @@ console.log('\nstorage — overview, listing, rename, bulk removal');
   };
 
   test('the overview reports the whole volume, not just what this app wrote', () => {
-    const o = overview();
-    assert.ok(o.volume.total === null || o.volume.total > 0,
-      'an operator reading "uploads: 44 MB" cannot tell if that is a problem without the disk size');
-    assert.ok(o.volume.free === null || o.volume.free >= 0);
-    assert.equal(typeof o.ours, 'number', 'the app total is what the breakdown has to add up to');
-    assert.ok(o.breakdown.database.bytes > 0, 'the database is always on this disk');
+    // The suite runs on WA_DB_PATH=':memory:', so the real FILES.db weighs
+    // nothing here. Point it at a scratch file with bytes in it for this one
+    // assertion — in production the database is always on this disk, and that
+    // is exactly what the assertion exists to say.
+    const { FILES } = require('./src/config');
+    const realDb = FILES.db;
+    const fakeDb = require('path').join(process.env.WA_UPLOAD_DIR, 'overview-test.db');
+    fsx.mkdirSync(process.env.WA_UPLOAD_DIR, { recursive: true });
+    fsx.writeFileSync(fakeDb, 'not empty');
+    FILES.db = fakeDb;
+    try {
+      const o = overview();
+      assert.ok(o.volume.total === null || o.volume.total > 0,
+        'an operator reading "uploads: 44 MB" cannot tell if that is a problem without the disk size');
+      assert.ok(o.volume.free === null || o.volume.free >= 0);
+      assert.equal(typeof o.ours, 'number', 'the app total is what the breakdown has to add up to');
+      assert.ok(o.breakdown.database.bytes > 0, 'the database is always on this disk');
+    } finally {
+      FILES.db = realDb;
+      fsx.rmSync(fakeDb, { force: true });
+    }
   });
 
   test('the breakdown marks which categories can actually be freed', () => {
@@ -4001,6 +4129,24 @@ test('a pre-queue campaign.json is refused rather than resumed against no queue'
   assert.equal(S.phase, 'idle', 'and nothing starts sending');
   assert.ok(S.logs.slice(before).some(l => /NOT resumed/.test(l.msg)),
     'the operator must be told their interrupted run did not come back');
+}));
+// node:sqlite enforces the run_id REFERENCES, so a campaign.json that outlived
+// its database (wa.db restored from an older backup) must not hand the loop a
+// run id no INSERT can bind — the first test-send used to die on it with an
+// unhandled "FOREIGN KEY constraint failed".
+test('a campaign.json pointing at a run the database has never seen starts idle', () => withSavedCampaignFile(() => {
+  const savedDelay = S.config.delaySec;
+  fsx.writeFileSync(F1_FILES.campaign, JSON.stringify({
+    phase: 'running', currentRunId: 99999999, pauseReason: null,
+    config: { delaySec: 7 }, savedAt: Date.now(),
+  }));
+  S.currentRunId = null; S.phase = 'idle';
+  try {
+    resumeIfInterrupted();
+    assert.equal(S.currentRunId, null, 'a phantom run id must not be adopted');
+    assert.equal(S.phase, 'idle', 'and no active phase survives with no real run behind it');
+    assert.equal(S.config.delaySec, 7, "the operator's own settings still come back");
+  } finally { S.config.delaySec = savedDelay; }
 }));
 
 console.log('\nF2 — webhook body size limit');

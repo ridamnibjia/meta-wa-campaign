@@ -72,13 +72,12 @@ const rowCounts = {
   webhook_events: one('SELECT count(*) AS n FROM webhook_events'),
 };
 
-// Saved inbound media that is still on disk, and what the next sweep will take.
+// Saved inbound media that is still on disk. "What the next sweep will take" is
+// services/storage.js:sweepDue — the sweep runs two clocks (90 days for kept
+// files, 24 hours for previews), and a hand-written single-cutoff copy here
+// under-reported by every previewed file the shorter clock was about to remove.
 const mediaOnDisk = one(
   'SELECT count(*) AS n, sum(file_size) AS bytes FROM media WHERE path IS NOT NULL');
-const mediaDueForSweep = one(`
-  SELECT count(*) AS n, sum(file_size) AS bytes
-    FROM media WHERE path IS NOT NULL AND downloaded_at IS NOT NULL AND downloaded_at < ?
-`);
 
 // The WAL and shared-memory files are part of what the database costs on disk,
 // and the -wal one in particular can dwarf the .db between checkpoints. Reporting
@@ -111,7 +110,7 @@ function freeBytes(dir) {
 function snapshot({ now = Date.now() } = {}) {
   const w = webhookStats.get();
   const disk  = mediaOnDisk.get();
-  const due   = mediaDueForSweep.get(now - MEDIA_LIMITS.retentionDays * 24 * 60 * 60 * 1000);
+  const due   = require('./storage').sweepDue(now);
   const free  = freeBytes(MEDIA_DIR);
 
   return {
@@ -184,7 +183,7 @@ function snapshot({ now = Date.now() } = {}) {
       belowFloor:   free !== null && free < MEDIA_LIMITS.minFreeBytes,
       retentionDays: MEDIA_LIMITS.retentionDays,
       savedMedia:  { files: disk.n || 0, bytes: disk.bytes || 0 },
-      dueForSweep: { files: due.n || 0, bytes: due.bytes || 0 },
+      dueForSweep: due,
     },
 
     rows: Object.fromEntries(Object.entries(rowCounts).map(([k, q]) => [k, q.get().n])),
