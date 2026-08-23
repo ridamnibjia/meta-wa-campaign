@@ -6533,6 +6533,30 @@ test('a CSV that lists the same number twice reports the merge rather than hidin
   assert.equal(skipped.length, 1, 'a row with no usable number is still a different problem, counted separately');
 });
 
+// ── Frontend scripts share one global scope ──────────────────────────────────
+console.log('\nfrontend — global scope');
+test('no top-level name is declared in two frontend scripts', () => {
+  // The views load as classic scripts in index.html order, so a later file's
+  // top-level declaration silently replaces an earlier one. Two components both
+  // named MediaPicker did exactly that: the inbox one overwrote the campaign
+  // header picker, whose onPick then never fired — the operator uploaded and
+  // selected a file and the template still submitted with no headerAssetId.
+  const html  = fsx.readFileSync(pathx.join(__dirname, 'public', 'index.html'), 'utf8');
+  const files = [...html.matchAll(/src="\/([^"]+\.jsx)"/g)].map(m => m[1]);
+  assert.ok(files.length > 1, 'index.html should list the frontend scripts');
+  const declaredIn = {};
+  for (const f of files) {
+    const src = fsx.readFileSync(pathx.join(__dirname, 'public', f), 'utf8');
+    for (const m of src.matchAll(/^(?:async )?function ([A-Za-z_$][\w$]*)|^const ([A-Za-z_$][\w$]*) *=/gm)) {
+      const name = m[1] || m[2];
+      (declaredIn[name] ||= new Set()).add(f);
+    }
+  }
+  const dupes = Object.entries(declaredIn).filter(([, set]) => set.size > 1);
+  assert.deepEqual(dupes.map(([n, set]) => `${n} in ${[...set].join(', ')}`), [],
+    'a name declared in two files means the later script silently replaces the earlier one');
+});
+
 Promise.all(pending).then(() => {
   console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ''}\n`);
 });

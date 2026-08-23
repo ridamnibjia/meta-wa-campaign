@@ -320,7 +320,11 @@ const mb = n => `${((n || 0) / 1024 / 1024).toFixed(1)} MB`;
 //
 // Module scope, like every other component in this file — one defined inside a
 // render is a new type on every render, and React remounts new types.
-function MediaPicker({ waId, onSent, onClose }) {
+//
+// Not "MediaPicker": campaign.jsx has a component of that name, and these files
+// share one global scope — the later script's declaration silently replaced the
+// campaign header picker, whose onPick then never fired. There is a test.
+function SendFilePanel({ waId, onSent, onClose }) {
   const [assets, setAssets] = useState(null);
   const [picked, setPicked] = useState(null);
   const [caption, setCaption] = useState('');
@@ -574,7 +578,7 @@ function Thread({ waId, onBack }) {
         )}
         {error && <p className="text-xs font-medium text-destructive">{error}</p>}
         {pickerOpen && data.windowOpen && (
-          <MediaPicker waId={waId}
+          <SendFilePanel waId={waId}
             onSent={() => { setPickerOpen(false); load(); loadInbox(); }}
             onClose={() => setPickerOpen(false)} />
         )}
