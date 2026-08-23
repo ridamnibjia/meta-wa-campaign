@@ -54,9 +54,10 @@ router.post('/test-send', async (req, res) => {
     log('info', `test send → +${dialStr}`);
     const r = await sendTemplate(contact);
     if (r.ok) {
-      // Recorded like any other send so the stat tiles walk accepted → delivered
-      // → read in front of you. It counts against the daily cap for free: that
-      // figure is a query over these rows, not a counter this route increments.
+      // Recorded like any other send, stamped with the current run, so it is
+      // counted — by the daily cap (a query over these rows) and by
+      // countsForRun. It stages no queue row, so the funnel-driven tiles
+      // deliberately do not move; the confirmation is the phone in your hand.
       markMessaged(dialStr);
       recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, r.params)

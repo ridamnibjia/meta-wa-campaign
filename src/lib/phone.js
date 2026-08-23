@@ -115,4 +115,21 @@ function parseCSV(buffer) {
   return { contacts, skipped, duplicates };
 }
 
-module.exports = { normalizePhone, parseCSV, splitCsvLine };
+// One CSV field on the way OUT, for the directory export. The name column is a
+// trust boundary — a WhatsApp profile name arrives over the webhook unsanitised
+// and can be anything a customer types — so two defences run before the
+// ordinary RFC 4180 quoting:
+//   · control characters (incl. CR/LF) become spaces: parseCSV above has no
+//     multi-line quoted-field support (deliberately), so a newline in a name
+//     would break the export's "re-upload as-is" promise for that row and the
+//     rows after it;
+//   · a leading = + - or @ gets Excel's apostrophe defusal — quoting alone does
+//     not stop Excel evaluating '=HYPERLINK(...)' typed as a profile name and
+//     exported onto the operator's machine.
+function csvField(v) {
+  const clean = String(v).replace(/[\u0000-\u001f]/g, ' ');
+  const safe  = /^[=+\-@]/.test(clean) ? `'${clean}` : clean;
+  return /[",]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+}
+
+module.exports = { normalizePhone, parseCSV, splitCsvLine, csvField };

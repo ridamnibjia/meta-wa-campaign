@@ -2,7 +2,7 @@
 const express = require('express');
 const multer  = require('multer');
 const { S, log, todayKey } = require('../state');
-const { parseCSV, normalizePhone } = require('../lib/phone');
+const { parseCSV, normalizePhone, csvField } = require('../lib/phone');
 const contacts = require('../services/contacts');
 const { recipientsForRun, progressForRun } = require('../services/messages');
 const { saveCampaignNow, stageRun, campaignBlocker } = require('../services/campaign');
@@ -83,6 +83,50 @@ router.post('/upload-csv', (req, res, next) => {
       billable, estimate: estimateCost(billable, rate), rate,
     });
   } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Stage a run from the contacts already on this server, no CSV in hand. The
+// directory is every number every upload has ever introduced, so "run it again
+// on the same 830" stops requiring a file the operator may no longer have.
+// Same guard, same staging and same shape of answer as /upload-csv — disabled
+// contacts are staged as skipped rows exactly as a CSV stages them, so the
+// funnel still reports who was left out and why.
+router.post('/stage-contacts', (req, res) => {
+  try {
+    const blocked = campaignBlocker();
+    if (blocked) return res.json({ ok: false, error: blocked });
+    const parsed = contacts.list().map(r => ({ name: r.name, dialStr: r.phone }));
+    if (!parsed.length) return res.json({ ok: false, error: 'No contacts on this server yet — upload a CSV first.' });
+    S.phase = 'idle'; S.failLog = [];
+    stageRun(parsed, `${S.config.templateName || 'campaign'} (server list)`);
+    saveCampaignNow();
+    log('info', `Campaign staged from the server's contact list — ${parsed.length} contacts`);
+    broadcast();
+    const rate     = rateFor(S.config.templateCategory);
+    const billable = billableCount(parsed, contacts.isDisabled);
+    res.json({
+      ok: true, count: parsed.length, sample: parsed.slice(0, 5),
+      billable, estimate: estimateCost(billable, rate), rate,
+    });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+
+// The list back out, in the exact shape it went in — Name, Mobile Phone with
+// the country code — so it can be re-uploaded as-is when the original file is
+// gone. Disabled contacts are included on purpose: re-uploading never
+// re-enables anyone (the upsert cannot touch `enabled`), and an export that
+// silently dropped them would not be the list.
+// UTF-8 BOM for the same reason the browser-built CSVs carry one: Excel on
+// Windows decodes a BOM-less file as the system codepage and mangles names.
+// csvField (lib/phone.js) defuses formula injection and strips control chars —
+// the name is a customer-controlled string and this file opens in Excel.
+router.get('/contacts/directory/export.csv', (req, res) => {
+  const rows = contacts.list();
+  const csv = '\ufeff' + ['Name,Mobile Phone',
+    ...rows.map(r => `${csvField(r.name || r.phone)},+${r.phone}`)].join('\r\n') + '\r\n';
+  res.setHeader('Content-Disposition', `attachment; filename="contacts-${todayKey()}.csv"`);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.send(csv);
 });
 
 // The SEND QUEUE — the current run, in the order the loop walks it. Read from

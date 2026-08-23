@@ -33,7 +33,11 @@ const upsertContact = db.prepare(`
   VALUES (?, ?, ?, ?)
   ON CONFLICT(phone) DO UPDATE SET
     name        = excluded.name,
-    fields_json = excluded.fields_json
+    -- COALESCE, because the two-column CSV the export route produces carries no
+    -- extra fields, and the round trip it advertises ("re-upload when the
+    -- original file is gone") must not be the thing that wipes the fields the
+    -- column exists to preserve. A file WITH extra columns still overwrites.
+    fields_json = COALESCE(excluded.fields_json, contacts.fields_json)
 `);
 
 const reapplySuppression = db.prepare(`
@@ -57,7 +61,11 @@ const isDisabledQ = db.prepare(`
   SELECT 1 AS hit FROM contacts   WHERE phone = ? AND enabled = 0
    UNION ALL
   SELECT 1 AS hit FROM suppressed WHERE phone = ?`);
-const allRows     = db.prepare('SELECT * FROM contacts ORDER BY enabled ASC, name COLLATE NOCASE ASC, phone ASC');
+// enabled DESC — messageable contacts first. Both callers are operator-facing
+// lists of "who a campaign reaches": the CSV export and /stage-contacts, whose
+// first five rows become the step-1 preview. enabled ASC led that preview with
+// exactly the people the run will skip.
+const allRows     = db.prepare('SELECT * FROM contacts ORDER BY enabled DESC, name COLLATE NOCASE ASC, phone ASC');
 const disabledQ   = db.prepare('SELECT * FROM contacts WHERE enabled = 0 ORDER BY disabled_at DESC');
 const countsQ     = db.prepare(`
   SELECT count(*)                                       AS total,

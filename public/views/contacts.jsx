@@ -187,10 +187,20 @@ function Contacts() {
                   onClick={() => { edit({ disable: [add] }, 'Added to the disabled list.'); setAdd(''); }}>
             Disable a number
           </Button>
-          <a href="/api/contacts/directory/download"
-             className="ml-auto text-xs text-primary underline-offset-4 hover:underline">
-            Download the disabled list
-          </a>
+          <span className="ml-auto flex items-center gap-3">
+            {/* The whole list, in the shape it was uploaded — Name, Mobile
+                Phone — so a lost CSV can be re-created from here and uploaded
+                as-is. Includes disabled contacts: re-uploading never
+                re-enables anyone. */}
+            <a href="/api/contacts/directory/export.csv" download
+               className="text-xs text-primary underline-offset-4 hover:underline">
+              Export all as CSV
+            </a>
+            <a href="/api/contacts/directory/download"
+               className="text-xs text-primary underline-offset-4 hover:underline">
+              Download the disabled list
+            </a>
+          </span>
         </div>
       </Card>
 

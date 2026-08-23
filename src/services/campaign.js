@@ -7,7 +7,7 @@ const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
 const { W, warmupCap, effectiveCap, markWarmupDay, dailyCount } = require('./warmup');
 const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
-        requeueFailedRecipient, recipientFor, runExists,
+        requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
         nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition } = require('../lib/errors');
@@ -724,6 +724,11 @@ function resumeIfInterrupted() {
 // report's whole job is saying who was not messaged and why, and a row that
 // was never inserted cannot say anything.
 function stageRun(contacts, label = S.config.templateName) {
+  // Staging over a run that was itself only staged discards it — otherwise its
+  // untouched rows survive as a run nothing points at and the Dashboard's
+  // stranded-contacts banner reports people who were never in a campaign.
+  // A run the loop has walked at all is kept: that is history.
+  discardUnstartedRun(S.currentRunId);
   const runId = startRun(label);
   buildRun(runId, contacts, phone => (isDisabled(phone) ? 'disabled' : null));
   return runId;

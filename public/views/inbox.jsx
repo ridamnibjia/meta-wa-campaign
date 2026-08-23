@@ -669,9 +669,15 @@ function Inbox() {
       </div>
 
       <Card className="overflow-hidden">
-        <div className="grid md:grid-cols-[18rem_1fr] md:divide-x md:divide-border" style={{ minHeight: '32rem' }}>
+        {/* One bounded height for BOTH columns, each scrolling on its own.
+            The right pane used to have no height at all, so a long thread
+            scrolled the PAGE — the transcript moved, the thread list (capped
+            at its own 36rem) did not, and the two panes slid out of
+            alignment. min-h-0 on each column is what lets a grid child
+            actually shrink to the row height instead of growing to fit. */}
+        <div className="grid h-[calc(100dvh-11.5rem)] min-h-[28rem] md:grid-cols-[18rem_1fr] md:divide-x md:divide-border">
           {/* Thread list — hidden on mobile once a conversation is open */}
-          <div className={cn('overflow-y-auto', selected && 'hidden md:block')} style={{ maxHeight: '36rem' }}>
+          <div className={cn('min-h-0 overflow-y-auto', selected && 'hidden md:block')}>
             <div className="sticky top-0 z-10 border-b border-border bg-card p-2">
               <Input value={q} onChange={e => setQ(e.target.value)}
                      placeholder="Search messages and people" className="h-8 text-xs" />
@@ -681,8 +687,10 @@ function Inbox() {
               : <ThreadList threads={threads} selected={selected} open={open} />}
           </div>
 
-          {/* Transcript */}
-          <div className={cn(!selected && 'hidden md:block')}>
+          {/* Transcript. NOT overflow-y-auto here: Thread pins its own header
+              and composer and scrolls only the messages between them, which
+              needs this cell to be a fixed-height box, nothing more. */}
+          <div className={cn('min-h-0', !selected && 'hidden md:block')}>
             {selected
               ? <Thread waId={selected} onBack={() => go('inbox')} />
               : <Empty icon="←" title="Pick a conversation">Choose someone on the left to read the thread and reply.</Empty>}

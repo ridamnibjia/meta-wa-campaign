@@ -2,7 +2,7 @@
 // things you might want to do next.
 function Dashboard() {
   const { ss, account, threads, logs, contacts } = useApp();
-  const { phase, skipped, total, dailyCount, dailyCap,
+  const { phase, total, dailyCount, dailyCap,
           pricing = {}, warmup, retrying = 0, nextRetry, lastRun, currentIdx = 0,
           funnel } = ss;
 

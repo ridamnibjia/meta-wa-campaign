@@ -83,72 +83,64 @@ const testAsync = (name, fn) => {
 };
 
 console.log('\nslugify');
-test('lowercases and underscores spaces', () => assert.equal(slugify('Diwali Offer 2026'), 'diwali_offer_2026'));
-test('strips illegal characters', () => assert.equal(slugify('50% off — now!'), '50_off_now'));
-test('trims leading/trailing underscores', () => assert.equal(slugify('  hi  '), 'hi'));
-test('never returns empty', () => assert.equal(slugify('!!!'), 'template'));
-test('caps at 512 chars', () => assert.equal(slugify('a'.repeat(600)).length, 512));
+test('slugify — lowercases, strips symbols, trims underscores, never returns empty, caps at 512', () => {
+  assert.equal(slugify('Diwali Offer 2026'), 'diwali_offer_2026', 'lowercases and underscores spaces');
+  assert.equal(slugify('50% off — now!'), '50_off_now', 'strips illegal characters');
+  assert.equal(slugify('  hi  '), 'hi', 'trims leading/trailing underscores');
+  assert.equal(slugify('!!!'), 'template', 'never returns empty');
+  assert.equal(slugify('a'.repeat(600)).length, 512, 'caps at 512 chars');
+});
 
 console.log('\ntemplateVars');
-test('finds a single variable', () => assert.deepEqual(templateVars('Hi {{1}}, welcome'), [1]));
-test('finds and sorts multiple', () => assert.deepEqual(templateVars('{{2}} then {{1}}'), [1, 2]));
-test('de-duplicates repeats', () => assert.deepEqual(templateVars('{{1}} and {{1}}'), [1]));
-test('tolerates inner spaces', () => assert.deepEqual(templateVars('Hi {{ 1 }}'), [1]));
-test('returns empty for plain text', () => assert.deepEqual(templateVars('no vars here'), []));
+test('templateVars — finds, sorts, de-dupes, tolerates spaces, empty on plain text', () => {
+  assert.deepEqual(templateVars('Hi {{1}}, welcome'), [1], 'finds a single variable');
+  assert.deepEqual(templateVars('{{2}} then {{1}}'), [1, 2], 'finds and sorts multiple');
+  assert.deepEqual(templateVars('{{1}} and {{1}}'), [1], 'de-duplicates repeats');
+  assert.deepEqual(templateVars('Hi {{ 1 }}'), [1], 'tolerates inner spaces');
+  assert.deepEqual(templateVars('no vars here'), [], 'returns empty for plain text');
+});
 
 console.log('\nsanitizeParam');
-test('collapses newlines', () => assert.equal(sanitizeParam('a\nb'), 'a b'));
-test('collapses tabs', () => assert.equal(sanitizeParam('a\tb'), 'a b'));
-test('collapses 4+ spaces', () => assert.equal(sanitizeParam('a     b'), 'a b'));
-test('falls back on empty', () => assert.equal(sanitizeParam('   '), 'there'));
-test('falls back on null', () => assert.equal(sanitizeParam(null), 'there'));
-test('caps at 1024 chars', () => assert.equal(sanitizeParam('x'.repeat(2000)).length, 1024));
+test('sanitizeParam — collapses whitespace, falls back on blank/null, caps at 1024', () => {
+  assert.equal(sanitizeParam('a\nb'), 'a b', 'collapses newlines');
+  assert.equal(sanitizeParam('a\tb'), 'a b', 'collapses tabs');
+  assert.equal(sanitizeParam('a     b'), 'a b', 'collapses 4+ spaces');
+  assert.equal(sanitizeParam('   '), 'there', 'falls back on empty');
+  assert.equal(sanitizeParam(null), 'there', 'falls back on null');
+  assert.equal(sanitizeParam('x'.repeat(2000)).length, 1024, 'caps at 1024 chars');
+});
 
 console.log('\nvalidateTemplateInput');
 const ok = { displayName: 'Test', bodyText: 'Hi {{1}}, our range is live.', sampleValues: ['Rahul'] };
-test('accepts a valid input', () => assert.deepEqual(validateTemplateInput(ok), []));
-test('requires a name', () => assert.match(validateTemplateInput({ ...ok, displayName: '' })[0], /name is required/));
-test('requires a body', () => assert.match(validateTemplateInput({ ...ok, bodyText: '' }).join(), /body is required/));
-test('rejects a body over 1024 chars', () =>
-  assert.match(validateTemplateInput({ ...ok, bodyText: 'x'.repeat(1100), sampleValues: [] }).join(), /max 1024/));
-test('rejects gaps in variable numbering', () =>
-  assert.match(validateTemplateInput({ ...ok, bodyText: 'Hi {{1}} and {{3}} here', sampleValues: ['a', 'b'] }).join(), /no gaps/));
-test('rejects a body starting with a variable', () =>
-  assert.match(validateTemplateInput({ ...ok, bodyText: '{{1}} welcome aboard' }).join(), /cannot start with a variable/));
-test('rejects a body ending with a variable', () =>
-  assert.match(validateTemplateInput({ ...ok, bodyText: 'Welcome aboard {{1}}' }).join(), /cannot end with a variable/));
-test('requires a sample per variable', () =>
-  assert.match(validateTemplateInput({ ...ok, sampleValues: [] }).join(), /sample value/));
-test('rejects an over-length footer', () =>
-  assert.match(validateTemplateInput({ ...ok, footerText: 'x'.repeat(70) }).join(), /max 60/));
-test('rejects variables in the footer', () =>
-  assert.match(validateTemplateInput({ ...ok, footerText: 'From {{1}}' }).join(), /Footer cannot contain variables/));
-test('rejects an unknown category', () =>
-  assert.match(validateTemplateInput({ ...ok, category: 'PROMO' }).join(), /Unknown category/));
+test('validateTemplateInput — accepts a valid input and names every rejection: name, body, length, gaps, edges, samples, footer, category', () => {
+  assert.deepEqual(validateTemplateInput(ok), [], 'accepts a valid input');
+  assert.match(validateTemplateInput({ ...ok, displayName: '' })[0], /name is required/, 'requires a name');
+  assert.match(validateTemplateInput({ ...ok, bodyText: '' }).join(), /body is required/, 'requires a body');
+  assert.match(validateTemplateInput({ ...ok, bodyText: 'x'.repeat(1100), sampleValues: [] }).join(), /max 1024/, 'rejects a body over 1024 chars');
+  assert.match(validateTemplateInput({ ...ok, bodyText: 'Hi {{1}} and {{3}} here', sampleValues: ['a', 'b'] }).join(), /no gaps/, 'rejects gaps in variable numbering');
+  assert.match(validateTemplateInput({ ...ok, bodyText: '{{1}} welcome aboard' }).join(), /cannot start with a variable/, 'rejects a body starting with a variable');
+  assert.match(validateTemplateInput({ ...ok, bodyText: 'Welcome aboard {{1}}' }).join(), /cannot end with a variable/, 'rejects a body ending with a variable');
+  assert.match(validateTemplateInput({ ...ok, sampleValues: [] }).join(), /sample value/, 'requires a sample per variable');
+  assert.match(validateTemplateInput({ ...ok, footerText: 'x'.repeat(70) }).join(), /max 60/, 'rejects an over-length footer');
+  assert.match(validateTemplateInput({ ...ok, footerText: 'From {{1}}' }).join(), /Footer cannot contain variables/, 'rejects variables in the footer');
+  assert.match(validateTemplateInput({ ...ok, category: 'PROMO' }).join(), /Unknown category/, 'rejects an unknown category');
+});
 
 console.log('\nbuildTemplatePayload');
-test('includes the example block when variables exist', () => {
-  const p = buildTemplatePayload(ok);
-  assert.deepEqual(p.components[0].example, { body_text: [['Rahul']] });
-});
-test('omits the example block when there are none', () => {
-  const p = buildTemplatePayload({ displayName: 'Flat', bodyText: 'Same text for all.' });
-  assert.equal(p.components[0].example, undefined);
-});
-test('slugifies the name', () => assert.equal(buildTemplatePayload({ ...ok, displayName: 'My Promo!' }).name, 'my_promo'));
-test('appends the footer when given', () => {
-  const p = buildTemplatePayload({ ...ok, footerText: 'Mirror PVC' });
-  assert.deepEqual(p.components[1], { type: 'FOOTER', text: 'Mirror PVC' });
-});
-test('appends the opt-out button when enabled', () => {
-  const p = buildTemplatePayload({ ...ok, addOptOut: true });
-  assert.equal(p.components.at(-1).buttons[0].text, 'Stop promotions');
-});
-test('omits buttons when opt-out is off', () => {
-  const p = buildTemplatePayload({ ...ok, addOptOut: false });
-  assert.equal(p.components.some(c => c.type === 'BUTTONS'), false);
-});
-test('defaults to MARKETING/en', () => {
+test('buildTemplatePayload — example block, slug name, footer, opt-out button, MARKETING/en defaults', () => {
+  // includes the example block when variables exist
+  assert.deepEqual(buildTemplatePayload(ok).components[0].example, { body_text: [['Rahul']] });
+  // omits the example block when there are none
+  assert.equal(buildTemplatePayload({ displayName: 'Flat', bodyText: 'Same text for all.' }).components[0].example, undefined);
+  // slugifies the name
+  assert.equal(buildTemplatePayload({ ...ok, displayName: 'My Promo!' }).name, 'my_promo');
+  // appends the footer when given
+  assert.deepEqual(buildTemplatePayload({ ...ok, footerText: 'Mirror PVC' }).components[1], { type: 'FOOTER', text: 'Mirror PVC' });
+  // appends the opt-out button when enabled
+  assert.equal(buildTemplatePayload({ ...ok, addOptOut: true }).components.at(-1).buttons[0].text, 'Stop promotions');
+  // omits buttons when opt-out is off
+  assert.equal(buildTemplatePayload({ ...ok, addOptOut: false }).components.some(c => c.type === 'BUTTONS'), false);
+  // defaults to MARKETING/en
   const p = buildTemplatePayload(ok);
   assert.equal(p.category, 'MARKETING');
   assert.equal(p.language, 'en');
@@ -184,38 +176,29 @@ test('the header is the first component — Meta requires that order', () => {
   assert.equal(p.components[0].type, 'HEADER');
 });
 
-test('rejects a media header with no file chosen', () =>
-  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'IMAGE' }).join(), /choose a file/i));
-test('rejects a TEXT header with no text', () =>
-  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT' }).join(), /header text/i));
-test('rejects an over-length TEXT header', () =>
-  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT', headerText: 'x'.repeat(61) }).join(), /max 60/));
-test('rejects more than one variable in a TEXT header', () =>
-  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT', headerText: '{{1}} {{2}}', headerSample: 'a' }).join(), /one variable/i));
-test('rejects an unknown header format', () =>
-  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'LOCATION' }).join(), /header format/i));
+test('validateTemplateInput header rejections — missing file, missing text, over-length, extra variable, unknown format', () => {
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'IMAGE' }).join(), /choose a file/i, 'rejects a media header with no file chosen');
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT' }).join(), /header text/i, 'rejects a TEXT header with no text');
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT', headerText: 'x'.repeat(61) }).join(), /max 60/, 'rejects an over-length TEXT header');
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'TEXT', headerText: '{{1}} {{2}}', headerSample: 'a' }).join(), /one variable/i, 'rejects more than one variable in a TEXT header');
+  assert.match(validateTemplateInput({ ...okBase, headerFormat: 'LOCATION' }).join(), /header format/i, 'rejects an unknown header format');
+});
 
 console.log('\ntemplate buttons');
 const qr  = n => Array.from({ length: n }, (_, i) => ({ type: 'QUICK_REPLY', text: `Reply ${i}` }));
 const url = n => Array.from({ length: n }, (_, i) => ({ type: 'URL', text: `Link ${i}`, url: `https://example.com/${i}` }));
 const tel = n => Array.from({ length: n }, (_, i) => ({ type: 'PHONE_NUMBER', text: `Call ${i}`, phone_number: '+910000000000' }));
 
-test('accepts a legal mix', () =>
-  assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: false, buttons: [...qr(2), ...url(2), ...tel(1)] }), []));
-test('rejects 3 URL buttons', () =>
-  assert.match(validateTemplateInput({ ...okBase, buttons: url(3) }).join(), /at most 2 URL/i));
-test('rejects 2 phone buttons', () =>
-  assert.match(validateTemplateInput({ ...okBase, buttons: tel(2) }).join(), /at most 1 (phone|call)/i));
-test('the opt-out button counts toward the 3 quick-reply ceiling', () =>
-  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(3) }).join(), /at most 3 quick/i));
-test('rejects a URL button with no url', () =>
-  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop' }] }).join(), /needs a URL/i));
-test('rejects a non-http URL', () =>
-  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop', url: 'javascript:alert(1)' }] }).join(), /https?:/i));
-test('rejects a button with no label', () =>
-  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', url: 'https://example.com' }] }).join(), /label/i));
-test('rejects an unknown button type', () =>
-  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'COPY_CODE', text: 'x' }] }).join(), /button type/i));
+test('validateTemplateInput buttons — accepts a legal mix, enforces per-type ceilings, URL/label/type checks', () => {
+  assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: false, buttons: [...qr(2), ...url(2), ...tel(1)] }), [], 'accepts a legal mix');
+  assert.match(validateTemplateInput({ ...okBase, buttons: url(3) }).join(), /at most 2 URL/i, 'rejects 3 URL buttons');
+  assert.match(validateTemplateInput({ ...okBase, buttons: tel(2) }).join(), /at most 1 (phone|call)/i, 'rejects 2 phone buttons');
+  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(3) }).join(), /at most 3 quick/i, 'the opt-out button counts toward the 3 quick-reply ceiling');
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop' }] }).join(), /needs a URL/i, 'rejects a URL button with no url');
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop', url: 'javascript:alert(1)' }] }).join(), /https?:/i, 'rejects a non-http URL');
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', url: 'https://example.com' }] }).join(), /label/i, 'rejects a button with no label');
+  assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'COPY_CODE', text: 'x' }] }).join(), /button type/i, 'rejects an unknown button type');
+});
 
 test('the opt-out button is emitted first, before the operator\'s own', () => {
   const b = buildTemplatePayload({ ...okBase, addOptOut: true, buttons: url(1) })
@@ -237,6 +220,22 @@ test('an empty CSV still answers with all three keys', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
   assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [] });
+});
+
+test('csvField — defuses formulas, strips control chars, quotes, and round-trips', () => {
+  const { csvField } = require('./server');
+  assert.equal(csvField('Asha Rao'), 'Asha Rao');
+  assert.equal(csvField('=HYPERLINK("http://evil","x")'), `"'=HYPERLINK(""http://evil"",""x"")"`,
+    'a leading = must get the apostrophe defusal — quoting alone does not stop Excel evaluating it');
+  assert.equal(csvField('+91 shop'), "'+91 shop", 'leading + is a formula in Excel too');
+  assert.equal(csvField('Doe, John'), '"Doe, John"', 'ordinary RFC 4180 quoting still applies');
+  assert.equal(csvField('a\nb'), 'a b',
+    'newlines become spaces — parseCSV has no multi-line fields, so the export must never emit one');
+  // The whole point: what the export writes, the parser reads back as one row.
+  const out = ['Name,Mobile Phone', `${csvField('Doe, John')},+919000000031`, `${csvField('=SUM(1)')},+919000000032`].join('\r\n');
+  const back = parseCSV(Buffer.from(out));
+  assert.equal(back.contacts.length, 2, 'every exported row survives the round trip');
+  assert.equal(back.contacts[0].name, 'Doe, John');
 });
 
 testAsync('an empty template name never matches the whole WABA', async () => {
@@ -314,65 +313,49 @@ console.log('\nadopting a template — the attachment picked this session surviv
 
 console.log('\nbuildParams');
 const slots = (...v) => { resizeParamValues(v.length); S.config.paramValues = v; };
-test('returns nothing when the template has no variables', () => {
+test('buildParams — name slots, sanitization, fallback, fixed values, mixed slots', () => {
+  // returns nothing when the template has no variables
   slots();
   assert.deepEqual(buildParams({ name: 'Rahul' }), []);
-});
-test('maps a name slot to the contact name', () => {
+  // maps a name slot to the contact name, sanitizes it, falls back when blank
   slots({ source: 'name', value: '' });
   assert.deepEqual(buildParams({ name: 'Rahul' }), [{ type: 'text', text: 'Rahul' }]);
-});
-test('sanitizes a multi-line name', () => {
-  slots({ source: 'name', value: '' });
-  assert.deepEqual(buildParams({ name: 'Ra\nhul' }), [{ type: 'text', text: 'Ra hul' }]);
-});
-test('falls back when the name is blank', () => {
-  slots({ source: 'name', value: '' });
-  assert.deepEqual(buildParams({ name: '' }), [{ type: 'text', text: 'there' }]);
-});
-test('a fixed slot sends the same value to everyone', () => {
+  assert.deepEqual(buildParams({ name: 'Ra\nhul' }), [{ type: 'text', text: 'Ra hul' }], 'sanitizes a multi-line name');
+  assert.deepEqual(buildParams({ name: '' }), [{ type: 'text', text: 'there' }], 'falls back when the name is blank');
+  // a fixed slot sends the same value to everyone
   slots({ source: 'fixed', value: '12' });
   assert.deepEqual(buildParams({ name: 'Rahul' }), [{ type: 'text', text: '12' }]);
   assert.deepEqual(buildParams({ name: 'Priya' }), [{ type: 'text', text: '12' }]);
-});
-test('mixes a per-contact slot with fixed ones', () => {
+  // mixes a per-contact slot with fixed ones
   slots({ source: 'name', value: '' }, { source: 'fixed', value: '12' }, { source: 'fixed', value: '1 March' });
   assert.deepEqual(buildParams({ name: 'Rahul' }).map(p => p.text), ['Rahul', '12', '1 March']);
 });
-test('an unfilled fixed slot is reported, not silently sent', () => {
+test('missingParams — an unfilled fixed slot is reported, a filled template reports nothing', () => {
   slots({ source: 'name', value: '' }, { source: 'fixed', value: '  ' });
-  assert.deepEqual(missingParams(), [2]);
-});
-test('a fully filled template reports nothing missing', () => {
+  assert.deepEqual(missingParams(), [2], 'an unfilled fixed slot is reported, not silently sent');
   slots({ source: 'name', value: '' }, { source: 'fixed', value: '12' });
-  assert.deepEqual(missingParams(), []);
+  assert.deepEqual(missingParams(), [], 'a fully filled template reports nothing missing');
 });
-test('resizing keeps values for slots that still exist', () => {
+test('resizeParamValues — shrinking keeps surviving slots, growing defaults only {{1}} to the name', () => {
   slots({ source: 'fixed', value: '12' }, { source: 'fixed', value: '1 March' });
   resizeParamValues(1);
-  assert.deepEqual(S.config.paramValues, [{ source: 'fixed', value: '12' }]);
-});
-test('growing adds fixed slots, defaulting only {{1}} to the contact name', () => {
+  assert.deepEqual(S.config.paramValues, [{ source: 'fixed', value: '12' }], 'resizing keeps values for slots that still exist');
   resizeParamValues(0); resizeParamValues(2);
-  assert.deepEqual(S.config.paramValues.map(p => p.source), ['name', 'fixed']);
+  assert.deepEqual(S.config.paramValues.map(p => p.source), ['name', 'fixed'], 'growing adds fixed slots, defaulting only {{1}} to the contact name');
 });
 resizeParamValues(0);
 
 console.log('\nrenderBody');
 const p = t => ({ type: 'text', text: t });
-test('substitutes positionally', () =>
-  assert.equal(renderBody('Hi {{1}}, order {{2}}', [p('Sam'), p('A12')]), 'Hi Sam, order A12'));
-test('tolerates inner spaces', () =>
-  assert.equal(renderBody('Hi {{ 1 }}', [p('Sam')]), 'Hi Sam'));
-test('repeats a variable used twice', () =>
-  assert.equal(renderBody('{{1}} and {{1}}', [p('Sam')]), 'Sam and Sam'));
-test('returns the body unchanged when it has no variables', () =>
-  assert.equal(renderBody('Plain text', []), 'Plain text'));
-// A missing param must stay visibly unresolved. Writing "undefined" into a
-// customer thread would read as text we actually sent.
-test('leaves an unsupplied slot as its literal placeholder', () =>
-  assert.equal(renderBody('Hi {{1}}, order {{2}}', [p('Sam')]), 'Hi Sam, order {{2}}'));
-test('returns null for a missing body so the caller can fall back', () => {
+test('renderBody — substitutes positionally, tolerates spaces and repeats, keeps unsupplied placeholders, null on missing body', () => {
+  assert.equal(renderBody('Hi {{1}}, order {{2}}', [p('Sam'), p('A12')]), 'Hi Sam, order A12', 'substitutes positionally');
+  assert.equal(renderBody('Hi {{ 1 }}', [p('Sam')]), 'Hi Sam', 'tolerates inner spaces');
+  assert.equal(renderBody('{{1}} and {{1}}', [p('Sam')]), 'Sam and Sam', 'repeats a variable used twice');
+  assert.equal(renderBody('Plain text', []), 'Plain text', 'returns the body unchanged when it has no variables');
+  // A missing param must stay visibly unresolved. Writing "undefined" into a
+  // customer thread would read as text we actually sent.
+  assert.equal(renderBody('Hi {{1}}, order {{2}}', [p('Sam')]), 'Hi Sam, order {{2}}', 'leaves an unsupplied slot as its literal placeholder');
+  // returns null for a missing body so the caller can fall back
   assert.equal(renderBody(null, [p('Sam')]), null);
   assert.equal(renderBody('', [p('Sam')]), null);
   assert.equal(renderBody(undefined), null);
@@ -410,12 +393,14 @@ test('a run with no captured body falls back to the placeholder', () => {
 });
 
 console.log('\nnormalizePhone');
-test('prefixes a 10-digit Indian number', () => assert.equal(normalizePhone('9000000001'), '919000000001'));
-test('strips a leading zero', () => assert.equal(normalizePhone('09000000001'), '919000000001'));
-test('strips formatting characters', () => assert.equal(normalizePhone('+91 90000-00001'), '919000000001'));
-test('rejects toll-free numbers', () => assert.equal(normalizePhone('18001234567'), null));
-test('rejects numbers that are too short', () => assert.equal(normalizePhone('12345'), null));
-test('rejects empty input', () => assert.equal(normalizePhone(''), null));
+test('normalizePhone — prefixes 91, strips zero and formatting, rejects toll-free, short and empty', () => {
+  assert.equal(normalizePhone('9000000001'), '919000000001', 'prefixes a 10-digit Indian number');
+  assert.equal(normalizePhone('09000000001'), '919000000001', 'strips a leading zero');
+  assert.equal(normalizePhone('+91 90000-00001'), '919000000001', 'strips formatting characters');
+  assert.equal(normalizePhone('18001234567'), null, 'rejects toll-free numbers');
+  assert.equal(normalizePhone('12345'), null, 'rejects numbers that are too short');
+  assert.equal(normalizePhone(''), null, 'rejects empty input');
+});
 
 console.log('\nparseCSV');
 test('reads name and mobile, and dedupes', () => {
@@ -487,26 +472,28 @@ console.log('\nverifySignature');
   const secret = 'test_app_secret';
   const body = Buffer.from(JSON.stringify({ object: 'whatsapp_business_account' }));
   const good = 'sha256=' + require('node:crypto').createHmac('sha256', secret).update(body).digest('hex');
-  test('accepts a correctly signed body', () => assert.equal(verifySignature(body, good, secret), true));
-  test('rejects a tampered body', () => assert.equal(verifySignature(Buffer.from('{"object":"evil"}'), good, secret), false));
-  test('rejects a wrong secret', () => assert.equal(verifySignature(body, good, 'other_secret'), false));
-  test('rejects a missing header', () => assert.equal(verifySignature(body, undefined, secret), false));
-  test('rejects when no secret is configured', () => assert.equal(verifySignature(body, good, ''), false));
-  test('rejects a short header without throwing', () => assert.equal(verifySignature(body, 'sha256=abc', secret), false));
+  test('verifySignature — accepts a correct signature and rejects tampering, wrong/missing secret, bad headers', () => {
+    assert.equal(verifySignature(body, good, secret), true, 'accepts a correctly signed body');
+    assert.equal(verifySignature(Buffer.from('{"object":"evil"}'), good, secret), false, 'rejects a tampered body');
+    assert.equal(verifySignature(body, good, 'other_secret'), false, 'rejects a wrong secret');
+    assert.equal(verifySignature(body, undefined, secret), false, 'rejects a missing header');
+    assert.equal(verifySignature(body, good, ''), false, 'rejects when no secret is configured');
+    assert.equal(verifySignature(body, 'sha256=abc', secret), false, 'rejects a short header without throwing');
+  });
 }
 
 console.log('\nexplainError');
-test('explains a known send failure', () => assert.match(explainError(131042), /Billing not set up/));
-test('includes an action, not just a label', () => assert.match(explainError(190), /Generate a fresh System User token/));
-test('returns null for an unknown code', () => assert.equal(explainError(999999), null));
-// -1 is this app's own code for "fetch threw", not one of Meta's. Without an
-// entry the skip report told the operator to look it up in Meta's error
-// reference, which does not list it.
-test('explains our own network code rather than blaming Meta', () => {
-  assert.match(explainError(-1), /Could not reach Meta from this server/);
+test('explainError — explains known codes with an action, null for unknown or missing, owns code -1', () => {
+  assert.match(explainError(131042), /Billing not set up/, 'explains a known send failure');
+  assert.match(explainError(190), /Generate a fresh System User token/, 'includes an action, not just a label');
+  assert.equal(explainError(999999), null, 'returns null for an unknown code');
+  // -1 is this app's own code for "fetch threw", not one of Meta's. Without an
+  // entry the skip report told the operator to look it up in Meta's error
+  // reference, which does not list it.
+  assert.match(explainError(-1), /Could not reach Meta from this server/, 'explains our own network code rather than blaming Meta');
   assert.doesNotMatch(explainError(-1), /error reference/);
+  assert.equal(explainError(undefined), null, 'returns null for a missing code');
 });
-test('returns null for a missing code', () => assert.equal(explainError(undefined), null));
 test('every entry has both a cause and an action', () => {
   for (const [code, v] of Object.entries(META_ERRORS)) {
     assert.equal(v.length, 2, `code ${code} is malformed`);
@@ -515,26 +502,31 @@ test('every entry has both a cause and an action', () => {
 });
 
 console.log('\ntierToCap');
-test('expands the K suffix', () => assert.equal(tierToCap('TIER_1K'), 1000));
-test('expands a larger K tier', () => assert.equal(tierToCap('TIER_100K'), 100000));
-test('reads a plain numeric tier', () => assert.equal(tierToCap('TIER_250'), 250));
-test('returns null for UNLIMITED so the UI keeps its default', () => assert.equal(tierToCap('TIER_UNLIMITED'), null));
-test('returns null for UNKNOWN', () => assert.equal(tierToCap('UNKNOWN'), null));
-test('returns null for undefined', () => assert.equal(tierToCap(undefined), null));
+test('tierToCap — expands K suffixes, reads numeric tiers, null for UNLIMITED/UNKNOWN/undefined', () => {
+  assert.equal(tierToCap('TIER_1K'), 1000, 'expands the K suffix');
+  assert.equal(tierToCap('TIER_100K'), 100000, 'expands a larger K tier');
+  assert.equal(tierToCap('TIER_250'), 250, 'reads a plain numeric tier');
+  assert.equal(tierToCap('TIER_UNLIMITED'), null, 'returns null for UNLIMITED so the UI keeps its default');
+  assert.equal(tierToCap('UNKNOWN'), null, 'returns null for UNKNOWN');
+  assert.equal(tierToCap(undefined), null, 'returns null for undefined');
+});
 
 console.log('\nwarm-up ladder');
 {
   const restore = { days: [...W.days], enabled: W.enabled, quality: S.quality, cap: S.config.dailyCap };
   const setup = (days, quality = 'GREEN') => { W.days = days; S.quality = quality; W.enabled = true; };
 
-  test('day one starts at the bottom rung', () => { setup([]); assert.equal(warmupCap(), WARMUP_PLAN[0]); });
-  test('a day already sent on keeps its own rung', () => {
+  test('warmupStep/warmupCap — one rung per sending day, from the bottom to the last', () => {
+    // day one starts at the bottom rung
+    setup([]); assert.equal(warmupCap(), WARMUP_PLAN[0]);
+    // a day already sent on keeps its own rung
     setup([todayKey()]);
     assert.equal(warmupStep(), 0, 'today is day 1, not day 2');
-  });
-  test('a fresh day climbs one rung', () => { setup(['2026-01-01']); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
-  test('climbs one rung per sending day', () => { setup(['a', 'b', 'c']); assert.equal(warmupCap(), WARMUP_PLAN[3]); });
-  test('the last rung is still the last rung on its own day', () => {
+    // a fresh day climbs one rung
+    setup(['2026-01-01']); assert.equal(warmupCap(), WARMUP_PLAN[1]);
+    // climbs one rung per sending day
+    setup(['a', 'b', 'c']); assert.equal(warmupCap(), WARMUP_PLAN[3]);
+    // the last rung is still the last rung on its own day
     setup(new Array(WARMUP_PLAN.length - 1).fill(0).map((_, i) => 'd' + i));
     assert.equal(warmupCap(), WARMUP_PLAN[WARMUP_PLAN.length - 1]);
   });
@@ -578,35 +570,31 @@ console.log('\nwarm-up ladder');
     setup(new Array(50).fill(0).map((_, i) => 'd' + i), null);
     assert.equal(graduated(), true);
   });
-  test('holds a rung back while quality is RED', () => { setup(['a', 'b'], 'RED'); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
-  test('holds a rung back while quality is YELLOW', () => { setup(['a', 'b'], 'YELLOW'); assert.equal(warmupCap(), WARMUP_PLAN[1]); });
-  test('cannot be held below the bottom rung', () => { setup([], 'RED'); assert.equal(warmupCap(), WARMUP_PLAN[0]); });
-  test('disabling it lifts the ceiling entirely', () => { setup([]); W.enabled = false; assert.equal(warmupCap(), null); });
+  test('warmupCap — quality holds a rung back, never below the bottom rung, disabling lifts the ceiling', () => {
+    setup(['a', 'b'], 'RED');    assert.equal(warmupCap(), WARMUP_PLAN[1], 'holds a rung back while quality is RED');
+    setup(['a', 'b'], 'YELLOW'); assert.equal(warmupCap(), WARMUP_PLAN[1], 'holds a rung back while quality is YELLOW');
+    setup([], 'RED');            assert.equal(warmupCap(), WARMUP_PLAN[0], 'cannot be held below the bottom rung');
+    setup([]); W.enabled = false; assert.equal(warmupCap(), null, 'disabling it lifts the ceiling entirely');
+  });
 
-  test('effective cap takes the lower of warm-up and your own cap', () => {
+  test('effectiveCap — the lower of warm-up and your own cap, and 0 is "no cap of your own", never zero sends', () => {
     setup([]); S.config.dailyCap = 1000;
     assert.equal(effectiveCap(), WARMUP_PLAN[0], 'warm-up is lower on day 1');
-  });
-  test('your own cap wins when it is the stricter one', () => {
+    // your own cap wins when it is the stricter one
     setup(['a', 'b', 'c', 'd', 'e']); S.config.dailyCap = 300;
     assert.equal(effectiveCap(), 300);
-  });
-  test('warm-up off falls back to your own cap', () => {
+    // warm-up off falls back to your own cap
     setup([]); W.enabled = false; S.config.dailyCap = 750;
     assert.equal(effectiveCap(), 750);
-  });
-  // 0 is the operator saying "no cap of mine". It is a value, not a missing
-  // one — `if (dailyCap)` in the config route could not express it, so typing 0
-  // used to leave the old cap in place with no sign that it had been ignored.
-  test('a dailyCap of 0 means no cap of your own', () => {
+    // 0 is the operator saying "no cap of mine". It is a value, not a missing
+    // one — `if (dailyCap)` in the config route could not express it, so typing 0
+    // used to leave the old cap in place with no sign that it had been ignored.
     setup([]); W.enabled = false; S.config.dailyCap = 0;
     assert.equal(effectiveCap(), null, 'null is no ceiling; 0 would read as "send nothing"');
-  });
-  test('the warm-up ceiling still applies when you have set no cap of your own', () => {
+    // the warm-up ceiling still applies when you have set no cap of your own
     setup([]); S.config.dailyCap = 0;
     assert.equal(effectiveCap(), WARMUP_PLAN[0], 'a new number does not skip the ladder by clearing its cap');
-  });
-  test('a finished ladder plus no cap of your own is no cap at all', () => {
+    // a finished ladder plus no cap of your own is no cap at all
     setup(new Array(50).fill(0).map((_, i) => 'd' + i)); S.config.dailyCap = 0;
     assert.equal(effectiveCap(), null);
   });
@@ -700,12 +688,11 @@ console.log('\nIST day arithmetic');
   // 2026-03-15T18:30:00Z is exactly midnight IST on the 16th.
   const midnightIst = Date.parse('2026-03-15T18:30:00Z');
 
-  test('midnight IST is the start of that IST day', () =>
-    assert.equal(startOfIstDay(midnightIst), midnightIst));
-  test('an instant late in the IST day still maps back to its own midnight', () =>
-    assert.equal(startOfIstDay(midnightIst + 23 * 3600000), midnightIst));
-  test('one millisecond earlier belongs to the previous IST day', () =>
-    assert.equal(startOfIstDay(midnightIst - 1), midnightIst - 86400000));
+  test('startOfIstDay — midnight, late-day and one-ms-early instants all map to the right IST day', () => {
+    assert.equal(startOfIstDay(midnightIst), midnightIst, 'midnight IST is the start of that IST day');
+    assert.equal(startOfIstDay(midnightIst + 23 * 3600000), midnightIst, 'an instant late in the IST day still maps back to its own midnight');
+    assert.equal(startOfIstDay(midnightIst - 1), midnightIst - 86400000, 'one millisecond earlier belongs to the previous IST day');
+  });
   // The server may run anywhere. If this used the host's own zone, the daily
   // counter would roll over at the wrong hour on every deploy outside India.
   test('the answer does not depend on the host time zone', () => {
@@ -1085,12 +1072,11 @@ test('countsForRun on an empty run returns zeros, not nulls', () => {
 
 
 console.log('\npricing');
-test('marketing rate comes from the configured price', () => {
+test('rateFor — configured price, case-insensitive, unknown category falls back to the dearest rate', () => {
   PRICES.MARKETING = 0.78;
-  assert.equal(rateFor('MARKETING'), 0.78);
-});
-test('category is case-insensitive', () => assert.equal(rateFor('marketing'), 0.78));
-test('an unknown category falls back to the dearest rate, not zero', () => {
+  assert.equal(rateFor('MARKETING'), 0.78, 'marketing rate comes from the configured price');
+  assert.equal(rateFor('marketing'), 0.78, 'category is case-insensitive');
+  // an unknown category falls back to the dearest rate, not zero
   PRICES.MARKETING = 0.78; PRICES.UTILITY = 0.115;
   assert.equal(rateFor('NONSENSE'), 0.78);
   assert.equal(rateFor(null), 0.78);
@@ -1098,45 +1084,31 @@ test('an unknown category falls back to the dearest rate, not zero', () => {
 // A predicate rather than a Set: the answer lives in SQL now, and lib/ must not
 // import the database.
 const disabled = (...off) => p => off.includes(p);
-test('billable excludes disabled numbers', () => {
+test('billableCount — excludes disabled numbers, tolerates an empty list and a missing predicate', () => {
   const contacts = [{ dialStr: '911' }, { dialStr: '922' }, { dialStr: '933' }];
-  assert.equal(billableCount(contacts, disabled('922')), 2);
+  assert.equal(billableCount(contacts, disabled('922')), 2, 'billable excludes disabled numbers');
+  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }], disabled()), 2, 'billable counts everything when nobody is disabled');
+  assert.equal(billableCount([], disabled()), 0, 'billable of an empty list is zero, not NaN');
+  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }]), 2, 'billable with no predicate counts the whole list rather than throwing');
 });
-test('billable counts everything when nobody is disabled', () => {
-  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }], disabled()), 2);
-});
-test('billable of an empty list is zero, not NaN', () => assert.equal(billableCount([], disabled()), 0));
-test('billable with no predicate counts the whole list rather than throwing', () =>
-  assert.equal(billableCount([{ dialStr: '911' }, { dialStr: '922' }]), 2));
-test('estimate multiplies and rounds to paise', () => assert.equal(estimateCost(988, 0.78), 770.64));
-test('estimate never goes negative', () => assert.equal(estimateCost(-5, 0.78), 0));
-test('spend counts delivered only — failures are free', () => assert.equal(spentCost(529, 0.78), 412.62));
-test('spend is zero before anything is delivered', () => assert.equal(spentCost(0, 0.78), 0));
-test('money is formatted with the currency symbol and two decimals', () => {
-  assert.equal(formatMoney(770.6, '₹'), '₹770.60');
+test('estimateCost/spentCost/formatMoney — rounds to paise, never negative, failures are free, two decimals', () => {
+  assert.equal(estimateCost(988, 0.78), 770.64, 'estimate multiplies and rounds to paise');
+  assert.equal(estimateCost(-5, 0.78), 0, 'estimate never goes negative');
+  assert.equal(spentCost(529, 0.78), 412.62, 'spend counts delivered only — failures are free');
+  assert.equal(spentCost(0, 0.78), 0, 'spend is zero before anything is delivered');
+  assert.equal(formatMoney(770.6, '₹'), '₹770.60', 'money is formatted with the currency symbol and two decimals');
 });
 
 console.log('\n24-hour reply window');
 const HOUR = 3600000;
-test('a thread with no inbound message has no open window', () => {
-  assert.equal(isWindowOpen({ lastInboundAt: 0 }), false);
+test('isWindowOpen — no inbound means no window; open up to 23h59m, shut at and past 24h', () => {
+  assert.equal(isWindowOpen({ lastInboundAt: 0 }), false, 'a thread with no inbound message has no open window');
   assert.equal(isWindowOpen(null), false);
-});
-test('a reply one hour ago leaves the window open', () => {
   const now = Date.now();
-  assert.equal(isWindowOpen({ lastInboundAt: now - HOUR }, now), true);
-});
-test('the window is still open at 23h59m', () => {
-  const now = Date.now();
-  assert.equal(isWindowOpen({ lastInboundAt: now - (24 * HOUR - 60000) }, now), true);
-});
-test('the window is shut at exactly 24h', () => {
-  const now = Date.now();
-  assert.equal(isWindowOpen({ lastInboundAt: now - 24 * HOUR }, now), false);
-});
-test('the window is shut past 24h', () => {
-  const now = Date.now();
-  assert.equal(isWindowOpen({ lastInboundAt: now - 25 * HOUR }, now), false);
+  assert.equal(isWindowOpen({ lastInboundAt: now - HOUR }, now), true, 'a reply one hour ago leaves the window open');
+  assert.equal(isWindowOpen({ lastInboundAt: now - (24 * HOUR - 60000) }, now), true, 'the window is still open at 23h59m');
+  assert.equal(isWindowOpen({ lastInboundAt: now - 24 * HOUR }, now), false, 'the window is shut at exactly 24h');
+  assert.equal(isWindowOpen({ lastInboundAt: now - 25 * HOUR }, now), false, 'the window is shut past 24h');
 });
 
 // The old S.inbox-backed assertions here (record a reply, redeliver it, count
@@ -1145,11 +1117,9 @@ test('the window is shut past 24h', () => {
 // no longer writes to. describeInbound is describe() — a pure function,
 // untouched by the storage migration — so those two stay.
 console.log('\ninbound messages');
-test('a button tap is described by its label, not left blank', () => {
-  assert.equal(describeInbound({ type: 'button', button: { text: 'Stop promotions' } }), 'Stop promotions');
-});
-test('an unsupported type is labelled rather than dropped silently', () => {
-  assert.equal(describeInbound({ type: 'image' }), '[image]');
+test('describeInbound — a button tap keeps its label, an unsupported type is labelled rather than dropped', () => {
+  assert.equal(describeInbound({ type: 'button', button: { text: 'Stop promotions' } }), 'Stop promotions', 'a button tap is described by its label, not left blank');
+  assert.equal(describeInbound({ type: 'image' }), '[image]', 'an unsupported type is labelled rather than dropped silently');
 });
 
 console.log('\ninbound');
@@ -1489,13 +1459,11 @@ test('a destroyed session stops validating', () => {
 });
 
 console.log('\ndb');
-test('node 22.5 and above is accepted', () => {
+test('nodeVersionOk — 22.5 and above accepted, anything below rejected', () => {
   assert.equal(nodeVersionOk('22.5.0'), true);
   assert.equal(nodeVersionOk('23.7.0'), true);
   assert.equal(nodeVersionOk('24.0.1'), true);
-});
-test('node below 22.5 is rejected', () => {
-  assert.equal(nodeVersionOk('22.4.9'), false);
+  assert.equal(nodeVersionOk('22.4.9'), false, 'node below 22.5 is rejected');
   assert.equal(nodeVersionOk('20.11.0'), false);
   assert.equal(nodeVersionOk('18.20.0'), false);
 });
@@ -2286,6 +2254,15 @@ console.log('\ncontacts — enable / disable');
     const file = Buffer.from(`Name,Mobile Phone,City\nAsha,${p},Pune\n`);
     C.upsertFromCsv(parseCSV(file).contacts, {});
     assert.deepEqual(JSON.parse(C.getRow(p).fields_json), { City: 'Pune' });
+    // The directory export produces a two-column file and advertises re-upload
+    // as the recovery for a lost original — that round trip must not be the
+    // thing that wipes the fields this column exists to preserve.
+    C.upsertFromCsv(parseCSV(csv([['Asha', p]])).contacts, {});
+    assert.deepEqual(JSON.parse(C.getRow(p).fields_json), { City: 'Pune' },
+      'a re-upload with no extra columns keeps what an earlier upload stored');
+    // A file that DOES carry extra columns still overwrites.
+    C.upsertFromCsv(parseCSV(Buffer.from(`Name,Mobile Phone,City\nAsha,${p},Mumbai\n`)).contacts, {});
+    assert.deepEqual(JSON.parse(C.getRow(p).fields_json), { City: 'Mumbai' });
   });
 
   test('the upload is recorded with what happened to the file', () => {
@@ -2556,37 +2533,28 @@ console.log('\nlib/schedule — retries do not fire in the middle of the night')
   // IST and on a server in UTC. 18:30 UTC is 00:00 IST the following day.
   const ist = (y, m, d, h, min = 0) => Date.UTC(y, m - 1, d, h - 5, min - 30);
 
-  test('a daytime deadline is left exactly where it is', () => {
+  test('deferPastQuietHours — daytime and pre-window deadlines untouched, night deadlines land at the right 8am, [23:00, 07:00) boundaries, 07:00-08:00 grace', () => {
+    // a daytime deadline is left exactly where it is
     const at = ist(2026, 8, 14, 14, 0);
     assert.equal(deferPastQuietHours(at), at,
       'deferring a 2pm retry would delay every rung in the working day for no reason');
-  });
-
-  test('a deadline just before the window is left alone', () => {
-    const at = ist(2026, 8, 14, 22, 59);
-    assert.equal(deferPastQuietHours(at), at,
+    // a deadline just before the window is left alone
+    const preWindow = ist(2026, 8, 14, 22, 59);
+    assert.equal(deferPastQuietHours(preWindow), preWindow,
       '22:59 is outside a 23:00-07:00 window and must fire on time');
-  });
-
-  test('a late-evening deadline moves to 8am the NEXT morning', () => {
+    // a late-evening deadline moves to 8am the NEXT morning
     assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 30)), ist(2026, 8, 15, 8, 0),
       'the next morning after the 14th is the 15th — landing back on the 14th would be in the past');
-  });
-
-  test('an after-midnight deadline moves to 8am the SAME morning', () => {
+    // an after-midnight deadline moves to 8am the SAME morning
     assert.equal(deferPastQuietHours(ist(2026, 8, 15, 2, 0)), ist(2026, 8, 15, 8, 0),
       '02:00 IST is already the 15th, and pushing it to the 16th would cost the contact a whole day');
-  });
-
-  test('the window is closed at its start and open at its end', () => {
+    // the window is closed at its start and open at its end
     assert.equal(deferPastQuietHours(ist(2026, 8, 14, 23, 0)), ist(2026, 8, 15, 8, 0),
       '23:00:00 exactly is inside the quiet window');
     const seven = ist(2026, 8, 15, 7, 0);
     assert.equal(deferPastQuietHours(seven), seven,
       '07:00:00 exactly is outside it — the window is [23:00, 07:00)');
-  });
-
-  test('the hour between 07:00 and 08:00 is grace, not a gap', () => {
+    // the hour between 07:00 and 08:00 is grace, not a gap
     const halfSeven = ist(2026, 8, 15, 7, 30);
     assert.equal(deferPastQuietHours(halfSeven), halfSeven,
       'a deadline that reached 07:30 on its own is a morning deadline; 08:00 is only where a ' +
@@ -3858,7 +3826,8 @@ console.log('\nthe transcript excludes what was never delivered');
       .run('fine-1', '910000006661', 'fine', 1700000000002);
     const m = inboxThread('910000006661').messages.find(x => x.id === 'fine-1');
     assert.ok(m, 'this one actually arrived');
-    assert.equal(m.error, null);
+    assert.equal(m.error, undefined,
+      'no error key at all — VISIBLE excludes every failed row, so an error payload here was dead code');
   });
 
   test('an inbound message is never hidden, whatever the outbound rule says', () => {
@@ -5683,8 +5652,16 @@ console.log('\nfile risk classification');
     assert.equal(v.sniffed, 'exe');
   });
 
-  test('an executable extension blocks even with innocent bytes', () => {
+  test('classify — single-signal tiers: exe extension blocks, OLE2 and csv warn, plain pdf and empty input are ok', () => {
+    // an executable extension blocks even with innocent bytes
     assert.equal(classify({ mime: 'application/octet-stream', filename: 'setup.exe', bytes: jpeg }).tier, 'block');
+    assert.equal(classify({ mime: 'application/msword', filename: 'old.doc', bytes: ole2 }).tier, 'warn',
+      'legacy OLE2 Office is warn — it can carry a macro');
+    assert.equal(classify({ mime: 'text/csv', filename: 'contacts.csv', bytes: Buffer.from('=cmd|calc') }).tier, 'warn',
+      'a csv is warn — spreadsheet formula injection is a real delivery route');
+    assert.equal(classify({ mime: 'application/pdf', filename: 'invoice.pdf', bytes: pdf }).tier, 'ok',
+      'a plain pdf is ok — downloads, never renders inline');
+    assert.equal(classify({}).tier, 'ok', 'an unknown mime with no filename and no bytes is ok, not safe');
   });
 
   test('html and svg are blocked — they are the XSS vector this feature exists for', () => {
@@ -5702,22 +5679,6 @@ console.log('\nfile risk classification');
     assert.equal(classify({ mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename: 'q3.docx', bytes: zip }).tier, 'ok');
     assert.equal(classify({ mime: 'application/zip', filename: 'stuff.zip', bytes: zip }).tier, 'warn');
     assert.equal(classify({ mime: 'application/zip', filename: undefined,   bytes: zip }).tier, 'warn');
-  });
-
-  test('legacy OLE2 Office is warn — it can carry a macro', () => {
-    assert.equal(classify({ mime: 'application/msword', filename: 'old.doc', bytes: ole2 }).tier, 'warn');
-  });
-
-  test('a csv is warn — spreadsheet formula injection is a real delivery route', () => {
-    assert.equal(classify({ mime: 'text/csv', filename: 'contacts.csv', bytes: Buffer.from('=cmd|calc') }).tier, 'warn');
-  });
-
-  test('a plain pdf is ok — downloads, never renders inline', () => {
-    assert.equal(classify({ mime: 'application/pdf', filename: 'invoice.pdf', bytes: pdf }).tier, 'ok');
-  });
-
-  test('an unknown mime with no filename and no bytes is ok, not safe', () => {
-    assert.equal(classify({}).tier, 'ok');
   });
 
   test('effectiveRisk floors an unscannable file at warn', () => {
@@ -6500,6 +6461,36 @@ test('contacts left on a superseded run are counted, and the current run is not'
     assert.ok(afterReset.contacts > s.contacts,
       'so the total can only grow when the current run stops being current');
   } finally { S.currentRunId = saved; }
+});
+
+// Staging twice before Start — click "Reuse the server list", then upload a
+// corrected CSV instead — used to leave the first staging behind as a run
+// nothing points at, and the banner above reported its contacts as "never
+// reached" about people who were never in a campaign at all.
+test('re-staging before Start discards the superseded staging instead of stranding it', () => {
+  const { stageRun } = require('./server');
+  const saved = { run: S.currentRunId, phase: S.phase };
+  try {
+    S.phase = 'idle';
+    const first = stageRun([{ dialStr: '919000000611', name: 'Staged once' }], 'staged-then-replaced');
+    const second = stageRun([
+      { dialStr: '919000000612', name: 'Reached' },
+      { dialStr: '919000000616', name: 'Never reached' },
+    ], 'the-real-one');
+    assert.ok(second > first, 'the run id is NOT recycled — deleting the row would hand its id to the next run, and a stale bookmark would silently render a different campaign');
+    assert.ok(!strandedWork(second).runs.some(r => r.id === first),
+      'a run that was only ever staged leaves nothing behind when it is replaced');
+    assert.ok(!require('./server').listRuns().some(r => r.id === first),
+      'and History does not list it — staged-and-never-started is noise, not history');
+
+    // But a run the loop TOUCHED is history and must survive re-staging.
+    recordRecipientSent(second, '919000000612', 'wamid.restaged.612');
+    const third = stageRun([{ dialStr: '919000000613', name: 'Third' }], 'third');
+    assert.ok(require('./server').listRuns().some(r => r.id === second),
+      'a walked run is kept — its rows are the record of what was sent');
+    assert.ok(strandedWork(third).runs.some(r => r.id === second),
+      'and its unresolved contacts are reported as stranded, because they are');
+  } finally { S.currentRunId = saved.run; S.phase = saved.phase; }
 });
 
 // ── Raw envelopes have a lifetime; the replay queue does not ─────────────────

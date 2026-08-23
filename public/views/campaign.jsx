@@ -373,6 +373,10 @@ function Campaign() {
 
   const [showAll,  setShowAll]  = useState(false);
   const [dragging, setDragging] = useState(false);
+  // The directory — every contact any upload has ever introduced. Its count is
+  // what makes "reuse the list already here" offerable without a CSV in hand.
+  const [dir,      setDir]      = useState(null);
+  const [staging,  setStaging]  = useState(false);
   const [writing,  setWriting]  = useState(false);
   const [starting, setStarting] = useState(false);
   const [deleting, setDeleting] = useState(null);   // template name pending confirmation
@@ -391,6 +395,23 @@ function Campaign() {
     const c = ss.config || {};
     setSettings(p => ({ delaySec: c.delaySec || p.delaySec, dailyCap: c.dailyCap ?? p.dailyCap }));
   }, [ss.config?.delaySec, ss.config?.dailyCap]);
+
+  // Re-fetched when the staged count moves, because an upload grows the
+  // directory and the button should say the new number.
+  useEffect(() => {
+    api.get('/api/contacts/directory?size=1')
+      .then(r => setDir(r.counts || null)).catch(() => {});
+  }, [contacts.count]);
+
+  const useExistingList = async () => {
+    setStaging(true);
+    const r = await api.post('/api/stage-contacts')
+      .catch(() => ({ ok: false, error: 'Network error — is the server running?' }));
+    setStaging(false);
+    if (!r.ok) return alert('Could not stage the list: ' + r.error);
+    setContacts({ count: r.count, sample: r.sample, file: 'contact list on this server' });
+    setFailLog([]);
+  };
 
   // The preview needs an asset's kind and filename, which only the library
   // knows — S.config carries the id alone.
@@ -539,6 +560,24 @@ function Campaign() {
           </label>
           <input id="csv" type="file" accept=".csv" hidden disabled={isActive}
                  onChange={e => e.target.files[0] && uploadCSV(e.target.files[0])} />
+
+          {/* The other way in: the contacts already on this server. Every
+              upload grows the directory, so a repeat campaign does not need
+              the original file — anyone switched off (opted out, or not on
+              WhatsApp) is staged as a skipped row exactly as a CSV stages
+              them, and the funnel reports them the same way. */}
+          {!isActive && dir?.total > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Button variant="outline" size="sm" disabled={staging} onClick={useExistingList}>
+                {staging ? 'Staging…'
+                  : <>↻ Reuse the {num(dir.total)} contacts on this server{dir.disabled > 0 ? ` · ${num(dir.disabled)} switched off, skipped` : ''}</>}
+              </Button>
+              <a className="text-xs font-medium text-primary underline underline-offset-2"
+                 href="/api/contacts/directory/export.csv" download>
+                Download the list as CSV
+              </a>
+            </div>
+          )}
 
           {/* Format guidance, shown before the first upload — after one, the
               parsed list below is the better answer to "did it work?".
@@ -762,7 +801,7 @@ function Campaign() {
         {/* ── 3. Send ──────────────────────────────────────────── */}
         <Step n={3} title="Send" state={isRunning ? 'now' : phase === 'done' ? 'done' : 'todo'}>
           <Field label="Test on your own number first"
-                 hint="Sent outside the warm-up ceiling. Confirms delivered and read webhooks actually arrive.">
+                 hint="Sent outside the warm-up ceiling. Confirms Meta accepts sends from this number and template — watch the message arrive on your phone.">
             <div className="flex gap-2">
               <Input className="flex-1 font-mono" value={test.to} placeholder="+91 98765 43210"
                      onChange={e => setTest(t => ({ ...t, to: e.target.value }))} />

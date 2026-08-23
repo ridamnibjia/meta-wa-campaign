@@ -313,6 +313,17 @@ const listThreads = db.prepare(`
 
 const getThread = db.prepare('SELECT wa_id, name, last_inbound_at FROM threads WHERE wa_id = ?');
 
+// The one integer buildState needs. It used to read summary().unread, which
+// runs listThreads — a full scan-and-sort of `threads` with two correlated
+// preview subqueries per row — once per broadcast, i.e. after every send and
+// every webhook envelope, to sum a column and throw the list away. Threads
+// grow with the contact directory (recordOutbound upserts one per recipient),
+// so that scan grew with the business on the hottest path in the app.
+// unread only ever increments on inbound rows, so a plain sum is the same
+// number summary() computes.
+const sumUnreadQ = db.prepare('SELECT COALESCE(sum(unread), 0) AS n FROM threads');
+const unreadCount = () => sumUnreadQ.get().n;
+
 // A page of transcript, newest first, walked backwards from a cursor. Served by
 // idx_messages_thread (wa_id, at DESC) — the index has existed since P1 and this
 // is the query it was built for.
@@ -325,7 +336,6 @@ const PAGE_SIZE = 30;
 
 const pageOfMessages = db.prepare(`
   SELECT m.wamid, m.dir, m.type, m.body, m.at, m.rowid AS rid, m.status,
-         m.error_code, m.error_title,
          md.media_id, md.mime_type, md.filename, md.file_size, md.path,
          md.risk, md.risk_reason, md.scan_status, md.scan_signature, md.provisional,
          ma.id AS asset_id, ma.filename AS asset_filename,
@@ -364,15 +374,11 @@ const decodeCursor = c => {
 // can only fail.
 const toEntry = (r, now = Date.now()) => ({
   id: r.wamid, dir: r.dir, type: r.type, text: r.body ?? '', at: r.at, status: r.status,
-  // A failed message used to say "failed" in a log the operator had to go
-  // looking for, on a page that wipes it. The code and Meta's own title travel
-  // with the message, and explainError turns the number into an instruction —
-  // the same table the fail log has always used, now on the bubble itself.
-  error: r.status === 'failed' ? {
-    code:  r.error_code ?? null,
-    title: r.error_title ?? null,
-    hint:  explainError(r.error_code),
-  } : null,
+  // No `error` key on purpose. error_code is only ever written by markFailed,
+  // which also sets status='failed' — and VISIBLE excludes those rows from the
+  // transcript entirely, so an error payload here could never render. The
+  // undelivered COUNT on the thread banner and Campaign history carry the
+  // codes; a bubble that is not in the conversation carries nothing.
   // Outbound media the operator sent. A separate key from `media` above, which
   // is inbound: that one carries a risk verdict, a 30-day expiry and a
   // Keep/Discard decision, and not one of those means anything for a file the
@@ -525,4 +531,4 @@ function search(q, { waId = null, limit = 50 } = {}) {
 }
 
 module.exports = { WINDOW_MS, PAGE_SIZE, CAPTION_LIMIT, isWindowOpen, recordInbound, markRead,
-                   sendReply, sendMedia, summary, thread, describe, search };
+                   sendReply, sendMedia, summary, unreadCount, thread, describe, search };

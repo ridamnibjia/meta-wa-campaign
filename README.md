@@ -8,6 +8,7 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 
 - **Compose and submit templates** to Meta from the app, with local validation that catches the documented rejection causes before you spend a review cycle.
 - **Bulk send** from a CSV, at a configurable pace, with live per-message state over WebSocket.
+- **Run it again without the file.** Every upload grows a durable contact directory, so a repeat campaign can be staged from the contacts already on the server — one click, no CSV in hand — with opted-out and undeliverable numbers skipped and reported exactly as a fresh upload would. The whole directory also exports back to CSV in the shape it was uploaded (`Name,Mobile Phone`), so a lost file can be re-created from the server.
 - **Survives restarts.** The send queue is a table in SQLite and the resume point is a query over what was actually sent — not a saved cursor a crash can leave ahead of reality — so a crash or deploy picks up where it stopped instead of re-sending.
 - **Warm-up ladder.** A brand-new number climbs `20 → 50 → 100 → 250 → 500 → 1000` per sending day, holds its rung if quality drops to YELLOW or RED, and graduates off the ladder entirely once it has walked the whole thing at good quality.
 - **One-tap opt-out.** A "Stop promotions" button on every template; taps arrive by webhook and disable that contact for campaigns — while leaving them replyable in the inbox.
@@ -339,6 +340,23 @@ that clears a suppression is an explicit, confirmed Enable.
 `GET /api/contacts/directory/download` exports the disabled list with names,
 reasons and timestamps — the file you hand over when someone asks you to prove
 you stopped messaging them.
+
+### Campaigns without a CSV, and the list back out
+
+The directory is every contact any upload has ever introduced, and it outlives
+the files that built it. Two things follow:
+
+- **Reuse the list.** Step 1 of the Campaign screen offers *"Reuse the N
+  contacts on this server"* beside the drop zone. It stages a run from the
+  directory exactly as an upload would — disabled contacts (opted out, or not
+  on WhatsApp) are staged as skipped rows, so the funnel still reports who was
+  left out and why, and nobody disabled is ever messaged.
+- **Export the list.** *"Export all as CSV"* on the Contacts page (and next to
+  the reuse button) downloads the whole directory as `Name,Mobile Phone` with
+  country codes — the exact shape the parser accepts, so the file re-uploads
+  as-is. Disabled contacts are included on purpose: re-uploading never
+  re-enables anyone, and an export that silently dropped them would not be the
+  list.
 
 ### The Contacts page
 
@@ -683,7 +701,7 @@ that module's behaviour is about to change in a future release.
 Run the self-check any time — no framework, no network, ~5 seconds:
 
 ```bash
-npm test         # 564 cases
+npm test         # ~470 focused cases, every assertion says why it matters
 ```
 
 It runs against an in-memory database and temp directories, so it never touches
@@ -694,8 +712,10 @@ the repo's own state files. Run it before every commit.
 The dashboard is the landing page; **New campaign** is the working screen, and it
 is three steps top to bottom:
 
-1. **Upload contacts** — drop a CSV. You immediately get the parsed count, the
-   billable count after opt-outs, and the estimated spend.
+1. **Upload contacts** — drop a CSV, or click *Reuse the N contacts on this
+   server* to stage the directory a previous upload built. Either way you
+   immediately get the parsed count, the billable count after opt-outs, and the
+   estimated spend.
 2. **Pick or compose a template** — choose an existing `APPROVED` template, or
    write a new one and submit it for review without leaving the app. Validation
    runs as you type. If the template has `{{1}}`, `{{2}}` … you map each variable
@@ -1001,10 +1021,12 @@ GET    /api/logs                server log buffer
 GET    /api/faillog             per-contact failure detail
 
 POST   /api/upload-csv          parse CSV → contacts + cost estimate
+POST   /api/stage-contacts      stage a run from the stored directory — no CSV
 GET    /api/contacts            the full parsed list with sent / opted-out flags
 GET    /api/contacts/directory           every known contact (?disabled=1 to filter)
 POST   /api/contacts/directory           { disable: [...], enable: [...] }
 GET    /api/contacts/directory/download  export the disabled list as JSON
+GET    /api/contacts/directory/export.csv  the whole directory as Name,Mobile Phone
 GET    /api/campaign/skips               who was not messaged, grouped by what to do
 GET    /api/inbox/search?q=              search messages, threads and numbers
 GET    /api/inbox/:waId?before=          one page of transcript, newest first

@@ -602,6 +602,33 @@ const recipientsQ = db.prepare(
 // run for every upload, so this only ever fires if a caller reuses one.
 const clearRun = db.prepare('DELETE FROM run_recipients WHERE run_id = ?');
 
+// A run the loop has touched has a row with a wamid or an attempted_at stamp —
+// buildRun's own 'disabled' rows carry neither. Staged-and-never-started is the
+// one state a run can be discarded from without erasing history.
+const runWalkedQ   = db.prepare(`
+  SELECT 1 AS hit FROM run_recipients
+   WHERE run_id = ? AND (wamid IS NOT NULL OR attempted_at IS NOT NULL) LIMIT 1`);
+
+// Called by stageRun before it opens the next run. Staging twice before Start —
+// click "Reuse the server list", then decide to upload a corrected CSV instead
+// — used to leave the first staging's rows behind as a run nothing points at:
+// all pending, so strandedWork() counted every one and the Dashboard warned
+// "N contacts from earlier campaigns were never reached" about people who were
+// never part of a campaign at all, permanently.
+//
+// Only the QUEUE rows go; the campaign_runs row stays. Deliberately: without
+// AUTOINCREMENT, deleting the newest run row hands its id to the next run, and
+// a stale bookmark to the discarded one would silently render a different
+// campaign — the exact failure runDetail's null-not-fallback rule exists to
+// prevent. A run with no recipients is already invisible in History (listRuns
+// filters `queued > 0` as "staged and never started is noise, not history"),
+// and any test sends filed under it keep a run row to name.
+function discardUnstartedRun(runId) {
+  if (runId == null || runWalkedQ.get(runId)) return false;
+  clearRun.run(runId);
+  return true;
+}
+
 // `disabledFor` is passed in rather than imported, because services/messages.js
 // has no business knowing why a contact is off — services/campaign.js supplies
 // the predicate from services/contacts.js. A disabled contact is recorded as a
@@ -906,7 +933,7 @@ module.exports = {
   recordEnvelope, markEnvelopeProcessed, unprocessedWebhookCount,
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
-  recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists,
+  recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
   nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
 };

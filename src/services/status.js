@@ -120,7 +120,9 @@ function buildState() {
       spent:     spentCost(f.delivered, rate),
       remaining: estimateCost(Math.max(0, billable - f.delivered), rate),
     },
-    inboxUnread:    inbox.summary().unread,
+    // unreadCount, never summary(): buildState runs once per message sent, and
+    // summary() builds the whole thread list to answer one integer.
+    inboxUnread:    inbox.unreadCount(),
     pauseReason:    S.pauseReason,
     config:         S.config,
     configured:     !!(CFG.phoneNumberId && CFG.accessToken),
