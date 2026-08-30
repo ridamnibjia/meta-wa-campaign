@@ -54,6 +54,11 @@ function ContactRow({ c, onDisable, onEnable, onRename, onDelete }) {
 }
 
 function Contacts() {
+  // The live counts ride the state broadcast, so a CSV uploaded on the Campaign
+  // page (or an opt-out landing over the webhook) refreshes this list without a
+  // reload — an operator who uploads and then opens Contacts must see the new
+  // total, not yesterday's.
+  const { ss } = useApp();
   // useRoute re-renders this component on every hashchange, which is what makes
   // the URL usable as state at all.
   const [, full] = useRoute();
@@ -89,7 +94,9 @@ function Contacts() {
       .then(d => { setData(d); setError(''); })
       .catch(() => setError('Could not read the contact list.'));
   }, [q, status, page]);
-  useEffect(() => { load(); }, [load]);
+  // Re-fetch when the server-side totals move, not only on navigation: the
+  // upload happens on another screen, and this one may already be mounted.
+  useEffect(() => { load(); }, [load, ss.contacts?.total, ss.contacts?.disabled]);
 
   const flash = m => { setMsg(m); setTimeout(() => setMsg(''), 3000); };
 
