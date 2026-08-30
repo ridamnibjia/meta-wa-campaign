@@ -300,22 +300,28 @@ calls `retry` gets `skipped_reason = 'retry'` plus `retry_after`, and becomes
 pending again by widening the query above — not by a second queue the loop has to
 merge, and not by a `setTimeout` that a restart forgets. `attempts` is
 incremented in SQL for the same reason: read-modify-write in JS hands the contact
-a free extra attempt on every crash. Five waits of three hours, so six attempts.
+a free extra attempt on every crash. The rung heights come from
+`backoffFor(code)` — three hours apart by default, a day apart for 131049.
 `retrying` is counted apart from `skipped` — folding it in would report a run
 finished with people still owed a message, which is the leak the ladder exists to
 close.
 
-**Five rungs, not three, and never zero failures.** It was 1h → 2h → 4h. That is
-too short for the failure it mostly absorbs: **131049 is Meta's per-user
-marketing cap — a rolling, per-person window counted across every business that
-messages that person**, not a counter that resets at midnight. Seven hours of
-retries closed runs with hundreds still owed a message, and the only way to reach
-them was re-uploading the CSV, which opens a new run and messages everyone twice.
-It is not longer than five because **no ladder reaches zero on 131049**: the cap
-belongs to the recipient, not to the attempt. Reaching those people reliably
-means the 24-hour service window — a template that invites a reply, then a
-free-form send — which is what `sendMedia` exists for. Do not re-shorten this
-ladder, and do not expect it to zero the failures on its own.
+**Two ladders, not one, and 131049's is day-scale.** The ladder was five rungs
+of three hours for every retryable code, and for 131049 that was actively
+harmful: **131049 is Meta's per-user marketing cap — a rolling, per-person
+window counted across every business that messages that person**, and Meta's
+own per-user-limits page says wait AT LEAST 24 hours before resending AND that
+repeated resends inside a 24-hour window can extend the block by up to another
+24 hours. Five retries in fifteen hours was hammering the cap it was retrying.
+`backoffFor(code)` in `services/campaign.js` now hands BOTH entrances the
+code's own ladder: 131049 gets three rungs of 24h (the industry norm — WATI
+retries daily for up to 7 days, Gallabox 24/12/12, WANotifier and QuickReply
+3×24h), 131048 (the sender-level spam throttle) gets 4h/12h/24h, and everything
+else keeps the default five rungs of three hours. Do not shorten either ladder,
+and do not expect any ladder to zero 131049: the cap belongs to the recipient,
+not to the attempt. Reaching capped people reliably means the 24-hour service
+window — a template that invites a reply, then a free-form send — which is what
+`sendMedia` exists for.
 
 **The ladder has two entrances, and the webhook one is the busy entrance.** Meta
 answers most sends with HTTP 200 and a wamid and only refuses to deliver minutes
@@ -351,6 +357,34 @@ is still recorded on the message row by `applyStatus` — the send really did fa
 re-runs stored envelopes, so an unguarded version would walk a contact down the
 whole ladder without a single extra attempt being made — and would un-send a
 newer attempt when a stale failure for an older wamid arrived late.
+
+**A fault that fails every send pauses the campaign; one row's fault skips one
+row.** `haltsCampaign()` in `lib/errors.js` is a whitelist beside
+`skipDisposition` — token/permission, billing, account restriction, template
+codes, 131063 — and the loop checks it before every other branch on a failed
+send: it sets `pauseFlag` (so the loop stays awake, and `/api/resume` treats a
+flag-parked pause as operator-resumable — the sleepUntil pauses never set the
+flag), phase `paused`, and a `pauseReason` naming the code, with the contact
+left PENDING. Before this, an expired token burned the whole remaining list
+into identical `failed` rows at delaySec intervals — a thousand-line report of
+one fact, each line costing an attempt. Deliberately not every `fix` code:
+131009 / 132005 / 132012 / 131021 are one row's problem, and pausing a campaign
+over one bad CSV cell is the opposite failure. A crash during the halt is fine:
+`pauseReason ≠ USER_PAUSE`, so `resumeIfInterrupted` retries once, hits the
+same fault, and re-pauses — the probe costs one send.
+
+**MM Lite is an opt-in flag, off by default, and only for MARKETING.**
+`S.config.mmLite` routes template sends to `/PHONE_NUMBER_ID/marketing_messages`
+when the adopted template's category is MARKETING — the endpoint rejects every
+other category, so the gate lives in `sendTemplate`, the one door both the loop
+and test sends pass through. Meta's default `product_policy` is
+`CLOUD_API_FALLBACK`: a WABA that never signed the MM Lite ToS just keeps Cloud
+API routing, which is why the Settings switch is safe to expose. It is
+delivery-time optimisation on Meta's side (their A/B: ~9% delivery lift), NOT
+an exemption from the per-user cap. The webhook's `pricing.category` becomes
+`marketing_lite`; nothing here reads it. 131063 is what Meta returns when
+marketing is disabled on Cloud API, and its `META_ERRORS` entry names this
+switch as the fix.
 
 **Quiet hours are asked TWICE — of the deadline, and of the clock.**
 `lib/schedule.js` pushes any deadline landing 23:00–07:00 IST to 08:00. Night
@@ -425,6 +459,23 @@ Meta's reference, which will never list it.
 resurrect someone who opted out. The requirement is an *absence* in the
 `ON CONFLICT DO UPDATE` set list, which is exactly the kind of thing a future
 contributor "fixes" by adding `enabled = excluded.enabled`. There is a test.
+
+**The CSV parser reads files as they actually arrive, and guesses out loud.**
+`parseCSV` tokenizes the whole file RFC-4180 — a quoted field keeps its commas
+AND its newlines, because Google Contacts and most CRMs export Notes/Address
+columns with embedded newlines, and the old per-line split silently dropped a
+third of such a file as "no usable phone number" (the reported symptom:
+"uploaded 1000 contacts, only the old ones show"). It sniffs the delimiter from
+the header line (`,` `;` tab — a `;` file split on `,` made the whole line one
+field, and the name's digits fused into a plausible WRONG number), and decodes
+UTF-16 by its BOM. Headers matching phone/mobile/whatsapp/"contact no" are
+phone columns; when NOTHING matches, it falls back to the column whose VALUES
+dial (≥90% of the first fifty non-empty cells), and a headerless bare-number
+list is treated as data rather than eating its first contact as a header. Both
+fallbacks come back as `guessedPhone`, which the upload route logs as a warning
+— a guess that large must not be silent. A bare "Number"/"Account Number"
+header still never outranks a named phone column, and the refusal for a file
+with no phones at all now NAMES the columns it saw.
 
 **The opt-out is a second table, and it outlives the contact.** `contacts.enabled`
 used to be the whole record, which made "delete this contact" and "forget they

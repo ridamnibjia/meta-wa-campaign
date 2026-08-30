@@ -218,7 +218,7 @@ const SKIP_GROUPS = [
     // Deliberately does NOT suggest re-sending this as UTILITY. That category is
     // for transactional messages the customer is expecting; promotional copy
     // under it is category misuse and costs the quality rating.
-    blurb: 'These used up all six attempts and still failed for a reason nothing on your side controls — usually the per-person marketing cap, which resets on a scale of days. Put them in a later campaign; there is nothing to fix here.' },
+    blurb: 'These used up every attempt and still failed for a reason nothing on your side controls — usually the per-person marketing cap, which resets on a scale of days. Put them in a later campaign; there is nothing to fix here.' },
   { key: 'fix',       title: 'Fix something first',
     blurb: 'These failed because of a setting on your side. Retrying unchanged repeats the failure; correcting the cause makes the whole list sendable.' },
   { key: 'permanent', title: 'Meta will not deliver these',
@@ -830,10 +830,12 @@ function Campaign() {
           {isWaiting && (
             <Alert variant="warning" title={`In progress — retrying ${num(ss.retrying || 0)} contact${ss.retrying === 1 ? '' : 's'}`}>
               {ss.nextRetry ? `Next attempt at ${clockOf(ss.nextRetry.at)}. ` : ''}
-              These failed for a reason that may pass — a network blip, a Meta hiccup, or the
-              per-person marketing cap. Each gets up to five more tries, three hours apart, with
-              anything falling in the night pushed to 08:00. The campaign is not finished until
-              then, and it carries on by itself across a restart.
+              These failed for a reason that may pass. Transient faults — a network blip, a rate
+              limit, a Meta hiccup — retry three hours apart. The per-person marketing cap
+              (131049) retries once a day for up to three days, because Meta itself asks for 24
+              hours between attempts and blocks harder when you retry sooner. Deadlines falling
+              in the night are pushed to 08:00. The campaign is not finished until then, and it
+              carries on by itself across a restart.
             </Alert>
           )}
           {/* Pause / Resume / Stop are not repeated here. They live in the bar

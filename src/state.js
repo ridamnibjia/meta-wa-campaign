@@ -46,6 +46,13 @@ const S = {
     templateBody:     null,   // the approved, UNRENDERED body — snapshotted onto each run
     headerFormat:     null,   // null | 'TEXT' | 'IMAGE' | 'VIDEO' | 'DOCUMENT'
     headerAssetId:    null,   // media_assets.id sent as this campaign's header
+    // Route MARKETING template sends through Meta's Marketing Messages API
+    // (/marketing_messages) instead of /messages — delivery-time optimisation
+    // on Meta's side, measurably fewer refusals. Off by default: it needs a
+    // one-time ToS acceptance on the WABA, and until that is done Meta routes
+    // the send back through the Cloud API anyway (CLOUD_API_FALLBACK), so
+    // turning it on early is safe but pointless.
+    mmLite:           false,
   },
   pauseReason: null,
   logs:        [],

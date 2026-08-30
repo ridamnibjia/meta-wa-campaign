@@ -52,6 +52,10 @@ router.post('/config', (req, res) => {
     S.config.dailyCap = n;
   }
 
+  // Boolean, checked by type: a checkbox posts true or false and nothing else
+  // may flip where marketing sends are routed.
+  if (typeof req.body.mmLite === 'boolean') S.config.mmLite = req.body.mmLite;
+
   // Checked with `in` rather than truthiness so null can clear it. The
   // template's own approval example is restored on the next adoptTemplate, so
   // clearing is never destructive.

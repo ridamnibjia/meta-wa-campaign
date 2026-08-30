@@ -14,7 +14,7 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 - **One-tap opt-out.** A "Stop promotions" button on every template; taps arrive by webhook and disable that contact for campaigns — while leaving them replyable in the inbox.
 - **Two-way inbox with attachments.** Inbound replies are threaded, and you can reply free-form — text or a file — inside Meta's 24-hour customer-service window. Files come from a reusable library, so one price list is uploaded once and sent to any number of contacts.
 - **Campaign history, with a downloadable report.** Every past campaign with its start and end, the message body *as it was sent*, and who was reached, delivered to, read by, or missed and why — plus a one-click spreadsheet of the whole thing: totals per outcome, then every contact with Meta's code, how many times they were tried, and what it means.
-- **A retry ladder that respects the night.** A failure about the moment rather than about the number goes back on the queue — six attempts, three hours apart — entered both from the send response *and* from the late `failed` webhook Meta actually uses. Nothing goes out between 23:00 and 07:00 IST, checked against the clock at send time and not only when the deadline is written.
+- **A retry ladder that respects the night — and Meta's clock.** A failure about the moment rather than about the number goes back on the queue, entered both from the send response *and* from the late `failed` webhook Meta actually uses. Transient faults retry three hours apart, six attempts in all; the per-user marketing cap (`131049`) retries once a day for up to three days, because Meta asks for 24 hours between attempts and blocks harder when you retry sooner. Nothing goes out between 23:00 and 07:00 IST, checked against the clock at send time and not only when the deadline is written.
 - **Storage management.** One page showing what the disk holds, what it is filled with, and what can safely be removed — with a hard line between files you uploaded and customer files under a retention promise.
 - **Cost estimates** before you start and a running spend figure while you send, per Meta's per-message pricing.
 - **Password gate.** The whole API and the socket sit behind one password. Without `APP_PASSWORD` set, the app refuses to serve anything rather than opening up.
@@ -390,8 +390,14 @@ A send that fails for a reason about the **moment** rather than about the
 Meta fault, or `131049` (the per-person marketing cap, which is counted across
 every business messaging that person and has nothing to do with your settings).
 
-Six attempts in all — the original, then five more three hours apart. The ladder
-is therefore 15 hours of sending time spread over at most about a day.
+Transient faults — a network throw, a rate limit, a Meta fault — get six
+attempts in all: the original, then five more three hours apart. `131049` walks
+its own ladder: three more attempts, **a day apart**, because Meta's
+per-user-limits page asks for at least 24 hours between attempts and warns that
+resending sooner can extend the block by up to another 24 hours. The old
+three-hour rungs were hammering the very cap they retried; day-scale retries are
+also how WATI, Interakt, Gallabox and the rest pace this error, and the pacing
+recovers a large share of initially-refused sends on its own.
 
 **The ladder has two entrances, and the second is the busy one.** Meta answers
 most sends with HTTP 200 and a message id and only decides minutes or hours later
@@ -399,6 +405,23 @@ that it will not deliver, over a `failed` status webhook — which is how `13104
 almost always arrives. Both the send-time failure and the late webhook feed the
 same ladder and the same whitelist, so a run does not close with a contact that
 Meta accepted and then refused.
+
+**A fault that would fail everyone pauses the campaign instead.** An expired
+token, a billing hold, a template Meta paused — every send after it fails
+identically, so walking on would burn the whole list into a thousand-line
+report of one fact, one attempt at a time. The first such failure now parks the
+campaign with the contact still pending, the pause banner names the code and
+the fix, and **Resume** retries that same contact first. Which codes qualify is
+`haltsCampaign` in `src/lib/errors.js` — deliberately not every "fix" code,
+because a bad value in one CSV cell is one row's problem.
+
+**MM Lite (optional).** Settings → *Marketing Messages API* routes MARKETING
+templates through Meta's `/marketing_messages` endpoint; Meta then optimises
+delivery timing on their side (a measured ~9% delivery lift in Meta's own A/B
+test on engaged audiences). It needs a one-time Terms of Service acceptance in
+WhatsApp Manager — until then Meta falls back to the Cloud API automatically,
+so the switch is safe to flip early. It is **not** an exemption from the
+per-user marketing cap.
 
 ### Quiet hours
 
@@ -1256,13 +1279,19 @@ estimate.** Set these to your own country's rates from
 
 The **App behavior** column is `skipDisposition()` in `src/lib/errors.js`, and it
 is the same table the skip report groups by. `retry` puts the contact back on the
-queue (six attempts, three hours apart, never at night); `fix` means retrying
-unchanged just reproduces the failure once per contact.
+queue (three hours apart by default, a day apart for `131049`, never at night);
+`fix` means retrying unchanged just reproduces the failure once per contact — and
+the codes that fail *every* contact identically (`haltsCampaign()`: token,
+billing, template, account) pause the whole campaign with the contact still
+pending, so Resume after the fix loses nobody.
 
 | Code | Meaning | App behavior |
 |---|---|---|
 | `131026` | Not on WhatsApp, or blocked by Meta on quality grounds | `permanent` — contact disabled `failed_hard`, never retried |
-| `131049` | Per-person marketing cap, counted across every business | `retry` — nothing on your side caused it or fixes it |
+| `131049` | Per-person marketing cap, counted across every business | `retry` — a day apart, three times: Meta asks for ≥24h between attempts, and faster retries extend the block |
+| `131048` | Sender-level spam throttle | `retry` — 4h/12h/24h; hammering it feeds the signal that raised it |
+| `131056` | Too many messages to this one person in a short window | `retry` |
+| `131057` | Account in maintenance mode | `retry` |
 | `131000`, `131016` | Meta fault it tells you is transient | `retry` |
 | `130429`, `80007`, `4` | Rate limit | Slept off in the loop **three times**, then handed to the ladder so one throttled number cannot own the campaign |
 | `130472` | Meta held this recipient back for a marketing experiment | `unclassified` on purpose — a holdout window runs for days, so all six attempts would land inside it, but the contact is fine and must not be written off |

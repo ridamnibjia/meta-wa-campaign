@@ -219,7 +219,7 @@ test('a blank sample slot is caught positionally, not by counting non-blanks els
 test('an empty CSV still answers with all three keys', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
-  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [] });
+  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null });
 });
 
 test('csvField — defuses formulas, strips control chars, quotes, and round-trips', () => {
@@ -465,6 +465,66 @@ test('a CRLF file does not leave a stray return on the last column', () => {
   const { contacts } = parseCSV(Buffer.from('Name,Mobile Phone\r\nAsha,+919000000001\r\n'));
   assert.equal(contacts.length, 1);
   assert.equal(contacts[0].dialStr, '919000000001');
+});
+
+// Every case below loaded ZERO contacts (or, worse, wrong numbers) before the
+// whole-file tokenizer, the delimiter sniff, the UTF-16 decode and the value
+// fallback. Each one is a real export format: the reported symptom was
+// "uploaded 1000 contacts, the app shows only the old ones".
+test('a quoted field may contain newlines — Google Contacts Notes columns do', () => {
+  const csv = 'Name,Notes,Mobile Phone\n'
+    + 'Asha,"first line\nsecond line",+919000000001\n'
+    + 'Rahul,plain,+919000000002\n'
+    + 'Meera,"a, comma\nand a line",+919000000003\n';
+  const { contacts, skipped } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 3,
+    'the per-line splitter parsed a third of such a file and reported the rest as rows with no phone');
+  assert.equal(skipped.length, 0);
+  assert.equal(contacts[2].dialStr, '919000000003');
+});
+test('an Excel "Unicode CSV" (UTF-16 with BOM) loads instead of parsing to zero', () => {
+  const body = 'Name,Mobile Phone\nAsha,+919000000001\n';
+  const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(body, 'utf16le')]);
+  const { contacts } = parseCSV(buf);
+  assert.equal(contacts.length, 1, 'decoded as UTF-8 every header check fails on the NUL neighbours');
+  assert.equal(contacts[0].dialStr, '919000000001');
+});
+test('a semicolon-separated file parses on ";" and never fuses the name into the number', () => {
+  const { contacts } = parseCSV(Buffer.from('Name;Mobile Phone\nUser7;+91 90000 00001\n'));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].dialStr, '919000000001',
+    'split on the wrong delimiter the whole line is one field, and the name\'s digits joined the phone — a message to a stranger');
+  assert.equal(contacts[0].name, 'User7');
+});
+test('a tab-separated file parses on tabs', () => {
+  const { contacts } = parseCSV(Buffer.from('Name\tMobile Phone\nAsha\t+919000000001\n'));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].dialStr, '919000000001');
+});
+test('a bare list of numbers with no header row loads — the first number is not eaten as a header', () => {
+  const { contacts, guessedPhone } = parseCSV(Buffer.from('+919000000001\n+919000000002\n'));
+  assert.equal(contacts.length, 2);
+  assert.equal(contacts[0].name, 'Contact');
+  assert.ok(guessedPhone, 'a guess this large is said out loud, never made in silence');
+});
+test('"Contact Number", "WhatsApp Number" and friends are phone headers', () => {
+  for (const h of ['Contact Number', 'Contact No.', 'WhatsApp Number', 'Whatsapp']) {
+    const { contacts, guessedPhone } = parseCSV(Buffer.from(`Name,${h}\nAsha,+919000000001\n`));
+    assert.equal(contacts.length, 1, `header "${h}" names a phone`);
+    assert.equal(guessedPhone, null, 'matched by name, so nothing was guessed');
+  }
+});
+test('a header nothing matches falls back to sniffing the values, and says so', () => {
+  const { contacts, guessedPhone } = parseCSV(Buffer.from('Name,Digits\nAsha,+919000000001\nRahul,+919000000002\n'));
+  assert.equal(contacts.length, 2, 'the numbers are the point of the file, whatever the column is called');
+  assert.match(String(guessedPhone), /Digits/, 'and the operator is told which column was guessed');
+});
+test('the value sniff never runs when a real phone header exists', () => {
+  const csv = 'Name,Account Number,Mobile Phone\nAsha,12345678901,+919000000001\n';
+  const { contacts, guessedPhone } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1);
+  assert.equal(contacts[0].dialStr, '919000000001', 'the account id stays an account id');
+  assert.equal(guessedPhone, null);
 });
 
 console.log('\nverifySignature');
@@ -2683,7 +2743,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     try {
       buildRun(run, p);
       const contact = { name: p[0].name, dialStr: p[0].dialStr };
-      const fail    = { errorCode: 131049, error: 'cap', hint: null };
+      const fail    = { errorCode: 131000, error: 'meta fault', hint: null };
 
       for (let i = 0; i < RETRY_BACKOFF_MS.length; i++) {
         const row = nextPending(run, Date.now() + 99 * HOUR_MS);
@@ -2702,12 +2762,35 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     } finally { S.currentRunId = saved; }
   });
 
-  test('the ladder is five even rungs of three hours', () => {
+  test('the default ladder is five even rungs of three hours', () => {
     assert.equal(RETRY_BACKOFF_MS.length, 5,
-      'three rungs over seven hours closed runs with people still owed a message, because ' +
-      '131049 is a rolling per-person cap and not a counter that resets');
+      'transient faults get six attempts — enough to outlast a bad afternoon, short enough to close the run');
     assert.ok(RETRY_BACKOFF_MS.every(ms => ms === 3 * HOUR_MS),
-      'even spacing is what makes the ladder explainable to an operator');
+      'even spacing is what makes the ladder explainable to an operator — 131049 walks its own day-scale ladder');
+  });
+
+  test('131049 walks a day-scale ladder; unlisted codes keep the default one', () => {
+    const M2 = require('./server');
+    const day = M2.backoffFor(131049);
+    assert.ok(day.length >= 3, 'the per-user cap deserves several attempts — it does lift');
+    assert.ok(day.every(ms => ms >= 24 * HOUR_MS),
+      'Meta says wait AT LEAST 24h, and that resends inside 24h can extend the block by another 24h — ' +
+      'the old 3-hour rungs were hammering the very cap they retried');
+    assert.equal(M2.backoffFor(131000), M2.RETRY_BACKOFF_MS, 'unlisted codes use the default ladder');
+    const spam = M2.backoffFor(131048);
+    assert.ok(spam.every((ms, i, a) => i === 0 || ms >= a[i - 1]),
+      'the spam throttle backs off harder each time, never faster — hammering it feeds the signal that raised it');
+  });
+
+  test('haltsCampaign — campaign-wide faults only, never one row\'s problem', () => {
+    const M2 = require('./server');
+    for (const code of [190, 131042, 132001, 132015, 133010, 131063]) {
+      assert.equal(M2.haltsCampaign(code), true, `${code} fails every contact identically — pause, do not burn the list`);
+      assert.equal(M2.skipDisposition(code), 'fix', `${code} still reads as "fix something first" in the report`);
+    }
+    for (const code of [131049, 131026, -1, 131009, 132005, 999999]) {
+      assert.equal(M2.haltsCampaign(code), false, `${code} is one row's problem and must not stop the other nine hundred`);
+    }
   });
 
   test('with WA_QUIET_HOURS=0 the stored deadline is exactly the backoff — the opt-out reaches the ladder too', () => {
@@ -2724,7 +2807,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       buildRun(run, p);
       const before = Date.now();
       scheduleRetry({ name: p[0].name, dialStr: p[0].dialStr }, { attempts: 0 },
-        { errorCode: 131049, error: 'cap' }, '[t]');
+        { errorCode: 131000, error: 'meta fault' }, '[t]');
       const at = rowFor(run, p[0].dialStr).retry_after;
       assert.ok(Math.abs(at - (before + 3 * 3600000)) < 60000,
         'under WA_QUIET_HOURS=0 the deadline must be the bare three-hour rung, whatever the wall clock says');
@@ -2885,7 +2968,7 @@ console.log('\ndelivery failures that arrive over the webhook');
 {
   const M = require('./server');
   const { buildRun, recordRecipientSent, progressForRun, handleDeliveryFailure,
-          applyStatus, countsForRun, recipientsForRun, RETRY_BACKOFF_MS } = M;
+          applyStatus, countsForRun, recipientsForRun, RETRY_BACKOFF_MS, backoffFor } = M;
   const C = M.contacts;
 
   let runSeq = 0;
@@ -2936,7 +3019,8 @@ console.log('\ndelivery failures that arrive over the webhook');
     const row = rowFor(run, p[1].dialStr);
     assert.equal(row.wamid, null, 'the accept stamp is what made the queue call them done');
     assert.equal(row.attempts, 1);
-    assert.ok(row.retry_after > Date.now() + RETRY_BACKOFF_MS[0] - 5000, 'due about three hours out');
+    assert.ok(row.retry_after > Date.now() + backoffFor(131049)[0] - 5000,
+      'due about a day out — Meta asks for 24 hours before a 131049 resend');
   });
 
   test('the progress counter does not walk backwards when the ladder requeues', () => {
@@ -3013,19 +3097,20 @@ console.log('\ndelivery failures that arrive over the webhook');
     assert.equal(progressForRun(run).pending, 0, 'guessing on the operator\'s behalf is the thing skipDisposition refuses to do');
   });
 
-  test('the ladder ends after five rungs and the run is allowed to close', () => {
+  test('the ladder ends when its code\'s rungs are spent, and the run is allowed to close', () => {
     const run = newRun();
     const p = people(1);
     buildRun(run, p);
-    for (let i = 0; i < RETRY_BACKOFF_MS.length; i++) {
+    const rungs = backoffFor(131049).length;
+    for (let i = 0; i < rungs; i++) {
       accepted(run, p[0], `w.rung${i}`);
       assert.equal(webhook(`w.rung${i}`, 131049), 'retrying');
       assert.equal(rowFor(run, p[0].dialStr).attempts, i + 1);
     }
-    accepted(run, p[0], 'w.rung5');
-    assert.equal(webhook('w.rung5', 131049), 'exhausted',
-      'six attempts over about fifteen hours is the whole ladder — the cap belongs to the '
-      + 'recipient, not to the attempt, so no ladder length zeroes it');
+    accepted(run, p[0], `w.rung${rungs}`);
+    assert.equal(webhook(`w.rung${rungs}`, 131049), 'exhausted',
+      'the cap belongs to the recipient, not to the attempt, so no ladder length zeroes it — '
+      + 'the run must be allowed to close');
     assert.equal(progressForRun(run).pending, 0, 'and the campaign is finally allowed to be finished');
     assert.equal(countsForRun(run).failed, 1, 'reported as a failure, which is what it is');
   });
@@ -6301,6 +6386,117 @@ console.log('\na Reset that lands mid-send');
       flags.stopFlag = false; flags.pauseFlag = false;
       if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
+    }
+  });
+  // ── An account-level fault must pause the campaign, not burn the list ───────
+  // Every send after an expired token / paused template / billing hold fails
+  // identically. The loop used to write that identical failure once per contact
+  // at delaySec intervals — a 1000-row list became a 1000-line report of one
+  // fact. Now the first such failure parks the campaign with the contact still
+  // PENDING, and Resume (allowed, because pauseFlag is set) retries them first.
+  testAsync('an account-level failure pauses the campaign instead of failing the list', async () => {
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, fetch: global.fetch,
+                    days: [...W.days], enabled: W.enabled, delay: S.config.delaySec,
+                    cap: S.config.dailyCap, run: S.currentRunId, phase: S.phase, reason: S.pauseReason };
+    const hadC = fsr.existsSync(FILESr.campaign);
+    const prevC = hadC ? fsr.readFileSync(FILESr.campaign) : null;
+    const hadW = fsr.existsSync(FILESr.warmup);
+    const prevW = hadW ? fsr.readFileSync(FILESr.warmup) : null;
+
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p';
+    S.config.delaySec = 0; S.config.dailyCap = 0; S.config.headerAssetId = null;
+    W.enabled = false;
+    if (!W.days.includes(todayKey())) W.days.push(todayKey());
+
+    const runId = startRun('halted');
+    buildRun(runId, [{ dialStr: '919300000801', name: 'A' }, { dialStr: '919300000802', name: 'B' }]);
+    S.currentRunId = runId; S.phase = 'running';
+    flags.stopFlag = false; flags.pauseFlag = false;
+
+    let sends = 0;
+    global.fetch = async () => {
+      sends++;
+      return { ok: false, headers: new Map(),
+               json: async () => ({ error: { code: 132001, message: 'Template not found' } }) };
+    };
+
+    try {
+      startLoop();
+      const until = Date.now() + 4000;
+      while (S.phase !== 'paused' && Date.now() < until) await new Promise(r => setTimeout(r, 25));
+
+      assert.equal(S.phase, 'paused', 'a template-level fault parks the campaign');
+      assert.equal(flags.pauseFlag, true, 'via pauseFlag, so the loop stays awake and /api/resume is allowed');
+      assert.match(S.pauseReason || '', /132001/, 'and the reason names the code the operator has to fix');
+      assert.equal(sends, 1, 'one probe, not one failure per contact');
+      const rows = db.prepare('SELECT skipped_reason, wamid FROM run_recipients WHERE run_id = ?').all(runId);
+      assert.ok(rows.every(r => r.skipped_reason === null && r.wamid === null),
+        'nobody was skipped and nobody was consumed — a Resume after the fix loses no one');
+
+      flags.stopFlag = true;
+      const gone = Date.now() + 3000;
+      while (flags.running && Date.now() < gone) await new Promise(r => setTimeout(r, 25));
+      assert.equal(flags.running, false);
+    } finally {
+      global.fetch = saved.fetch;
+      CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
+      S.config.delaySec = saved.delay; S.config.dailyCap = saved.cap;
+      W.days = saved.days; W.enabled = saved.enabled;
+      S.currentRunId = saved.run; S.phase = saved.phase; S.pauseReason = saved.reason;
+      flags.stopFlag = false; flags.pauseFlag = false;
+      if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
+      if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
+    }
+  });
+
+  // A thrown fetch (DNS, TLS, no network) is a moment, not three hours: it goes
+  // through the same in-loop backoff a rate limit gets, and only lands on the
+  // ladder after RATE_LIMIT_RETRIES straight misses.
+  testAsync('a thrown fetch is transient — in-loop backoff first, the ladder only after', async () => {
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, fetch: global.fetch,
+                    header: S.config.headerAssetId };
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p'; S.config.headerAssetId = null;
+    global.fetch = async () => { throw new Error('ECONNRESET'); };
+    try {
+      const r = await M.sendTemplate({ name: 'X', dialStr: '919300000901' });
+      assert.equal(r.ok, false);
+      assert.equal(r.errorCode, -1);
+      assert.equal(r.transient, true, 'the loop retries the SAME contact in seconds, like a rate limit');
+      assert.ok(r.retryAfter >= 1000, 'with a real pause, not a tight loop');
+    } finally {
+      global.fetch = saved.fetch; CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
+      S.config.headerAssetId = saved.header;
+    }
+  });
+
+  // MM Lite: same payload, sibling endpoint, marketing templates only. A WABA
+  // that has not signed the MM Lite ToS is routed back through the Cloud API by
+  // Meta itself, which is why the flag is safe to expose.
+  testAsync('mmLite routes MARKETING sends to /marketing_messages and nothing else', async () => {
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, fetch: global.fetch,
+                    mm: S.config.mmLite, cat: S.config.templateCategory, header: S.config.headerAssetId };
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p'; S.config.headerAssetId = null;
+    const urls = [];
+    global.fetch = async url => {
+      urls.push(String(url));
+      return { ok: true, headers: new Map(),
+               json: async () => ({ messages: [{ id: 'wamid.mm' + urls.length }] }) };
+    };
+    try {
+      S.config.mmLite = true; S.config.templateCategory = 'MARKETING';
+      await M.sendTemplate({ name: 'X', dialStr: '919300000902' });
+      assert.match(urls[0], /\/marketing_messages$/, 'MM Lite on + MARKETING template → the optimised endpoint');
+
+      S.config.templateCategory = 'UTILITY';
+      await M.sendTemplate({ name: 'X', dialStr: '919300000903' });
+      assert.match(urls[1], /\/messages$/, '/marketing_messages rejects every other category, so they stay put');
+
+      S.config.mmLite = false; S.config.templateCategory = 'MARKETING';
+      await M.sendTemplate({ name: 'X', dialStr: '919300000904' });
+      assert.match(urls[2], /\/messages$/, 'off means off');
+    } finally {
+      global.fetch = saved.fetch; CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
+      S.config.mmLite = saved.mm; S.config.templateCategory = saved.cat; S.config.headerAssetId = saved.header;
     }
   });
 }

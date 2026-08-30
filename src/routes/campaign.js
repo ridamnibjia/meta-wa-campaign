@@ -162,7 +162,12 @@ router.post('/resume', (req, res) => {
   // "Sending" over hours of silence and deleted the one sentence (pauseReason)
   // that explained it. Refuse with that sentence instead. Only the operator's
   // own pause (USER_PAUSE) is theirs to resume.
-  if (S.phase === 'paused' && S.pauseReason && S.pauseReason !== USER_PAUSE) {
+  // A halt pause is the exception: the loop parks itself on an account- or
+  // template-level failure with pauseFlag SET, exactly like the operator's own
+  // pause, so it is awake and listening — and Resume is how the operator says
+  // "I fixed it, try again". The flag is the test: the loop's sleepUntil pauses
+  // (cap, quiet hours, rate limit) never set it.
+  if (S.phase === 'paused' && S.pauseReason && S.pauseReason !== USER_PAUSE && !flags.pauseFlag) {
     return res.json({ ok: false, error: S.pauseReason });
   }
   flags.pauseFlag = false; S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast(); log('info', 'Resumed'); if (!flags.running) startLoop(); res.json({ ok: true });

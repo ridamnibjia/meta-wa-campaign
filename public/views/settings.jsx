@@ -130,6 +130,31 @@ function SettingsView() {
         </CardContent>
       </Card>
 
+      {/* Marketing Messages API (MM Lite) */}
+      <Card>
+        <CardHeader row>
+          <div className="space-y-1">
+            <CardTitle>Marketing Messages API</CardTitle>
+            <CardDescription>
+              Send MARKETING templates through Meta's <span className="font-mono">/marketing_messages</span> endpoint
+              instead of the plain Cloud API. Meta then optimises delivery timing on their side —
+              measurably fewer "not delivered" refusals on engaged audiences.
+            </CardDescription>
+          </div>
+          <Switch checked={!!ss.config?.mmLite} onChange={mmLite => api.post('/api/config', { mmLite })} label="On" />
+        </CardHeader>
+        <CardContent>
+          <p className="text-xs text-muted-foreground">
+            Needs a one-time Terms of Service acceptance on the WhatsApp Business Account
+            (WhatsApp Manager → Account tools → Marketing Messages). Until that is done, Meta
+            routes these sends back through the Cloud API automatically — so turning this on
+            before onboarding is safe, it just changes nothing yet. Same templates, same
+            webhooks, same per-delivered billing. Utility templates and inbox replies stay on
+            the Cloud API either way.
+          </p>
+        </CardContent>
+      </Card>
+
       {/* Warm-up */}
       {warm && (
         <Card>

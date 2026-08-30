@@ -41,9 +41,12 @@ const META_ERRORS = {
   131016: ['WhatsApp service temporarily unavailable','Transient on Meta\'s side. Pause and resume in a few minutes.'],
   131021: ['Sender and recipient are the same number','You are messaging your own business number. Remove it from the CSV.'],
   131026: ['Message undeliverable',                   'The number is not on WhatsApp, or Meta blocked it on quality grounds. A property of the number, not of the attempt — nothing to fix, and the contact has been switched off so later campaigns skip it automatically.'],
+  368:    ['Account restricted for a policy violation', 'Meta has restricted this WhatsApp Business Account. Check Policy Enforcement under Business Support Home. Sending stays blocked until it is resolved.'],
   131031: ['Account locked for a policy violation',   'Check Business Support Home in Business Manager. Sending stays blocked until resolved.'],
   131042: ['Billing not set up for this business',    'Add or fix the payment method: Business Settings → Billing & Payments. Sends stay blocked until it clears.'],
+  131045: ['Phone number has a registration problem',  'Re-register the number under WhatsApp → API Setup. Sends stay blocked until it clears.'],
   131047: ['Outside the 24-hour customer service window', 'Only approved templates can open a conversation. Confirm you are sending the template, not free text.'],
+  131048: ['Meta has rate-limited this number over spam signals', 'Too many blocks or reports recently. Check the quality rating in WhatsApp Manager, slow the sending down, and let the campaign retry on its own — the limit lifts by itself.'],
   // Deliberately no longer suggests re-sending this as UTILITY. The category is
   // about what the message IS, not about which cap it dodges: UTILITY is for
   // transactional content the customer is expecting — an order update, an
@@ -51,8 +54,13 @@ const META_ERRORS = {
   // misuse, which Meta re-categorises or rejects, and repeat offences cost the
   // quality rating that gates the messaging tier. The retry ladder is the
   // answer, and it is already running.
-  131049: ['Meta chose not to deliver this one',      'This recipient hit their per-user marketing limit — a rolling, per-person cap Meta applies across every business messaging them. Not your error, and nothing on your side fixes it. The campaign retries them automatically, three hours apart, up to five more times.'],
+  131049: ['Meta chose not to deliver this one',      'This recipient hit their per-user marketing limit — a rolling, per-person cap Meta applies across every business messaging them. Not your error, and nothing on your side fixes it. The campaign retries them automatically about once a day, up to three more times — Meta itself asks for at least 24 hours between attempts, and retrying sooner extends the block.'],
   131051: ['Unsupported message type',                'The template was changed after approval. Re-run Check Template.'],
+  131052: ['The media file could not be downloaded',  'Meta could not fetch the file for this message. Re-pick or re-upload the attachment.'],
+  131053: ['The media file could not be uploaded',    'Meta refused the file — usually an unsupported type or a corrupt upload. Re-export it and upload again.'],
+  131056: ['Too many messages to this same person in a short window', 'A per-recipient pacing limit. Only this contact is affected; the campaign retries them automatically.'],
+  131057: ['The account is in maintenance mode',      'Usually a throughput upgrade on Meta\'s side. Temporary — the campaign retries on its own.'],
+  131063: ['Marketing templates are disabled on the Cloud API for this account', 'This WABA is set to send marketing only through the Marketing Messages API. Turn on "Send via Marketing Messages API" in Settings, or clear disable_marketing_messages_on_cloud_api on the WABA.'],
   132000: ['Wrong number of template variables',      'The approved template expects a different variable count than the CSV supplies. Re-run Check Template.'],
   132001: ['Template not found in that language',     'Name or language code does not match an APPROVED template. Check spelling and the language code (en vs en_US).'],
   132005: ['Filled-in template text is too long',     'A CSV value is pushing the body past 1024 characters. Shorten the longest values.'],
@@ -115,7 +123,10 @@ const SKIP_DISPOSITIONS = ['retry', 'permanent', 'fix', 'unclassified'];
 //          these without touching the queue; they are listed so that one which
 //          survives the in-loop backoff still lands in "try again" rather than
 //          in a bucket that reads as final.
-const RETRY = new Set([-1, 4, 80007, 130429, 131000, 131016, 131049]);
+//   131048 is the sender-level spam throttle and 131056 the per-recipient
+//          pacing limit — both lift on their own, on a scale of hours.
+//   131057 is Meta's own maintenance mode.
+const RETRY = new Set([-1, 4, 80007, 130429, 131000, 131016, 131048, 131049, 131056, 131057]);
 
 // About the NUMBER. No amount of retrying changes the answer, and the contact
 // has already been disabled with 'failed_hard' by the campaign loop.
@@ -127,9 +138,11 @@ const PERMANENT = new Set([131026]);
 const FIX = new Set([
   10, 33, 100, 190, 200,            // token / permissions / wrong id
   131008, 131009, 131021, 131047,   // bad variable, own number, wrong message type for the window
-  131031, 131042, 133010,           // policy lock, billing, number not registered
+  368, 131031, 131042, 131045, 133010, // policy restriction, billing, registration
   131051, 132000, 132001, 132005,   // template drifted from what was approved
   132007, 132012, 132015, 132016, 2388023,
+  131052, 131053,                   // the media this send pointed at is broken
+  131063,                           // marketing disabled on Cloud API — a setting, not a contact
 ]);
 
 function skipDisposition(code) {
@@ -140,4 +153,25 @@ function skipDisposition(code) {
   return 'unclassified';
 }
 
-module.exports = { META_ERRORS, explainError, skipDisposition, SKIP_DISPOSITIONS };
+// ── Faults that fail EVERY send the same way ───────────────────────────────────
+// A subset of FIX. Nothing about the CONTACT caused these — an expired token, a
+// billing hold, a template Meta paused — so walking on writes the identical
+// failure once per row and turns a 1000-contact list into a 1000-line report of
+// one fact, each line costing a send attempt. The loop pauses the campaign on
+// the first of these instead, with the contact still PENDING, so a Resume after
+// the fix loses nobody and skips nobody.
+//
+// Deliberately NOT here: 131009 / 132005 / 132012 (a bad value from one CSV
+// cell), 131021 (one contact is our own number), 100 (ambiguous — Meta uses it
+// for bad templates and bad recipients alike). Those are one row's problem, and
+// pausing a whole campaign over one row is the opposite failure.
+const HALT = new Set([
+  10, 33, 190, 200,                    // token / permissions / wrong id
+  368, 131031, 131042, 131045, 133010, // account: policy, billing, registration
+  131051, 132000, 132001, 132007, 132015, 132016, 2388023, // template-level
+  131063,                              // marketing disabled on Cloud API
+]);
+
+const haltsCampaign = code => HALT.has(Number(code));
+
+module.exports = { META_ERRORS, explainError, skipDisposition, SKIP_DISPOSITIONS, haltsCampaign };

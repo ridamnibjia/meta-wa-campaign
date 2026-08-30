@@ -11,7 +11,8 @@ Asha,+91 90000 00001
 Sarah,+1 415 555 0123
 ```
 
-A header row and one phone column are the only hard requirements.
+One phone column is the only hard requirement — even the header row is optional
+for a plain list of numbers.
 
 > ## ✅ The one rule that matters
 > **Write every number with its country code.** `+91…`, `+1…`, `+44…`, `+971…` —
@@ -29,11 +30,16 @@ and column order does not matter.
 | Purpose | Header must match | Examples that work |
 |---|---|---|
 | Name | contains `First Name`, or **starts with** `Name` | `Name`, `First Name`, `FirstName`, `Name (display)` |
-| Mobile | contains `Mobile` | `Mobile Phone`, `Mobile`, `Mobile Phone 1 - Value` |
-| Home | contains `Home` | `Home Phone`, `Home Phone 1 - Value` |
+| Phone | contains `Phone`, `Mobile` or `WhatsApp`, or `Contact` followed by `No`/`Number` | `Mobile Phone`, `Phone 1 - Value`, `Home Phone`, `WhatsApp Number`, `Contact No.` |
+
+If **no** header names a phone, the parser falls back to the column whose
+*values* dial — ≥90% of them must be valid numbers — and the upload log says
+which column was guessed. A file with no header row at all (just numbers)
+loads the same way. Check the parsed preview before starting in either case.
 
 - A row with **no matching name column** is still sent — the name becomes `Contact`.
-- A row with **no usable phone number** is silently dropped.
+- A row with **no usable phone number** is reported after the upload, with its
+  row number — never silently dropped.
 - If a row has *both* a mobile and a home number, **both are messaged** — one
   person, two sends, two charges. Delete the home column if you do not want that.
 - `Given Name` alone will *not* be picked up (it neither contains `First Name`
@@ -71,12 +77,13 @@ Duplicates are removed by the **cleaned** number, so `9000000001`,
 
 ## Limits and gotchas
 
-- **UTF-8** only. Excel's "CSV (Comma delimited)" is fine; "CSV UTF-8" is safer
-  for non-Latin names.
-- **Commas inside a field break the row**, even when quoted. `"Sharma, Asha"`
-  shifts every later column by one. Remove commas from names before exporting.
-- Semicolon-separated CSVs (common on European Excel locales) are not parsed.
-  Save as comma-separated.
+- **UTF-8 or UTF-16.** Excel's "CSV (Comma delimited)", "CSV UTF-8" and
+  "Unicode CSV" all work — a UTF-16 file is recognised by its BOM.
+- **Quoted fields are read properly**, commas and line breaks included:
+  `"Sharma, Asha"` stays one name, and a Notes column with a line break inside
+  it does not break the rows after it.
+- **Semicolon- and tab-separated files** are detected from the header line and
+  parsed. Comma stays the default when in doubt.
 - Blank lines are ignored. There is no row limit, but the whole file is held in
   memory — past ~50k rows, split it.
 

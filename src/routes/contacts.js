@@ -37,12 +37,17 @@ router.post('/upload-csv', (req, res, next) => {
     // list out from under a running send is not.
     const blocked = campaignBlocker();
     if (blocked) return res.json({ ok: false, error: blocked });
-    const { contacts: parsed, skipped, duplicates } = parseCSV(req.file.buffer);
+    const { contacts: parsed, skipped, duplicates, headers, guessedPhone } = parseCSV(req.file.buffer);
     // Refused BEFORE stageRun: staging replaces the queue and opens a new run,
     // and an empty file must not swap a real campaign's queue for nothing.
     if (!parsed.length) {
+      // Name the columns the file actually has: "check your headers" sends the
+      // operator hunting through Excel, the list itself ends the hunt.
+      const cols = (headers || []).filter(Boolean).map(h => `"${h}"`).join(', ');
       return res.json({ ok: false, error: skipped.length
-        ? `No usable contacts — all ${skipped.length} row(s) lacked a phone number this app can read. Check the column headers and country codes.`
+        ? `No usable contacts — all ${skipped.length} row(s) lacked a phone number this app can read.`
+          + (cols ? ` The file's columns are ${cols}. A phone column's header should mention "phone", "mobile", "WhatsApp" or "contact number" — or the column should hold numbers with country codes.`
+                  : ' Check that the numbers carry country codes.')
         : 'That CSV is empty — nothing was loaded.' });
     }
     // The durable list is updated before the send queue, and the upsert
@@ -57,6 +62,10 @@ router.post('/upload-csv', (req, res, next) => {
     stageRun(parsed);
     saveCampaignNow();
     log('info', `CSV loaded — ${parsed.length} contacts (${upload.newCount} new to this server)`);
+    // A guess is allowed to load the file; it is not allowed to be silent.
+    if (guessedPhone) {
+      log('warn', `CSV — no column header names a phone, so the numbers were read by ${guessedPhone}. Check the parsed list before starting.`);
+    }
     // Loudly, and at warn level. A row the parser could not read is a customer
     // who will not be messaged, and the operator is the only one who can tell
     // whether that is a blank line at the end of the file or a broken export.

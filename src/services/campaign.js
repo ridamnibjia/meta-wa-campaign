@@ -10,7 +10,7 @@ const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
         nextRetryForRun, progressForRun } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
-const { explainError, skipDisposition } = require('../lib/errors');
+const { explainError, skipDisposition, haltsCampaign } = require('../lib/errors');
 const { deferPastQuietHours, nextIstMidnight } = require('../lib/schedule');
 const { graphHeaders } = require('./graph');
 const { headerComponent } = require('./media');
@@ -132,6 +132,15 @@ async function sendTemplate(contact) {
     return h.component;
   };
 
+  // MM Lite: Meta's Marketing Messages API takes the identical payload on a
+  // sibling endpoint and optimises delivery timing on Meta's side. MARKETING
+  // templates only — /marketing_messages rejects every other category — and a
+  // WABA that has not finished MM Lite onboarding is routed back through the
+  // Cloud API by Meta itself (CLOUD_API_FALLBACK is the default product
+  // policy), so the flag is safe to have on before onboarding completes.
+  const endpoint = S.config.mmLite && S.config.templateCategory === 'MARKETING'
+    ? 'marketing_messages' : 'messages';
+
   const post = async header => {
     const body = {
       messaging_product: 'whatsapp',
@@ -152,7 +161,7 @@ async function sendTemplate(contact) {
     if (components.length) body.template.components = components;
 
     const res = await fetch(
-      `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/messages`,
+      `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/${endpoint}`,
       { method: 'POST', headers: graphHeaders(), body: JSON.stringify(body) }
     );
     return { res, data: await res.json() };
@@ -198,7 +207,12 @@ async function sendTemplate(contact) {
   } catch (e) {
     // fetch itself threw — DNS, TLS, or no outbound network from this host — or
     // the header asset could not be uploaded, which attach() raises.
+    // `transient` routes it through the same in-loop backoff a rate limit gets:
+    // a 30-second blip at contact #340 should cost 30 seconds, not park that
+    // contact — and, one by one, the whole rest of the list — three hours out
+    // on the ladder.
     return { ok: false, error: `Could not send: ${e.message}`, errorCode: -1,
+             transient: true, retryAfter: 30000,
              hint: 'Network problem on the machine running this server, or the header file could not be uploaded to Meta.' };
   }
 }
@@ -209,26 +223,42 @@ async function sendTemplate(contact) {
 // — which opens a new run and messages everyone a second time. That is the leak
 // this closes.
 //
-// Five waits, so six attempts in total: the original send, then one every three
-// hours. Any deadline landing in the night is pushed to 08:00 IST by
-// deferPastQuietHours, so the ladder is 15 hours of send time spread over at
-// most about a day.
-//
-// It was three waits — 1h, 2h, 4h — and that was too short for the failure it
-// mostly absorbs. 131049 is Meta's per-user marketing cap: a ROLLING per-person
-// window counted across every business that messages that person, not a counter
-// that resets. Seven hours of retries closed runs with hundreds still owed a
-// message, and the only way to reach them was re-uploading the CSV — which
-// opens a new run and messages everyone a second time.
-//
-// It is not longer than five because no ladder reaches zero on 131049: the cap
-// belongs to the recipient, not to the attempt. Reaching those people reliably
-// means the 24-hour service window — a template that invites a reply, then a
-// free-form send — which is what services/inbox.js sendMedia exists for.
+// The DEFAULT ladder: five waits of three hours, so six attempts in total, for
+// failures that really are about the moment — a network blip, a Meta fault, a
+// throughput limit. Any deadline landing in the night is pushed to 08:00 IST by
+// deferPastQuietHours.
 //
 // WHICH failures come back here is lib/errors.js:skipDisposition, not a list
 // kept here. A code has to be named 'retry' there to get a second attempt.
 const RETRY_BACKOFF_MS = [3, 3, 3, 3, 3].map(h => h * 3600000);
+
+// Per-code ladders, for the failures whose clock is not ours.
+//
+// 131049 is Meta's per-user marketing cap: a ROLLING per-person window counted
+// across every business that messages that person. It used to walk the default
+// ladder — five retries inside fifteen hours — and Meta's own per-user-limits
+// page says two things that make that actively harmful: wait AT LEAST 24 hours
+// before resending, and repeated resends inside a 24-hour window can extend the
+// block by up to another 24 hours. So these rungs are a day apart, which is
+// also the industry norm (WATI retries every 24h for up to 7 days; Gallabox
+// 24h/12h/12h; WANotifier and QuickReply 3×24h — QuickReply reports recovering
+// about half of initially-refused sends this way).
+//
+// No ladder reaches zero on 131049: the cap belongs to the recipient, not to
+// the attempt. Reaching a capped person reliably means the 24-hour service
+// window — a template that invites a reply, then a free-form send — which is
+// what services/inbox.js sendMedia exists for.
+//
+// 131048 is the sender-level spam throttle: it lifts on its own, on a scale of
+// hours, and hammering it feeds the very signal that raised it.
+const RETRY_LADDERS = {
+  131049: [24, 24, 24].map(h => h * 3600000),
+  131048: [4, 12, 24].map(h => h * 3600000),
+};
+
+// One place answers "how long until this code's next go" for BOTH entrances —
+// the send response and the failure webhook — so they cannot walk two ladders.
+const backoffFor = code => RETRY_LADDERS[Number(code)] || RETRY_BACKOFF_MS;
 
 // Below this, a wait for the next retry deadline is spent silently — see the
 // long note at the `waiting` branch in campaignLoop. One minute rather than a
@@ -275,8 +305,9 @@ const deferIfQuiet = t => (QUIET_HOURS ? deferPastQuietHours(t) : t);
 // null run — a row that matches nothing, so the retry is simply lost.
 function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
   if (skipDisposition(result.errorCode) !== 'retry') return false;
+  const ladder = backoffFor(result.errorCode);
   const made = row.attempts || 0;
-  if (made >= RETRY_BACKOFF_MS.length) {
+  if (made >= ladder.length) {
     log('warn', `${n} ${contact.name} — still failing after ${made + 1} attempts, reporting it [${result.errorCode}]`);
     return false;
   }
@@ -284,9 +315,9 @@ function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
   // what nextPending compares against and what the "next attempt" sentence shows
   // the operator, so nudging the deadline anywhere else would leave the queue
   // and the screen disagreeing about when this contact is due.
-  const at = deferIfQuiet(Date.now() + RETRY_BACKOFF_MS[made]);
+  const at = deferIfQuiet(Date.now() + ladder[made]);
   recordRecipientRetry(runId, contact.dialStr, result.errorCode, at);
-  log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
+  log('warn', `${n} ${contact.name} — ${result.hint || result.error} [${result.errorCode}]. Retry ${made + 1} of ${ladder.length} at ${clockIST(at)}`);
   return true;
 }
 
@@ -362,17 +393,18 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
   // rebuilt. Nothing to put back.
   if (!row || row.wamid !== wamid) return 'stale';
 
+  const ladder = backoffFor(code);
   const made = row.attempts || 0;
-  if (made >= RETRY_BACKOFF_MS.length) {
-    // Six attempts over about fifteen hours. The cap belongs to the recipient,
-    // not to the attempt, so there is no ladder length that zeroes it — see the
-    // note above RETRY_BACKOFF_MS. They stay in `failed` and the run closes.
+  if (made >= ladder.length) {
+    // This code's whole ladder is spent. The cap belongs to the recipient, not
+    // to the attempt, so there is no ladder length that zeroes it — see the
+    // note above RETRY_LADDERS. They stay in `failed` and the run closes.
     log('warn', `+${waId} — still not delivered after ${made + 1} attempts, giving up [${code}]`);
     return 'exhausted';
   }
-  const at = deferIfQuiet(Date.now() + RETRY_BACKOFF_MS[made]);
+  const at = deferIfQuiet(Date.now() + ladder[made]);
   if (!requeueFailedRecipient(runId, waId, wamid, code, at)) return 'stale';
-  log('warn', `+${waId} — back on the queue, retry ${made + 1} of ${RETRY_BACKOFF_MS.length} at ${clockIST(at)}`);
+  log('warn', `+${waId} — back on the queue, retry ${made + 1} of ${ladder.length} at ${clockIST(at)}`);
 
   // Reopening a finished run. The run is already known to be the current one —
   // the guard above returned 'stale' otherwise — so what is left to establish is
@@ -601,6 +633,25 @@ async function campaignLoop() {
     if (rateLimited.phone !== contact.dialStr) rateLimited = { phone: null, n: 0 };
     log('info', `${n} ${contact.name} +${contact.dialStr}${attempt > 1 ? ` — attempt ${attempt}` : ''}`);
     const result = await sendTemplate(contact);
+    // A fault that fails EVERY send the same way — an expired token, a billing
+    // hold, a template Meta paused. Walking on would write the identical
+    // failure once per remaining contact, burn the whole list into a skip
+    // report of one fact, and charge each row an attempt. Park the campaign
+    // instead, with THIS contact still pending: pauseFlag keeps the loop awake
+    // and answering, and /api/resume (allowed because the flag is set) retries
+    // the same contact first — so a fixed fault costs nobody anything.
+    // Which codes qualify is lib/errors.js:haltsCampaign, a whitelist beside
+    // skipDisposition, and deliberately not every 'fix' code: a bad CSV value
+    // is one row's problem and must not stop the other nine hundred.
+    if (!result.ok && haltsCampaign(result.errorCode)) {
+      flags.pauseFlag = true;
+      S.phase = 'paused';
+      S.pauseReason = `Campaign paused — ${result.hint || result.error} [${result.errorCode}]`;
+      log('error', `${n} [${result.errorCode}] ${result.error} — campaign paused, nobody was skipped. Fix the cause, then press Resume.`);
+      if (result.hint) log('error', `   ↳ ${result.hint}`);
+      saveCampaignNow(); broadcast();
+      continue;
+    }
     if (result.ok) {
       markWarmupDay();
       markMessaged(contact.dialStr);
@@ -630,7 +681,7 @@ async function campaignLoop() {
         recordRecipientSkipped(runId, contact.dialStr, 'skipped', result.errorCode);
         log('warn', `${n} skipped — ${result.hint || result.error} [${result.errorCode}]`);
       }
-    } else if (result.rateLimit && rateLimited.n < RATE_LIMIT_RETRIES) {
+    } else if ((result.rateLimit || result.transient) && rateLimited.n < RATE_LIMIT_RETRIES) {
       // Counted per contact — the reset above guarantees this counter is about
       // the contact in hand. A limit that clears after one wait is a burst and
       // costs nobody anything; this branch re-sends the SAME contact with no
@@ -639,8 +690,9 @@ async function campaignLoop() {
       // and the row falls through to scheduleRetry below — 130429 / 80007 / 4
       // are all in skipDisposition's RETRY set, so the ladder takes them.
       rateLimited = { phone: contact.dialStr, n: rateLimited.n + 1 };
-      log('warn', `Rate limit — backing off ${Math.round(result.retryAfter / 1000)}s (${rateLimited.n} of ${RATE_LIMIT_RETRIES}). ${result.hint || result.error} [${result.errorCode}]`);
-      S.phase = 'paused'; S.pauseReason = 'Rate limit — auto-resuming'; broadcast();
+      const what = result.rateLimit ? 'Rate limit' : 'Network problem';
+      log('warn', `${what} — backing off ${Math.round(result.retryAfter / 1000)}s (${rateLimited.n} of ${RATE_LIMIT_RETRIES}). ${result.hint || result.error} [${result.errorCode}]`);
+      S.phase = 'paused'; S.pauseReason = `${what} — auto-resuming`; broadcast();
       // Same reason as the daily cap above: Meta's retry-after is minutes, not
       // seconds, and a Stop must not wait it out.
       await sleepUntil(Date.now() + result.retryAfter);
@@ -738,5 +790,6 @@ module.exports = {
   CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun, suppressIfPermanent,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
   campaignActive, campaignBlocker, scheduleRetry, handleDeliveryFailure, RETRY_BACKOFF_MS,
+  RETRY_LADDERS, backoffFor,
   USER_PAUSE, RATE_LIMIT_RETRIES,
 };
