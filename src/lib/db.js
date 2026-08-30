@@ -257,6 +257,10 @@ function openDb(file) {
   // Pointing an outbound send at it would put the operator's price list under
   // that sweep and delete it from disk with nothing anywhere to say why.
   addColumn(d, 'messages', 'asset_id', 'INTEGER REFERENCES media_assets(id)');
+  // Provenance grew a column: row_count is the UNIQUE contacts a file yielded,
+  // and without the duplicate count "971 rows in my sheet, 775 in the app"
+  // cannot be answered from the record of the upload itself.
+  addColumn(d, 'csv_uploads', 'duplicate_count', 'INTEGER');
   // Inbound media carries a verdict, not just bytes. `risk` is the
   // worst-of-three-signals tier from lib/filerisk; `scan_status` is ClamAV's
   // answer. Two columns because they answer different questions — "what kind

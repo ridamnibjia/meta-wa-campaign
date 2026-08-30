@@ -608,6 +608,18 @@ function Campaign() {
               server from an earlier session has none, so this hangs off count. */}
           {contacts.count > 0 && (
             <>
+              {/* Where every row of the file went. A hand-maintained sheet
+                  routinely lists the same customer several times; merged rows
+                  are correct (one person, one message) but a silent 971→775
+                  reads as the app losing contacts. */}
+              {contacts.breakdown && (
+                <p className="text-[11px] text-muted-foreground">
+                  {num(contacts.count)} unique number{contacts.count === 1 ? '' : 's'}
+                  {contacts.breakdown.duplicates > 0 && <> · {num(contacts.breakdown.duplicates)} duplicate row{contacts.breakdown.duplicates === 1 ? '' : 's'} merged</>}
+                  {contacts.breakdown.skipped > 0 && <> · {num(contacts.breakdown.skipped)} row{contacts.breakdown.skipped === 1 ? '' : 's'} unreadable</>}
+                  {contacts.breakdown.newCount != null && <> · {num(contacts.breakdown.newCount)} new to this server</>}
+                </p>
+              )}
               <div className="divide-y divide-border">
                 {(contacts.sample || []).slice(0, 3).map((c, i) => (
                   <div key={i} className="flex justify-between py-1.5 text-xs">

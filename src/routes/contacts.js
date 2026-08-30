@@ -55,6 +55,7 @@ router.post('/upload-csv', (req, res, next) => {
     // resurrect someone who opted out.
     const upload = contacts.upsertFromCsv(parsed, {
       filename: req.file.originalname || null, skippedCount: skipped.length,
+      duplicateCount: duplicates.length,
     });
     S.phase = 'idle'; S.failLog = [];
     // The queue is staged now, not at /start: it is then durable from the moment

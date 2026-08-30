@@ -316,7 +316,13 @@ function App() {
     // and a refusal because a campaign is still running names the campaign.
     // Prefixing it with "Could not read that CSV" made the second one a lie.
     if (!r.ok) return alert(r.error || 'Could not read that CSV');
-    setContacts({ count: r.count, sample: r.sample, file: file.name });
+    // The breakdown answers "my file has 971 rows, why does this say 775?"
+    // without making the operator dig through the Live log: duplicates are
+    // merged (one person, one message), unreadable rows are reported, and
+    // "new" is how many numbers this server had never seen.
+    setContacts({ count: r.count, sample: r.sample, file: file.name,
+                  breakdown: { duplicates: r.duplicates || 0, skipped: r.skipped || 0,
+                               newCount: r.newCount ?? null } });
     setFailLog([]);
   }, []);
 

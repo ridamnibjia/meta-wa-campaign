@@ -49,8 +49,8 @@ const reapplySuppression = db.prepare(`
 `);
 
 const insertUpload = db.prepare(`
-  INSERT INTO csv_uploads (uploaded_at, filename, row_count, new_count, skipped_count)
-  VALUES (?, ?, ?, ?, ?)
+  INSERT INTO csv_uploads (uploaded_at, filename, row_count, new_count, skipped_count, duplicate_count)
+  VALUES (?, ?, ?, ?, ?, ?)
 `);
 
 const getRow      = db.prepare('SELECT * FROM contacts WHERE phone = ?');
@@ -147,7 +147,7 @@ const markMessaged = (phone, at = Date.now()) => {
 // ── CSV upload ─────────────────────────────────────────────────────────────────
 // Returns the provenance row so the route can tell the operator what actually
 // happened to their file, rather than only how many contacts came out.
-function upsertFromCsv(contacts, { filename = null, skippedCount = 0 } = {}) {
+function upsertFromCsv(contacts, { filename = null, skippedCount = 0, duplicateCount = 0 } = {}) {
   const now = Date.now();
   let newCount = 0;
 
@@ -169,7 +169,7 @@ function upsertFromCsv(contacts, { filename = null, skippedCount = 0 } = {}) {
     // otherwise leave a suppressed number enabled.
     reapplySuppression.run();
     const uploadId = Number(insertUpload.run(
-      now, filename, contacts.length, newCount, skippedCount).lastInsertRowid);
+      now, filename, contacts.length, newCount, skippedCount, duplicateCount).lastInsertRowid);
     db.exec('COMMIT');
     return { uploadId, rowCount: contacts.length, newCount, skippedCount };
   } catch (e) {
