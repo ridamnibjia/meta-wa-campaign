@@ -731,9 +731,11 @@ async function campaignLoop() {
 // nothing downstream could tell.
 //
 // The grace period gives the network and Meta's API time to come back first.
+// It is a parameter below only so test.js can drive the timer without waiting
+// ten real seconds; server.js always takes the default.
 const RESUME_GRACE_MS = 10000;
 
-function resumeIfInterrupted() {
+function resumeIfInterrupted({ graceMs = RESUME_GRACE_MS } = {}) {
   const saved = loadCampaign();
   if (!saved) return;
   const p = progressForRun(S.currentRunId);
@@ -760,15 +762,27 @@ function resumeIfInterrupted() {
     log('info', `Campaign restored — ${p.sent + p.skipped}/${p.total} done, phase ${S.phase}`);
     return;
   }
+  // The exact sentence, kept: it is how the timer below knows nobody has acted
+  // on the announcement since.
+  const graceReason = `Server restarted — resuming ${p.pending} remaining contacts in ${graceMs / 1000}s`;
   S.phase       = 'paused';
-  S.pauseReason = `Server restarted — resuming ${p.pending} remaining contacts in ${RESUME_GRACE_MS / 1000}s`;
-  log('warn', `Campaign was interrupted at ${p.sent + p.skipped}/${p.total} — auto-resuming in ${RESUME_GRACE_MS / 1000}s`);
+  S.pauseReason = graceReason;
+  log('warn', `Campaign was interrupted at ${p.sent + p.skipped}/${p.total} — auto-resuming in ${graceMs / 1000}s`);
   setTimeout(() => {
+    // Stop, Pause and Reset each change the phase or the reason, and an operator
+    // who answers the "resuming in 10s" banner with one of them meant it.
+    // Resuming anyway erased the command — startLoop() clears both flags — and
+    // sent a campaign the operator had just ended. Nothing resurrects a
+    // campaign the operator ended: that rule binds this timer exactly as it
+    // binds the webhook ladder. `flags.running` covers anything that already
+    // started a loop in the window, so this can never put a second one on the
+    // queue.
+    if (S.phase !== 'paused' || S.pauseReason !== graceReason || flags.running) return;
     S.phase = 'running'; S.pauseReason = null;
     log('info', `Auto-resumed — ${progressForRun(S.currentRunId).pending} contacts left`);
     broadcast();
     startLoop();
-  }, RESUME_GRACE_MS).unref();
+  }, graceMs).unref();
 }
 
 // Open a run and stage its queue in one step, so no caller can create one

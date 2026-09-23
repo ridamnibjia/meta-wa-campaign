@@ -6320,6 +6320,80 @@ console.log('\nstorage — a file in use is never deleted');
   });
 }
 
+// ── Driving the real loop, and calling a campaign route, from a test ──────────
+// Function declarations, so they are hoisted and any section can use them.
+//
+// Every test that lets the loop run needs the same scaffolding and, above all,
+// the same teardown: the loop is Stopped and waited out BEFORE fetch is put
+// back, because a loop still inside an await when the stub comes off would
+// carry on against the real Graph API. campaign.json and warmup.json live at
+// the repo root and the loop writes both, so they are snapshotted and restored.
+async function withLoop(stubFetch, body) {
+  const M = require('./server');
+  const { CFG: cfg, FILES: files } = require('./src/config');
+  const fs = require('node:fs');
+  const saved = {
+    cfg: { ...cfg }, fetch: global.fetch, config: { ...M.S.config },
+    days: [...M.W.days], enabled: M.W.enabled, quality: M.S.quality,
+    run: M.S.currentRunId, phase: M.S.phase, reason: M.S.pauseReason,
+  };
+  const snap = [files.campaign, files.warmup].map(f => [f, fs.existsSync(f) ? fs.readFileSync(f) : null]);
+  Object.assign(M.S.config, { delaySec: 0, dailyCap: 0, headerAssetId: null });
+  M.W.enabled = false;
+  // Already a sending day, so markWarmupDay() is a no-op and writes nothing.
+  if (!M.W.days.includes(todayKey())) M.W.days.push(todayKey());
+  M.flags.stopFlag = false; M.flags.pauseFlag = false;
+  global.fetch = stubFetch;
+  const h = {
+    M,
+    // What an upload does: open a run, stage its queue, make it current.
+    stage(contacts, label) { const id = M.startRun(label); M.buildRun(id, contacts); return id; },
+    // What /start does once its checks pass.
+    start() { M.S.phase = 'running'; M.S.pauseReason = null; M.startLoop(); },
+    async until(pred, ms = 3000) {
+      const end = Date.now() + ms;
+      while (!pred() && Date.now() < end) await new Promise(r => setTimeout(r, 10));
+      return pred();
+    },
+    row: (run, phone) => M.db.prepare('SELECT * FROM run_recipients WHERE run_id = ? AND phone = ?').get(run, phone),
+  };
+  try {
+    await body(h);
+  } finally {
+    M.flags.stopFlag = true;
+    await h.until(() => !M.flags.running, 5000);
+    M.flags.stopFlag = false; M.flags.pauseFlag = false;
+    global.fetch = saved.fetch;
+    Object.assign(cfg, saved.cfg);
+    for (const k of Object.keys(M.S.config)) if (!(k in saved.config)) delete M.S.config[k];
+    Object.assign(M.S.config, saved.config);
+    M.W.days = saved.days; M.W.enabled = saved.enabled; M.S.quality = saved.quality;
+    Object.assign(M.S, { currentRunId: saved.run, phase: saved.phase, pauseReason: saved.reason });
+    for (const [f, prev] of snap) if (prev) fs.writeFileSync(f, prev); else fs.rmSync(f, { force: true });
+  }
+}
+
+// Graph's two answers to a send, as the stubbed fetch returns them.
+function graphOk(id) {
+  return { ok: true, headers: new Map(), json: async () => ({ messages: [{ id }] }) };
+}
+function graphErr(error) {
+  return { ok: false, headers: new Map(), json: async () => ({ error }) };
+}
+
+// A campaign route called the way Express calls it, minus the socket: the
+// handlers are thin, and HTTP would only add a port to close and a stubbed
+// fetch that has to wave localhost through.
+function callRoute(method, path, body = {}) {
+  const router = require('./src/routes/campaign');
+  const layer = router.stack.find(l => l.route?.path === path && l.route.methods[method]);
+  if (!layer) throw new Error(`no ${method.toUpperCase()} ${path} on the campaign router`);
+  return new Promise((resolve, reject) => {
+    const res = { status() { return this; }, json(o) { resolve(o); return this; } };
+    Promise.resolve(layer.route.stack[0].handle({ body, query: {}, params: {} }, res, reject)).catch(reject);
+  });
+}
+
 // ── The one thing that needs the loop itself ──────────────────────────────────
 // Every other test in this file stays out of the campaign loop on purpose. This
 // one cannot: the bug is a race between an HTTP route and an `await` inside the
@@ -6687,6 +6761,46 @@ test('a restart resumes the loop\'s own pause and respects the operator\'s', () 
     if (had) fs2.writeFileSync(FILES2.campaign, prev);
     else fs2.rmSync(FILES2.campaign, { force: true });
   }
+});
+
+// The grace period is announced on screen — "resuming N contacts in 10s" — and
+// an operator who answers it with Stop, Pause or Reset meant it. The timer used
+// to resume regardless: it set the phase to running, startLoop() cleared both
+// flags, and the campaign the operator had just ended sent anyway. The grace is
+// injected so the suite never waits the real ten seconds.
+testAsync('Stop, Pause or Reset inside the restart grace window is honoured; left alone, it resumes', async () => {
+  let sends = 0;
+  await withLoop(async () => graphOk(`wamid.grace.${++sends}`), async h => {
+    const { S, flags } = h.M;
+    const phone = '919000032001';
+    const run = h.stage([{ dialStr: phone, name: 'Asha' }], 'restart-grace');
+    // What a boot finds: campaign.json saying a run was sending, and a queue
+    // with someone still owed a message.
+    const boot = () => {
+      Object.assign(S, { currentRunId: run, phase: 'running', pauseReason: null });
+      h.M.saveCampaignNow();
+      Object.assign(S, { currentRunId: null, phase: 'idle', pauseReason: null });
+      flags.stopFlag = false; flags.pauseFlag = false;
+      h.M.resumeIfInterrupted({ graceMs: 20 });
+      assert.match(S.pauseReason || '', /Server restarted — resuming 1 remaining contacts in 0.02s/,
+        'the window is announced first, with the grace actually in force');
+    };
+
+    for (const [action, phase] of [['/stop', 'idle'], ['/pause', 'paused'], ['/reset', 'idle']]) {
+      boot();
+      await callRoute('post', action);                    // the operator answers the banner
+      await new Promise(r => setTimeout(r, 80));          // well past the 20 ms grace
+      assert.equal(flags.running, false,
+        `${action} inside the announced window must not be erased by the timer — nothing may resurrect a campaign the operator ended`);
+      assert.equal(sends, 0, `and after ${action} nobody is messaged`);
+      assert.equal(S.phase, phase, `the phase ${action} left behind is still the operator's`);
+    }
+
+    boot();
+    await h.until(() => h.row(run, phone).wamid);
+    assert.equal(h.row(run, phone).wamid, 'wamid.grace.1',
+      'left alone, the grace period ends in a resume — the half that must keep working');
+  });
 });
 
 // ── People an older campaign still owes a message to ─────────────────────────
