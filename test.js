@@ -6827,6 +6827,14 @@ test('docker-compose.yml publishes the port on loopback only, with state on a na
   assert.match(dc, /restart:\s*unless-stopped/, 'a crash on a box nobody is watching must not need a manual restart');
   assert.match(dc, /wa-data:\/data/, 'state must live on the named volume, or a rebuild silently deletes the database');
 });
+test('the repo carries an MIT license, so a self-hoster has a right to run it', () => {
+  assert.match(fsx.readFileSync(pathx.join(__dirname, 'LICENSE'), 'utf8'), /MIT License/,
+    'without a license the repo is all-rights-reserved and self-hosters have no right to run it');
+  assert.equal(require('./package.json').license, 'MIT',
+    'package.json is the machine-readable half — tools that read it should see the same answer as a human reading LICENSE');
+  assert.match(fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8'), /## License\s*\n+MIT/,
+    'the README is where a human actually looks, not just the LICENSE file');
+});
 
 // ── Frontend scripts share one global scope ──────────────────────────────────
 console.log('\nfrontend — global scope');
