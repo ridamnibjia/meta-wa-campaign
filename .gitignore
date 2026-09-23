@@ -39,6 +39,9 @@ docs/
 # Assistant session logs
 .remember/
 
+# Local Claude Code settings — per-contributor, not project config.
+.claude/
+
 # Never commit a real contact list. Phone numbers are personal data, and a
 # public repo is a permanent, indexed copy. contacts-template.csv is the
 # exception — it is synthetic and deliberately tracked.

@@ -6847,6 +6847,10 @@ test('CI runs the real suite on every push and PR, and reports audit advisories 
   assert.match(wf.split('\n').slice(auditLine, auditLine + 2).join('\n'), /continue-on-error:\s*true/,
     'an advisory must not turn a green suite into a red build — that is a decision for a human, not the audit step');
 });
+test('.gitignore keeps local assistant settings out of the public repo', () => {
+  const lines = fsx.readFileSync(pathx.join(__dirname, '.gitignore'), 'utf8').split('\n').map(s => s.trim());
+  assert.ok(lines.includes('.claude/'), 'a contributor\'s local Claude Code settings are not this project\'s to publish');
+});
 
 // ── Frontend scripts share one global scope ──────────────────────────────────
 console.log('\nfrontend — global scope');
