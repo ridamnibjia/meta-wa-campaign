@@ -8,11 +8,12 @@
 // recovering from something.
 const { CFG, OPT_OUT_LABEL } = require('../config');
 const { db } = require('../lib/db');
-const { log, emit } = require('../state');
+const { S, log, emit } = require('../state');
 const { broadcast } = require('./status');
 const { disable } = require('./contacts');
 const { applyStatus, markEnvelopeProcessed } = require('./messages');
 const { handleDeliveryFailure } = require('./campaign');
+const { fetchAccountInfo } = require('./graph');
 const inbox = require('./inbox');
 
 // One broadcast per envelope, not one per message and one per status.
@@ -44,6 +45,32 @@ function processEnvelope(body) {
         log(v.event === 'APPROVED' ? 'success' : 'warn',
             `template "${v.message_template_name}" is ${v.event}${v.reason && v.reason !== 'NONE' ? ` — ${v.reason}` : ''}`);
         emit('templates');
+        continue;
+      }
+
+      // The number's quality rating moved, or its messaging tier did. The
+      // warm-up gate re-derives its rung from S.quality on every send, and
+      // until this nothing refreshed that value while a campaign ran — only an
+      // operator opening a page, or the next Start — so on a retry ladder that
+      // spans days, a slip to YELLOW on day two changed nothing. The payload
+      // names an EVENT (FLAGGED, DOWNGRADE, …) and the tier, not the rating, so
+      // the rating is re-read from Graph rather than guessed from the event.
+      // Not awaited: this function stays synchronous, and a re-read is the one
+      // write replay cannot get wrong — it only ever fetches the rating as it is
+      // NOW. Subscribing to this field is README §10's job.
+      if (change.field === 'phone_number_quality_update') {
+        const v = change.value || {};
+        log(['UPGRADE', 'UNFLAGGED'].includes(v.event) ? 'info' : 'warn',
+            `Meta quality update: ${v.event || 'changed'}${v.current_limit ? ` · limit ${v.current_limit}` : ''}`);
+        fetchAccountInfo()
+          .then(i => {
+            // fetchAccountInfo reports a Graph refusal as { error } rather than
+            // throwing; both land in the same catch, so neither is silent.
+            if (!i?.qualityRating) throw new Error(i?.error || 'Graph returned no rating');
+            S.quality = i.qualityRating;
+            broadcast();
+          })
+          .catch(e => log('warn', `Could not re-read the quality rating: ${e.message}`));
         continue;
       }
 

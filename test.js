@@ -3875,6 +3875,64 @@ console.log('\nwebhook replay');
   });
 }
 
+console.log('\nwebhook ingest — what an envelope means');
+{
+  const { processEnvelope } = require('./src/services/ingest');
+  const { setIO } = require('./src/state');
+  // No entry id on purpose: an envelope that carries one teaches CFG.wabaId,
+  // and that would leak into every template test that runs after this block.
+  const envelopeOf = (field, value) => ({
+    object: 'whatsapp_business_account', entry: [{ changes: [{ field, value }] }],
+  });
+  // Every socket event emitted while fn runs. The real io goes back afterwards
+  // whatever fn did, so a failing assertion cannot leave the app talking to a
+  // test double.
+  const listening = async fn => {
+    const heard = [];
+    setIO({ emit: (event, payload) => heard.push({ event, payload }) });
+    try { await fn(); } finally { setIO(require('./server').io); }
+    return heard;
+  };
+
+  // Meta pushes this when the number is flagged, unflagged, or changes tier.
+  // The warm-up gate re-derives its rung from S.quality on every send, and
+  // nothing refreshed that value while a campaign ran — only an operator opening
+  // a page, or the next Start — on a retry ladder that now spans days.
+  testAsync('a quality update re-reads the rating from Graph; a failed re-read keeps the last one', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality,
+                    token: CFG.accessToken, phone: CFG.phoneNumberId };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = 'test-phone';
+    const asked = [];
+    try {
+      global.fetch = async url => {
+        asked.push(String(url));
+        return { json: async () => ({ quality_rating: 'YELLOW', messaging_limit_tier: 'TIER_1K' }) };
+      };
+      S.quality = 'GREEN';
+      processEnvelope(envelopeOf('phone_number_quality_update',
+        { display_phone_number: '15550000000', event: 'DOWNGRADE', current_limit: 'TIER_1K' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'YELLOW',
+        'the warm-up gate steps back a rung on this value — it has to be what Meta reports now, mid-campaign');
+      assert.ok(asked.some(u => u.includes('quality_rating')),
+        'read back from Graph, not mapped from the event name — the payload says DOWNGRADE, not which colour');
+
+      global.fetch = async () => { throw new Error('network down'); };
+      const heard = await listening(async () => {
+        processEnvelope(envelopeOf('phone_number_quality_update', { event: 'FLAGGED' }));
+        await new Promise(r => setImmediate(r));
+      });
+      assert.equal(S.quality, 'YELLOW', 'a re-read that failed must not clobber the last rating anyone saw');
+      assert.ok(heard.some(h => h.event === 'log' && /quality rating/i.test(h.payload.msg)
+                                && /network down/.test(h.payload.msg)),
+        'and the failure is said out loud, not swallowed');
+    } finally {
+      global.fetch = saved.fetch; S.quality = saved.quality;
+      CFG.accessToken = saved.token; CFG.phoneNumberId = saved.phone;
+    }
+  });
+}
+
 console.log('\ndiagnostics');
 {
   const diag = require('./src/services/diagnostics');
