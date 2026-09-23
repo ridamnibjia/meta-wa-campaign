@@ -11,7 +11,7 @@ const { db } = require('../lib/db');
 const { S, log, emit } = require('../state');
 const { broadcast } = require('./status');
 const { disable } = require('./contacts');
-const { applyStatus, markEnvelopeProcessed } = require('./messages');
+const { applyStatus, markEnvelopeProcessed, waIdForWamid } = require('./messages');
 const { handleDeliveryFailure } = require('./campaign');
 const { fetchAccountInfo } = require('./graph');
 const inbox = require('./inbox');
@@ -95,6 +95,21 @@ function processEnvelope(body) {
           // deserves an answer, and answering is not a marketing message.
           if (disable(m.from, 'opt_out', profileName)) {
             log('warn', `opt-out — +${m.from} will be skipped by campaigns from now on`);
+          }
+          // wa_id is not always the number we dialed: Brazil's ninth digit,
+          // Mexico's 521 and Argentina's 9 all come back from Meta in a
+          // different form from the one in the CSV, and the loop checks the
+          // CSV form. The tap answers a template, and context.id is that
+          // template's wamid — which names the form we dialed. disable() is a
+          // no-op when that number is already off for this reason, so a
+          // redelivered tap or a replay costs nothing.
+          // ponytail: only a button tap is an opt-out here, and every tap
+          // carries context.id. A typed stop word would not — learning wa_id
+          // aliases from each send response (data.contacts[0].wa_id) is the
+          // fix if that ever becomes an opt-out path.
+          const dialed = m.context?.id ? waIdForWamid(m.context.id) : null;
+          if (dialed && dialed !== m.from && disable(dialed, 'opt_out', profileName)) {
+            log('warn', `opt-out — +${dialed} (the number campaigns dial for +${m.from}) will be skipped too`);
           }
         }
         changed = true;

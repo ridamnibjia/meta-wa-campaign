@@ -333,6 +333,14 @@ function recordOutbound({ wamid, waId, name, type = 'template', body = null, at 
   }
 }
 
+// The number an outbound message was sent TO, in the form the campaign dialed
+// it. An opt-out tap answers a template and carries that template's wamid as
+// context.id — and the wa_id the tap comes FROM is not always the same string
+// (services/ingest.js names the countries). A primary-key lookup, so asking it
+// for every tap costs nothing.
+const dialedQ = db.prepare("SELECT wa_id FROM messages WHERE wamid = ? AND dir = 'out'");
+const waIdForWamid = wamid => dialedQ.get(wamid)?.wa_id ?? null;
+
 // ── The send queue ─────────────────────────────────────────────────────────────
 // Written when a CSV is uploaded, walked when the campaign runs. The resume
 // point is a query, never a saved integer: a counter that a crash leaves ahead
@@ -936,4 +944,5 @@ module.exports = {
   recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
   nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
+  waIdForWamid,
 };

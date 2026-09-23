@@ -3931,6 +3931,27 @@ console.log('\nwebhook ingest — what an envelope means');
       CFG.accessToken = saved.token; CFG.phoneNumberId = saved.phone;
     }
   });
+
+  // The wa_id Meta reports is not always the number the campaign dialed —
+  // Brazil's ninth digit, Mexico's 521, Argentina's 9. Filed under the wa_id
+  // alone, an opt-out suppressed a string no campaign row will ever match, and
+  // the next campaign messaged the person who had just asked us to stop.
+  test('an opt-out tap suppresses the number we dialed as well as the wa_id it came from', () => {
+    const dialed = '5511988887777', waId = '551188887777';
+    recordOutbound({ wamid: 'wamid.BR1', waId: dialed, name: 'Marco', body: 'x', runId: null });
+    processEnvelope(envelopeOf('messages', {
+      contacts: [{ wa_id: waId, profile: { name: 'Marco' } }],
+      messages: [{ id: 'wamid.BR1-tap', from: waId, timestamp: '1700000000', type: 'button',
+                   context: { from: '15550000000', id: 'wamid.BR1' },
+                   button: { text: OPT_OUT_LABEL, payload: OPT_OUT_LABEL } }],
+    }));
+    assert.equal(contacts.isDisabled(waId), true, 'the wa_id Meta reported is suppressed, as it always was');
+    assert.equal(contacts.isDisabled(dialed), true,
+      'and so is the form in the CSV — that is the string the next campaign checks before it dials');
+    assert.equal(contacts.getRow(dialed).disabled_reason, 'opt_out',
+      'recorded as the customer asking to stop, which only an explicit re-enable may undo');
+    markRead(waId);
+  });
 }
 
 console.log('\ndiagnostics');
