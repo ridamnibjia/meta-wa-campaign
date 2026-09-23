@@ -6851,6 +6851,16 @@ test('.gitignore keeps local assistant settings out of the public repo', () => {
   const lines = fsx.readFileSync(pathx.join(__dirname, '.gitignore'), 'utf8').split('\n').map(s => s.trim());
   assert.ok(lines.includes('.claude/'), 'a contributor\'s local Claude Code settings are not this project\'s to publish');
 });
+test('README documents only a deployment the session cookie can actually authenticate on', () => {
+  const md = fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8');
+  assert.doesNotMatch(md, /Cloudflare Pages \(frontend\) \+ Render \(backend\)/,
+    'a split frontend/backend deploy cannot log in — the session cookie is sameSite: strict and never rides cross-site');
+  assert.doesNotMatch(md, /setup screen asking for your backend URL/,
+    'that screen does not exist in the code; the README must not promise a feature that was never built');
+  assert.match(md, /\bBIND_HOST\b/, 'the bind-host env var must be documented now that Docker and Render both set it differently than the 127.0.0.1 default');
+  assert.match(md, /\bWA_DATA_DIR\b/, 'the data directory env var must be documented for anyone running this outside the repo root, e.g. the Docker volume');
+  assert.match(md, /docker compose up/, 'the Docker deployment path needs its own instructions now that the Dockerfile and compose file exist');
+});
 
 // ── Frontend scripts share one global scope ──────────────────────────────────
 console.log('\nfrontend — global scope');
