@@ -6861,6 +6861,11 @@ test('README documents only a deployment the session cookie can actually authent
   assert.match(md, /\bWA_DATA_DIR\b/, 'the data directory env var must be documented for anyone running this outside the repo root, e.g. the Docker volume');
   assert.match(md, /docker compose up/, 'the Docker deployment path needs its own instructions now that the Dockerfile and compose file exist');
 });
+test('the tracked backup scripts carry no hosting username', () => {
+  const read = f => fsx.readFileSync(pathx.join(__dirname, f), 'utf8');
+  assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service'), /\/home\/[a-z]/,
+    'a real hosting username in a public repo is exactly what docs/ is gitignored for');
+});
 
 // ── Frontend scripts share one global scope ──────────────────────────────────
 console.log('\nfrontend — global scope');
