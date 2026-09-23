@@ -6835,6 +6835,18 @@ test('the repo carries an MIT license, so a self-hoster has a right to run it', 
   assert.match(fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8'), /## License\s*\n+MIT/,
     'the README is where a human actually looks, not just the LICENSE file');
 });
+test('CI runs the real suite on every push and PR, and reports audit advisories without blocking a merge', () => {
+  const wf = fsx.readFileSync(pathx.join(__dirname, '.github', 'workflows', 'test.yml'), 'utf8');
+  assert.match(wf, /^on:\s*\[push, *pull_request\]/m, 'a fork PR that never runs the suite is how a regression reaches main unseen');
+  assert.match(wf, /actions\/setup-node@v4/, 'pin the action major version, or a v5 someday changes behaviour under everyone at once');
+  assert.match(wf, /node-version:\s*'22'/, 'this app requires Node 22.5+ for node:sqlite — an older runner would fail for a reason unrelated to the change under review');
+  assert.match(wf, /run:\s*npm ci/, 'ci must install from the lockfile exactly, not npm install\'s "close enough"');
+  assert.match(wf, /run:\s*npm test/, 'the whole point of the workflow');
+  const auditLine = wf.split('\n').findIndex(l => /npm audit --omit=dev/.test(l));
+  assert.ok(auditLine >= 0, 'a transitive dev-tool CVE is information, not a reason to skip auditing entirely');
+  assert.match(wf.split('\n').slice(auditLine, auditLine + 2).join('\n'), /continue-on-error:\s*true/,
+    'an advisory must not turn a green suite into a red build — that is a decision for a human, not the audit step');
+});
 
 // ── Frontend scripts share one global scope ──────────────────────────────────
 console.log('\nfrontend — global scope');
