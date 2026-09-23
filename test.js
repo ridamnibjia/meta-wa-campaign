@@ -6805,6 +6805,29 @@ test('a CSV that lists the same number twice reports the merge rather than hidin
   assert.equal(skipped.length, 1, 'a row with no usable number is still a different problem, counted separately');
 });
 
+// ── Deployment files ────────────────────────────────────────────────────────
+console.log('\ndeployment files');
+test('.dockerignore keeps secrets and customer data out of image layers', () => {
+  const lines = fsx.readFileSync(pathx.join(__dirname, '.dockerignore'), 'utf8')
+    .split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+  for (const must of ['.env*', '*.db', '*.db-wal', '.git', '*.csv', 'media/', 'uploads/', 'docs/', 'campaign.json', 'warmup.json'])
+    assert.ok(lines.includes(must), `${must} must stay out of the image — COPY . . ignores .gitignore`);
+});
+test('the image runs as a non-root user and binds all interfaces inside the container', () => {
+  const df = fsx.readFileSync(pathx.join(__dirname, 'Dockerfile'), 'utf8');
+  assert.match(df, /^USER node$/m, 'a process that holds a money-spending token should not be root');
+  assert.match(df, /BIND_HOST=0\.0\.0\.0/, 'loopback inside a container is unreachable through a published port');
+  assert.match(df, /process\.env\.PORT/, 'the healthcheck must follow PORT, not assume 3000');
+});
+test('docker-compose.yml publishes the port on loopback only, with state on a named volume', () => {
+  const dc = fsx.readFileSync(pathx.join(__dirname, 'docker-compose.yml'), 'utf8');
+  assert.match(dc, /build:\s*\.\s*$/m, 'must build from this repo\'s own Dockerfile, not run an image nobody can audit');
+  assert.match(dc, /env_file:\s*\.env/, 'credentials come from the operator\'s own .env, never baked into the image');
+  assert.match(dc, /"127\.0\.0\.1:3000:3000"/, 'binding 0.0.0.0 on the host exposes the app to the internet with no tunnel or proxy in front of it');
+  assert.match(dc, /restart:\s*unless-stopped/, 'a crash on a box nobody is watching must not need a manual restart');
+  assert.match(dc, /wa-data:\/data/, 'state must live on the named volume, or a rebuild silently deletes the database');
+});
+
 // ── Frontend scripts share one global scope ──────────────────────────────────
 console.log('\nfrontend — global scope');
 test('no top-level name is declared in two frontend scripts', () => {
