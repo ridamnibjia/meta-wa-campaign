@@ -24,6 +24,20 @@ process.env.WA_MEDIA_MIN_FREE_BYTES = '0';
 // own arithmetic is tested directly, against fixed timestamps, further down.
 process.env.WA_QUIET_HOURS = '0';
 
+// Hermetic credentials. dotenv never overrides a variable that is already set —
+// not even one set to '' — so these win over whatever .env sits in the checkout.
+// The suite used to pass only on a machine whose .env held a live token: five
+// tests failed anywhere else (a fresh clone, a worktree, CI), and a test that
+// ever forgot to stub fetch would have spent that token on the real Graph API.
+// The fakes are just enough to get past "credentials not configured" to the
+// behaviour under test; everything secret is blanked, as on a clean install.
+Object.assign(process.env, {
+  ACCESS_TOKEN: 'test-token', PHONE_NUMBER_ID: 'test-phone',
+  WABA_ID: '', BUSINESS_ID: '', APP_ID: '', APP_SECRET: '', APP_PASSWORD: '',
+  WEBHOOK_VERIFY_TOKEN: '', CLAMAV_ADDRESS: '', FRONTEND_URL: '',
+  WA_DATA_DIR: '', BIND_HOST: '', RENDER: '',
+});
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
@@ -1518,6 +1532,59 @@ test('a destroyed session stops validating', () => {
   assert.equal(validSession(t), false);
 });
 
+console.log('\nconfig — where the app listens and where it writes');
+{
+  // A pristine config for one environment, without disturbing the singleton
+  // every other module already holds.
+  const configWith = env => {
+    const id = require.resolve('./src/config');
+    const held = require.cache[id];
+    const saved = {};
+    for (const [k, v] of Object.entries(env)) {
+      saved[k] = process.env[k];
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    delete require.cache[id];
+    try { return require('./src/config'); }
+    finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      require.cache[id] = held;
+    }
+  };
+
+  test('the server binds loopback unless told otherwise', () => {
+    assert.equal(configWith({ BIND_HOST: '', RENDER: '' }).CFG.bindHost, '127.0.0.1',
+      'a caller who reaches the port directly can spoof X-Forwarded-For past trust proxy 1 — the login limiter keys on it');
+    assert.equal(configWith({ BIND_HOST: '', RENDER: 'true' }).CFG.bindHost, '0.0.0.0',
+      'Render routes to 0.0.0.0 — loopback there is an app nobody can reach');
+    assert.equal(configWith({ BIND_HOST: '10.0.0.5', RENDER: 'true' }).CFG.bindHost, '10.0.0.5',
+      'an explicit BIND_HOST always wins');
+  });
+
+  test('WA_DATA_DIR moves every file the app writes, and unset changes nothing', () => {
+    const pathx = require('path');
+    const plain = configWith({ WA_DATA_DIR: '', WA_UPLOAD_DIR: undefined, WA_MEDIA_DIR: undefined });
+    assert.equal(plain.DATA_DIR, plain.ROOT, 'every existing deployment keeps its files exactly where they are');
+    assert.equal(plain.FILES.db, pathx.join(plain.ROOT, 'wa.db'));
+    const boxed = configWith({ WA_DATA_DIR: '/data', WA_UPLOAD_DIR: undefined, WA_MEDIA_DIR: undefined });
+    assert.equal(boxed.FILES.campaign, '/data/campaign.json',
+      'state files follow the volume, or an image update forgets a mid-run campaign');
+    assert.equal(boxed.FILES.db, '/data/wa.db');
+    assert.equal(boxed.MEDIA_DIR, '/data/media');
+    assert.equal(boxed.UPLOAD_DIR, '/data/uploads');
+    assert.equal(boxed.PUBLIC_DIR, pathx.join(boxed.ROOT, 'public'), 'the code the app serves does not move');
+  });
+
+  test('every Meta call has a timeout, and byte transfers get longer than JSON calls', () => {
+    const { TIMEOUTS } = require('./src/config');
+    assert.ok(TIMEOUTS.graphMs > 0 && TIMEOUTS.graphMs <= 60_000,
+      'one wedged connection must not hold the single send loop for minutes');
+    assert.ok(TIMEOUTS.transferMs > TIMEOUTS.graphMs, 'a 100 MB upload is not a JSON call');
+  });
+}
+
 console.log('\ndb');
 test('nodeVersionOk — 22.5 and above accepted, anything below rejected', () => {
   assert.equal(nodeVersionOk('22.5.0'), true);
@@ -1600,6 +1667,15 @@ console.log('\nschema — media + template tables');
   const fsx   = require('fs');
   const pathx = require('path');
   const cols  = (d, t) => d.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+
+  test('run_recipients remembers which ladder a contact is on; assets remember their handle age', () => {
+    const d = openDb(':memory:');
+    assert.ok(cols(d, 'run_recipients').includes('ladder_code'),
+      'per-code ladders need the code the attempts belong to — error_code is cleared on every accept');
+    assert.ok(cols(d, 'run_recipients').includes('ladder_attempts'), 'and a per-ladder count no success clears');
+    assert.ok(cols(d, 'media_assets').includes('meta_handle_at'), 'an upload handle expires, so its age must be known');
+    d.close();
+  });
 
   test('campaign_runs carries the run-time template snapshot columns', () => {
     const d = openDb(':memory:');

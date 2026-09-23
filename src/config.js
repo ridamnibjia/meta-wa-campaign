@@ -7,6 +7,12 @@ const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
 
+// Where every file this app WRITES lives. Unset means the app directory, which
+// is where every deployment so far keeps them; a container points it at its
+// volume so wa.db, the state files and both media stores survive an image
+// update instead of being rebuilt away with the layer they were written into.
+const DATA_DIR = process.env.WA_DATA_DIR || ROOT;
+
 // Mutable at runtime: /api/config lets an operator override credentials for the
 // current session without editing .env and restarting. Overrides do not persist.
 const CFG = {
@@ -31,7 +37,21 @@ const CFG = {
   templateCategory:   process.env.TEMPLATE_CATEGORY    || 'MARKETING',
   frontendUrl:        process.env.FRONTEND_URL         || '',
   port:               parseInt(process.env.PORT)       || 3000,
+  // Loopback unless told otherwise. cloudflared or a reverse proxy on the same
+  // host is meant to be the only public entrance, and that is also what keeps
+  // `trust proxy 1` honest: a caller who can reach the port directly can put
+  // anything in X-Forwarded-For, which is what the login limiter keys on.
+  // Render routes traffic to 0.0.0.0, so it is detected rather than documented
+  // as a trap; the Docker image sets BIND_HOST itself, because loopback inside
+  // a container is unreachable through a published port.
+  bindHost:           process.env.BIND_HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1'),
 };
+
+// Every call to Meta carries one of these. Without a signal, fetch waits on
+// undici's own ~5-minute timers, so one wedged connection held the single send
+// loop — and Stop — for minutes per contact. JSON calls are small and get 30s;
+// byte transfers (a 100 MB header upload, an inbound download) get 5 minutes.
+const TIMEOUTS = { graphMs: 30_000, transferMs: 300_000 };
 
 // `Number(x) || fallback` cannot express zero, and zero is a legitimate setting
 // twice over: PRICE_UTILITY=0 (utility inside the service window is genuinely
@@ -76,12 +96,12 @@ const OPT_OUT_LABEL = 'Stop promotions';
 const QUIET_HOURS = process.env.WA_QUIET_HOURS !== '0';
 
 const FILES = {
-  optOuts:  path.join(ROOT, 'opt-outs.json'),
-  warmup:   path.join(ROOT, 'warmup.json'),
-  msgIndex: path.join(ROOT, 'msg-index.json'),
-  inbox:    path.join(ROOT, 'inbox.json'),
-  campaign: path.join(ROOT, 'campaign.json'),
-  db:       path.join(ROOT, 'wa.db'),
+  optOuts:  path.join(DATA_DIR, 'opt-outs.json'),
+  warmup:   path.join(DATA_DIR, 'warmup.json'),
+  msgIndex: path.join(DATA_DIR, 'msg-index.json'),
+  inbox:    path.join(DATA_DIR, 'inbox.json'),
+  campaign: path.join(DATA_DIR, 'campaign.json'),
+  db:       path.join(DATA_DIR, 'wa.db'),
 };
 
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -89,7 +109,7 @@ const PUBLIC_DIR = path.join(ROOT, 'public');
 // Inbound media bytes land here when an operator saves them. Nothing writes to
 // it until an operator clicks Save, so it is not created until then.
 // WA_MEDIA_DIR is the test escape hatch, exactly like WA_UPLOAD_DIR.
-const MEDIA_DIR = process.env.WA_MEDIA_DIR || path.join(ROOT, 'media');
+const MEDIA_DIR = process.env.WA_MEDIA_DIR || path.join(DATA_DIR, 'media');
 
 // ── ClamAV ─────────────────────────────────────────────────────────────────────
 // Empty means "no scanner", which is a supported deployment: most self-hosters
@@ -124,8 +144,9 @@ const MEDIA_LIMITS = {
 // Files uploaded for use as a template header. Separate from MEDIA_DIR, which
 // holds INBOUND customer media — different provenance, different retention.
 // WA_UPLOAD_DIR exists so test.js can point at a temp directory before
-// requiring the app, exactly like WA_DB_PATH. It is not a deployment knob.
-const UPLOAD_DIR = process.env.WA_UPLOAD_DIR || path.join(ROOT, 'uploads');
+// requiring the app, exactly like WA_DB_PATH. It is not a deployment knob —
+// WA_DATA_DIR is, and moves this along with everything else the app writes.
+const UPLOAD_DIR = process.env.WA_UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 
 module.exports = { CFG, PRICES, LIMITS, OPT_OUT_LABEL, QUIET_HOURS, FILES, PUBLIC_DIR, MEDIA_DIR, UPLOAD_DIR, ROOT,
-                   CLAMAV, MEDIA_LIMITS };
+                   DATA_DIR, TIMEOUTS, CLAMAV, MEDIA_LIMITS };

@@ -287,6 +287,13 @@ function openDb(file) {
   // most likely to be waiting through.
   addColumn(d, 'run_recipients', 'attempts',    'INTEGER NOT NULL DEFAULT 0');
   addColumn(d, 'run_recipients', 'retry_after', 'INTEGER');
+  // Each error code walks its own ladder, so the row has to remember which code
+  // the per-ladder count belongs to. error_code cannot answer that: markSent
+  // clears it on every accept, and a webhook failure — 131049's usual route —
+  // arrives AFTER that accept, when the row no longer says what failed before.
+  // Neither column is ever cleared by a success. `attempts` stays the total.
+  addColumn(d, 'run_recipients', 'ladder_code',     'INTEGER');
+  addColumn(d, 'run_recipients', 'ladder_attempts', 'INTEGER NOT NULL DEFAULT 0');
   // After addColumn, not in SCHEMA: SCHEMA runs first on every boot, so an index
   // naming retry_after would throw "no such column" on any database created
   // before this change — the exact upgrade this file exists to make painless.
@@ -297,6 +304,10 @@ function openDb(file) {
   // so the template and the sent message can still name what they sent; the
   // bytes are gone. NULL means the file is really here.
   addColumn(d, 'media_assets', 'deleted_at', 'INTEGER');
+  // When the Resumable Upload handle in meta_handle was minted. Handles are
+  // short-lived; without their age a month-old one was reused for every new
+  // template and failed at submit with an error that blamed the template.
+  addColumn(d, 'media_assets', 'meta_handle_at', 'INTEGER');
   // Backfill: every contact disabled before the suppressed table existed. An
   // INSERT OR IGNORE over a table that is usually empty, so it is idempotent and
   // free on every later boot. Without it, the first CSV re-upload after this
