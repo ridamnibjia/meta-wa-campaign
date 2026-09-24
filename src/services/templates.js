@@ -220,7 +220,15 @@ function shapeTemplate(t) {
   };
 }
 
-// One Graph call for message_templates. `name` filters to a single template;
+// Graph paginates message_templates at 200 a page. A WABA with a long history
+// of templates would otherwise have its later pages silently dropped, and the
+// picker would just look like it was missing templates nobody deleted.
+// Bounded at 10 pages (2,000 templates) so a paging loop on Meta's side — or a
+// WABA genuinely that large — cannot hang the request forever.
+const MAX_TEMPLATE_PAGES = 10;
+
+// One Graph call for message_templates, followed across every page.  `name`
+// filters to a single template (still possibly several language variants);
 // omitting it lists the whole WABA, which is what the UI's picker needs.
 async function fetchTemplates(name) {
   if (!CFG.accessToken) return { error: 'Access Token not set' };
@@ -228,12 +236,17 @@ async function fetchTemplates(name) {
   if (!wabaId) {
     return { error: 'WABA_ID is not set. Copy it from Meta for Developers → your app → WhatsApp → API Setup ("WhatsApp Business Account ID"), put it in .env, and restart.' };
   }
-  const url = `https://graph.facebook.com/${CFG.apiVersion}/${wabaId}/message_templates`
+  let url = `https://graph.facebook.com/${CFG.apiVersion}/${wabaId}/message_templates`
     + `?limit=200&fields=name,status,category,language,quality_score,rejected_reason,components`
     + (name ? `&name=${encodeURIComponent(name)}` : '');
-  const data = await (await fetch(url, { headers: graphHeaders() })).json();
-  if (data.error) return { error: data.error.message };
-  return { found: !!data.data?.length, templates: (data.data || []).map(shapeTemplate) };
+  const all = [];
+  for (let page = 0; page < MAX_TEMPLATE_PAGES && url; page++) {
+    const data = await (await fetch(url, { headers: graphHeaders(), signal: AbortSignal.timeout(TIMEOUTS.graphMs) })).json();
+    if (data.error) return { error: data.error.message };
+    all.push(...(data.data || []));
+    url = data.paging?.next || null;
+  }
+  return { found: !!all.length, templates: all.map(shapeTemplate) };
 }
 
 // Validate template — fetches status, category, language, body text from Meta

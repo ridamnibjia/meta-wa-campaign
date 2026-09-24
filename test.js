@@ -276,6 +276,35 @@ testAsync('an empty template name never matches the whole WABA', async () => {
   assert.deepEqual(await validateTemplate('  '), { found: false, name: '  ' });
 });
 
+console.log('\nfetchTemplates — pagination');
+{
+  const { fetchTemplates } = require('./server');
+  testAsync('follows paging.next so a large WABA is not silently truncated', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-paging';
+    const real = global.fetch;
+    const urls = [];
+    global.fetch = async url => {
+      urls.push(String(url));
+      return urls.length === 1
+        ? { ok: true, status: 200, json: async () => ({
+            data: [{ name: 'a', status: 'APPROVED', category: 'MARKETING', language: 'en' }],
+            paging: { next: 'https://graph.facebook.com/v23.0/test-waba-paging/message_templates?after=CURSOR' },
+          }) }
+        : { ok: true, status: 200, json: async () => ({
+            data: [{ name: 'b', status: 'APPROVED', category: 'MARKETING', language: 'en' }],
+          }) };
+    };
+    try {
+      const r = await fetchTemplates();
+      assert.equal(urls.length, 2, 'a second page must be fetched');
+      assert.equal(urls[1], 'https://graph.facebook.com/v23.0/test-waba-paging/message_templates?after=CURSOR',
+        'the second call must follow paging.next, not repeat the first page');
+      assert.deepEqual(r.templates.map(t => t.name), ['a', 'b'], "both pages' templates must be returned, not just the first");
+    } finally { global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+}
+
 console.log('\ntemplate row memory');
 test('a saved template row round-trips its header asset link', () => {
   const name = `plan_test_${Date.now()}`;
