@@ -46,7 +46,7 @@ const META_ERRORS = {
   131042: ['Billing not set up for this business',    'Add or fix the payment method: Business Settings → Billing & Payments. Sends stay blocked until it clears.'],
   131045: ['Phone number has a registration problem',  'Re-register the number under WhatsApp → API Setup. Sends stay blocked until it clears.'],
   131047: ['Outside the 24-hour customer service window', 'Only approved templates can open a conversation. Confirm you are sending the template, not free text.'],
-  131048: ['Meta has rate-limited this number over spam signals', 'Too many blocks or reports recently. Check the quality rating in WhatsApp Manager, slow the sending down, and let the campaign retry on its own — the limit lifts by itself.'],
+  131048: ['Meta has temporarily limited this number over spam signals', 'The campaign pauses itself and tries one contact again after four hours; if this keeps happening, review the template\'s quality and who is on the list.'],
   // Deliberately no longer suggests re-sending this as UTILITY. The category is
   // about what the message IS, not about which cap it dodges: UTILITY is for
   // transactional content the customer is expecting — an order update, an
@@ -124,7 +124,8 @@ const SKIP_DISPOSITIONS = ['retry', 'permanent', 'fix', 'unclassified'];
 //          survives the in-loop backoff still lands in "try again" rather than
 //          in a bucket that reads as final.
 //   131048 is the sender-level spam throttle and 131056 the per-recipient
-//          pacing limit — both lift on their own, on a scale of hours.
+//          pacing limit — both lift on their own, on a scale of hours. 131048
+//          is also SENDER_LEVEL (below): it parks the whole loop, not one row.
 //   131057 is Meta's own maintenance mode.
 const RETRY = new Set([-1, 4, 80007, 130429, 131000, 131016, 131048, 131049, 131056, 131057]);
 
@@ -174,4 +175,14 @@ const HALT = new Set([
 
 const haltsCampaign = code => HALT.has(Number(code));
 
-module.exports = { META_ERRORS, explainError, skipDisposition, SKIP_DISPOSITIONS, haltsCampaign };
+// ── Faults about the SENDING NUMBER rather than the recipient ──────────────────
+// Still 'retry' to skipDisposition — the contact who met one is owed another
+// go — but every send fails while one is in force, so the loop parks instead of
+// walking the list into it: hammering 131048 feeds the very signal that raised
+// it. services/messages.js builds the park's query from this set, so the loop
+// and the query cannot disagree about which codes stop everything.
+const SENDER_LEVEL = new Set([131048]);
+const isSenderLevel = code => SENDER_LEVEL.has(Number(code));
+
+module.exports = { META_ERRORS, explainError, skipDisposition, SKIP_DISPOSITIONS, haltsCampaign,
+                   SENDER_LEVEL, isSenderLevel };

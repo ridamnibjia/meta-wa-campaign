@@ -2869,6 +2869,50 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     }
   });
 
+  // 131048 is a throttle on the NUMBER — every send fails while it is in force —
+  // which is a different kind of fact from 131049's per-person cap. One set names
+  // such codes, beside haltsCampaign, and the query that parks the loop is built
+  // from it, so the two cannot disagree about which codes they are.
+  test('isSenderLevel — the spam throttle is about the number, the marketing cap is about one person', () => {
+    assert.equal(M.isSenderLevel(131048), true, 'every send fails while it is in force — walking on only feeds it');
+    for (const code of [131049, 131026, -1, 130429, 131042, 999999]) {
+      assert.equal(M.isSenderLevel(code), false, `${code} does not fail every send, so it must not park the whole list`);
+    }
+    assert.equal(M.skipDisposition(131048), 'retry', 'the contact who met it is still retried, never written off');
+    assert.match(M.explainError(131048), /pauses itself/,
+      'the hint says what the app now does — "let the campaign retry on its own" described the walk this replaces');
+  });
+
+  test('the throttle deadline is read off the queue: only a live 131048 rung parks the loop', () => {
+    const run = newRun();
+    const p = people(4);
+    buildRun(run, p);
+    assert.equal(M.senderThrottleUntil(run), null, 'a queue nobody has been refused on parks nothing');
+    recordRecipientRetry(run, p[0].dialStr, 131048, Date.now() - 1);
+    assert.equal(M.senderThrottleUntil(run), null,
+      'an expired rung is not a throttle — the next contact is the probe that finds out whether it lifted');
+    recordRecipientRetry(run, p[1].dialStr, 131049, Date.now() + 24 * HOUR_MS);
+    assert.equal(M.senderThrottleUntil(run), null,
+      '131049 is one person\'s cap; the rest of the list is sendable and must not wait on it');
+    const early = Date.now() + 4 * HOUR_MS, late = Date.now() + 12 * HOUR_MS;
+    recordRecipientRetry(run, p[2].dialStr, 131048, early);
+    recordRecipientRetry(run, p[3].dialStr, 131048, late);
+    assert.equal(M.senderThrottleUntil(run), late,
+      'the LATEST live rung — probing before it would be the walk this exists to stop');
+    recordRecipientSent(run, p[3].dialStr, 'wamid.throttle.sent');
+    assert.equal(M.senderThrottleUntil(run), early,
+      'a rung whose retry already went out is no longer evidence of a throttle');
+    assert.equal(M.senderThrottleUntil(null), null, 'no run, no park — and never a throw');
+  });
+
+  test('the throttle check is a seek on the ladder index — it is asked before every send', () => {
+    const d = openDb(':memory:');
+    const plan = d.prepare('EXPLAIN QUERY PLAN ' + M.SENDER_THROTTLE_SQL).all(1, 0).map(r => r.detail).join(' | ');
+    assert.match(plan, /idx_run_recipients_retry/,
+      'once per message sent, so it must seek the run\'s live rungs rather than read the run');
+    assert.doesNotMatch(plan, /SCAN run_recipients/, 'a scan here grows with the list, once per send');
+  });
+
   test('with WA_QUIET_HOURS=0 the stored deadline is exactly the backoff — the opt-out reaches the ladder too', () => {
     // The suite runs with quiet hours off, and that flag used to apply only to
     // the loop's clock gate: scheduleRetry still deferred every night-time
@@ -6597,6 +6641,100 @@ console.log('\na Reset that lands mid-send');
       if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
     }
+  });
+
+  // ── A throttle on the NUMBER parks the whole loop ───────────────────────────
+  // 131048 is Meta limiting the sending number over spam signals: while it is in
+  // force every send fails. The loop used to park only the contact who met it and
+  // walk straight on — on a long list, hundreds of guaranteed failures at full
+  // tempo, each burning a rung and feeding the signal that raised the throttle.
+  // Now it parks until the latest live 131048 rung on the queue, and the next
+  // contact after that is a single probe.
+  testAsync('131048 at send time parks the loop — the rest of the list is not walked into it', async () => {
+    let sends = 0;
+    await withLoop(async () => (++sends === 1
+      ? graphErr({ code: 131048, message: 'Spam rate limit hit' })
+      : graphOk(`wamid.t48s.${sends}`)), async h => {
+      const { S, flags } = h.M;
+      const p = ['919000032101', '919000032102', '919000032103'];
+      const run = h.stage(p.map((dialStr, i) => ({ dialStr, name: ['Asha', 'Rahul', 'Marco'][i] })), 'throttle-send');
+      h.start();
+      await h.until(() => S.phase === 'paused' && /131048/.test(S.pauseReason || ''));
+
+      assert.match(S.pauseReason || '',
+        /^Meta is limiting this number over spam signals \[131048\] — sending pauses until .+\. Contacts already reached are unaffected\.$/,
+        'the operator is told which limit stopped the run');
+      const until = h.M.senderThrottleUntil(run);
+      assert.ok(until > Date.now(), 'the deadline is the queue\'s own 131048 rung');
+      assert.ok(S.pauseReason.includes(new Date(until).toLocaleTimeString('en-IN',
+        { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })), 'and until when, in IST');
+      assert.equal(sends, 1, 'a sender-level throttle fails every send — the next contacts must not be burned');
+      assert.equal(h.row(run, p[1]).attempted_at, null, 'the next contact has not been touched');
+
+      const resume = await callRoute('post', '/resume');
+      assert.equal(resume.ok, false, 'Resume cannot beat a throttle on the number — the loop is asleep until it lifts');
+      assert.match(resume.error, /131048/, 'and the refusal is the sentence that explains why');
+
+      flags.stopFlag = true;
+      const t0 = Date.now();
+      await h.until(() => !flags.running);
+      assert.equal(flags.running, false);
+      assert.ok(Date.now() - t0 < 1500, 'Stop is answered within a second, not when the throttle lifts');
+    });
+  });
+
+  // The busy entrance. Meta usually accepts the send and refuses it later over
+  // the status webhook, so this is how 131048 mostly arrives — with the loop
+  // already on to the next contact. The requeue writes the same kind of rung the
+  // send-time path writes, which is why the park needs no state of its own.
+  testAsync('a 131048 that arrives over the webhook parks the loop at its next iteration', async () => {
+    let sends = 0, requeued = null;
+    await withLoop(async () => {
+      if (++sends === 2) {
+        // Meta refuses the FIRST send while the loop is sending the second.
+        const failure = M.applyStatus({ id: 'wamid.t48w.1', status: 'failed',
+                                        errors: [{ code: 131048, title: 'Spam rate limit hit' }] });
+        requeued = failure && M.handleDeliveryFailure(failure);
+      }
+      return graphOk(`wamid.t48w.${sends}`);
+    }, async h => {
+      const { S } = h.M;
+      const p = ['919000032111', '919000032112', '919000032113'];
+      const run = h.stage(p.map(dialStr => ({ dialStr, name: 'Sarah' })), 'throttle-webhook');
+      h.start();
+      await h.until(() => S.phase === 'paused' && /131048/.test(S.pauseReason || ''));
+
+      assert.equal(requeued, 'retrying', 'the refused contact is back on its 131048 rung');
+      assert.match(S.pauseReason || '', /131048/, 'the busy entrance parks the loop, not only the send-time one');
+      assert.equal(sends, 2, 'the send already in flight completes; the one after it is never made');
+      assert.equal(h.row(run, p[2]).attempted_at, null, 'the third contact is untouched');
+    });
+  });
+
+  // Nothing about the park lives in memory. A restart mid-throttle re-derives it
+  // from the rung the queue already carries, so the loop that auto-resumes parks
+  // again instead of spending a probe the moment the process comes back.
+  testAsync('the 131048 park survives a restart — derived from the queue, not remembered', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.t48r.${++sends}`), async h => {
+      const { S, flags } = h.M;
+      const p = ['919000032121', '919000032122'];
+      const run = h.stage(p.map(dialStr => ({ dialStr, name: 'Rahul' })), 'throttle-restart');
+      // What the send-time entrance wrote before the process died…
+      M.recordRecipientRetry(run, p[0], 131048, Date.now() + 4 * 3600000);
+      // …and the campaign.json the park itself saved.
+      Object.assign(S, { currentRunId: run, phase: 'paused',
+        pauseReason: 'Meta is limiting this number over spam signals [131048] — sending pauses until 14:00. Contacts already reached are unaffected.' });
+      h.M.saveCampaignNow();
+      Object.assign(S, { currentRunId: null, phase: 'idle', pauseReason: null });   // a fresh boot
+
+      h.M.resumeIfInterrupted({ graceMs: 20 });
+      await h.until(() => flags.running && /131048/.test(S.pauseReason || ''));
+      assert.match(S.pauseReason || '', /131048/,
+        'the loop that auto-resumed found the throttle on the queue by itself — a pause the loop gave itself resumes, and re-parks');
+      assert.equal(sends, 0, 'and the next contact was not sent early: a restart must not cost a probe');
+      assert.equal(h.row(run, p[1]).attempted_at, null);
+    });
   });
 
   // A thrown fetch (DNS, TLS, no network) is a moment, not three hours: it goes

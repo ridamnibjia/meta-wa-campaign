@@ -8,7 +8,7 @@ const { W, warmupCap, effectiveCap, markWarmupDay, dailyCount } = require('./war
 const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
         requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
-        nextRetryForRun, progressForRun } = require('./messages');
+        nextRetryForRun, progressForRun, senderThrottleUntil } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition, haltsCampaign } = require('../lib/errors');
 const { deferPastQuietHours, nextIstMidnight } = require('../lib/schedule');
@@ -250,7 +250,9 @@ const RETRY_BACKOFF_MS = [3, 3, 3, 3, 3].map(h => h * 3600000);
 // what services/inbox.js sendMedia exists for.
 //
 // 131048 is the sender-level spam throttle: it lifts on its own, on a scale of
-// hours, and hammering it feeds the very signal that raised it.
+// hours, and hammering it feeds the very signal that raised it. Because it is
+// about the NUMBER, the loop also parks on these rungs (senderThrottleUntil in
+// campaignLoop) — so they are how long the whole run waits, not just one row.
 const RETRY_LADDERS = {
   131049: [24, 24, 24].map(h => h * 3600000),
   131048: [4, 12, 24].map(h => h * 3600000),
@@ -619,6 +621,28 @@ async function campaignLoop() {
       log('info', S.pauseReason);
       saveCampaignNow(); broadcast();
       await sleepUntil(gate);
+      if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
+      continue;
+    }
+    // ── A throttle on the NUMBER, not on this contact ─────────────────────────
+    // 131048 fails every send while it is in force. The loop used to park only
+    // the contact who met it and walk straight on to the next — on a long list,
+    // hundreds of guaranteed failures at full tempo, each burning a rung and
+    // feeding the spam signal that raised the throttle. The deadline is the
+    // latest live 131048 rung on this run's queue, written by either ladder
+    // entrance; when it passes, the next contact is the probe, and a probe that
+    // fails again gets its own rung and parks the loop again. One probe per rung,
+    // never a walk. No pauseFlag: like the cap, this is the loop's own pause, so
+    // /resume refuses with the sentence and a crash resumes it on the next boot.
+    // ponytail: the sentence names 131048 because it is the only SENDER_LEVEL
+    // code; a second one would need the query to return which code it found.
+    const throttle = senderThrottleUntil(runId);
+    if (throttle) {
+      S.phase = 'paused';
+      S.pauseReason = `Meta is limiting this number over spam signals [131048] — sending pauses until ${clockIST(throttle)}. Contacts already reached are unaffected.`;
+      log('warn', S.pauseReason);
+      saveCampaignNow(); broadcast();
+      await sleepUntil(throttle);
       if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue;
     }

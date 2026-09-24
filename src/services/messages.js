@@ -1,7 +1,7 @@
 'use strict';
 const { db } = require('../lib/db');
 const { S, flags, campaignActive, log } = require('../state');
-const { explainError, skipDisposition } = require('../lib/errors');
+const { explainError, skipDisposition, SENDER_LEVEL } = require('../lib/errors');
 
 // An unknown ID means a message this server never sent — traffic from another
 // tool on the same number, or a status for a message from before the SQL store.
@@ -385,6 +385,19 @@ const nextRetryAtQ = db.prepare(`
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason = 'retry'
 `);
 
+// The loop's park deadline for a throttle on the sending NUMBER (lib/errors.js
+// SENDER_LEVEL): the latest live rung any contact on this run is waiting out for
+// such a code. Derived from the rows BOTH ladder entrances already write —
+// scheduleRetry at send time, requeueAfterDelivery from the webhook — so the
+// park needs no state of its own, survives a restart, and a replayed webhook
+// cannot extend it (the requeue is wamid-guarded). Asked before every send, so
+// it is exactly idx_run_recipients_retry's predicate plus a range on its key.
+const SENDER_THROTTLE_SQL = `
+  SELECT max(retry_after) AS until FROM run_recipients
+   WHERE run_id = ? AND skipped_reason = 'retry' AND wamid IS NULL
+     AND retry_after > ? AND error_code IN (${[...SENDER_LEVEL].join(',')})`;
+const senderThrottleQ = db.prepare(SENDER_THROTTLE_SQL);
+
 // skipped_reason and retry_after are cleared on success: a row that failed
 // once, waited, and then went out is a SENT row, not a sent-and-also-retrying
 // one. Leaving them set would double-count it in every progress query below.
@@ -686,6 +699,11 @@ function nextRetryForRun(runId) {
   return r && r.n ? { at: r.at, count: r.n } : null;
 }
 
+// When a throttle on the sending number lifts, or null when none is in force.
+// `now` is a parameter for the same reason nextPending's is.
+const senderThrottleUntil = (runId, now = Date.now()) =>
+  (runId == null ? null : (senderThrottleQ.get(runId, now).until ?? null));
+
 function progressForRun(runId) {
   if (runId == null) {
     return { total: 0, sent: 0, skipped: 0, disabled: 0, retrying: 0, pending: 0, attempted: 0 };
@@ -936,4 +954,5 @@ module.exports = {
   recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
   nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
+  senderThrottleUntil, SENDER_THROTTLE_SQL,
 };
