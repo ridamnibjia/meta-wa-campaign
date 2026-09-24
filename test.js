@@ -1111,6 +1111,24 @@ test('a status for an unknown wamid changes nothing and does not throw', () => {
   assert.doesNotThrow(() => applyStatus({ id: 'never-sent', status: 'read' }));
   assert.equal(statusOf('never-sent'), undefined);
 });
+// Meta stamps every status with the moment it happened. status_at used to be
+// the server's clock at processing time, so a Diagnostics replay days after a
+// parser fix re-dated every delivery and failure to the replay day — and that
+// is the time runDetail and the downloadable report show.
+test('a status keeps the time Meta says it happened, not the time it was processed', () => {
+  const statusAt = wamid => testDb.prepare('SELECT status_at FROM messages WHERE wamid = ?').get(wamid).status_at;
+  const t0 = 1700000000;   // seconds, the way Meta sends it
+  seedOut('ts-deliv'); seedOut('ts-fail'); seedOut('ts-none');
+  applyStatus({ id: 'ts-deliv', status: 'delivered', timestamp: String(t0) });
+  applyStatus({ id: 'ts-fail', status: 'failed', timestamp: String(t0 + 60),
+                errors: [{ code: 131049, title: 'x' }] });
+  assert.equal(statusAt('ts-deliv'), t0 * 1000, 'replay must not re-date history to the replay day');
+  assert.equal(statusAt('ts-fail'), (t0 + 60) * 1000, 'nor a failure — its time is in the report too');
+
+  const before = Date.now();
+  applyStatus({ id: 'ts-none', status: 'sent' });
+  assert.ok(statusAt('ts-none') >= before, 'a status with no timestamp is still stamped — with the moment it was seen');
+});
 test('countsForRun sums per-contact statuses', () => {
   seedOut('r1', '9111', 9); seedOut('r2', '9112', 9); seedOut('r3', '9113', 9); seedOut('r4', '9114', 9);
   applyStatus({ id: 'r1', status: 'read' });

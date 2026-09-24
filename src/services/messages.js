@@ -111,7 +111,12 @@ function applyStatus(status) {
   const row = exists.get(id);
   if (!row) return onUnknownStatus(status);
 
-  const now = Date.now();
+  // Meta's own clock, not ours — the same idiom the inbound path uses. The
+  // server clock dated a Diagnostics replay's every delivery and failure to
+  // the day of the replay, and a redelivered failure drifted forward each
+  // time, in the run report and the CSV that shows them. The rank guards make
+  // an out-of-order timestamp harmless either way.
+  const now = Number(status.timestamp) ? Number(status.timestamp) * 1000 : Date.now();
 
   if (st === 'failed') {
     // A device that has acknowledged delivery cannot un-receive the message.
@@ -294,9 +299,10 @@ function markEnvelopeProcessed(id) {
   stampEvent.run(Date.now(), id);
 }
 
-// Nothing in this app replays webhook_events yet — this is the only signal
-// that it needs to. Surfaced on /health (F5) rather than left to a log line in
-// the 500-entry ring buffer that /api/start wipes.
+// Unprocessed rows are the replay queue — Diagnostics → Replay
+// (services/ingest.js:replayUnprocessed) drains it, and this count is the
+// signal to press it. Surfaced on /health (F5) rather than left to a log line
+// in the 500-entry ring buffer that /api/start wipes.
 function unprocessedWebhookCount() {
   return countUnprocessed.get().n;
 }
