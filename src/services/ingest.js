@@ -118,6 +118,20 @@ function processEnvelope(body) {
         changed = true;
       }
 
+      // ponytail: each status below is 1-3 standalone autocommits — applyStatus's
+      // own UPDATE, and on a failure markFailed + restampThread + the ladder's
+      // requeue on top — and under synchronous=FULL every one of those is its
+      // own fsync. A batched envelope of fifty statuses is 50-150 fsyncs
+      // blocking the event loop, not one. None of that buys durability: these
+      // are derived writes, replayable from the envelope recordEnvelope already
+      // fsynced before the 200 OK, and replay is idempotent by construction —
+      // applyStatus only moves a status forward, the ladder's requeue is
+      // guarded on the transition into 'failed' plus the wamid. The upgrade
+      // path is one transaction for the whole envelope; recordInbound's and
+      // recordOutbound's own db.exec('BEGIN') would then have to become
+      // SAVEPOINTs, since node:sqlite throws on a nested BEGIN. Worth doing
+      // only once a real webhook burst is measured stalling the loop — FULL
+      // stays exactly as it is for recordEnvelope either way.
       for (const status of (change.value?.statuses || [])) {
         // applyStatus returns a descriptor only on the transition INTO 'failed'.
         // Meta accepts most sends and refuses them later over this webhook, so

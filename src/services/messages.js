@@ -952,6 +952,14 @@ function statusForRun(runId, pending) {
 // ponytail: LIMIT 100, no cursor. One campaign per CSV upload means a hundred
 // rows is a year of history for one business. If it ever needs paging, the
 // cursor is (started_at, id) and never started_at alone — timestamps tie.
+//
+// ponytail: also N+1 — progressForRun, countsForRun and funnelForRun below
+// each run once PER RETURNED RUN, so a hundred runs is ~300 queries where one
+// would do. Fine at the hundreds-of-recipients-per-run scale this app ships
+// at (measured cost only shows up in the hundred-thousand range); the upgrade
+// path is the same rule funnelForRun already applies to a single run's
+// BUCKET_CASE, just grouped by run_id (and bucket, code) so it answers every
+// run in this list in one pass instead of one query per run per aggregate.
 function listRuns({ limit = 100 } = {}) {
   return runsQ.all(Math.min(Math.max(Number(limit) || 100, 1), 500))
     // A run staged and never started has no recipients. It is noise, not history.

@@ -49,7 +49,7 @@ const {
   warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W, graduated, dailyCount,
   sentSince, funnelForRun, startOfIstDay, nextIstMidnight, suppressIfPermanent,
   nextPending, recordRecipientRetry, deferPastQuietHours, USER_PAUSE, progressForRun,
-  strandedWork, sweepWebhookEvents, WEBHOOK_RETENTION_DAYS, RATE_LIMIT_RETRIES,
+  strandedWork, sweepWebhookEvents, WEBHOOK_RETENTION_DAYS, RATE_LIMIT_RETRIES, SWEEP_EVERY_MS,
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
@@ -5590,6 +5590,14 @@ console.log('\ninbound media — save, serve, expire');
     const DAY = 24 * 60 * 60 * 1000;
     const age = (id, ms) => db.prepare('UPDATE media SET downloaded_at = ? WHERE media_id = ?')
       .run(Date.now() - ms, id);
+
+    // The sweep runs on its own tick, not on demand, so how OFTEN it ticks is
+    // what actually bounds the preview promise below — a daily tick could only
+    // ever be as tight as the DAY, whatever previewHours said.
+    test('the sweep ticks hourly, so a previewHours as low as 1 is never outlived by the tick itself', () => {
+      assert.ok(SWEEP_EVERY_MS <= 60 * 60 * 1000,
+        'previewHours can be configured down to 1; a coarser tick would let a preview sit unswept past its own promised hour before the sweep ever looks at it');
+    });
 
     const saveOne = async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),

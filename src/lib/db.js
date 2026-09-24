@@ -230,8 +230,14 @@ function addColumn(d, table, column, decl) {
 
 function openDb(file) {
   const d = new DatabaseSync(file);
-  // WAL lets the socket broadcast read while a webhook batch writes. It is a
-  // no-op on :memory:, which is why the tests still pass against one.
+  // Not read/write concurrency: there is exactly one DatabaseSync connection,
+  // synchronous, on one thread, so a read can never overlap a write in this
+  // process — that benefit cannot occur here. The real ones: under
+  // synchronous=FULL below, WAL costs one fsync per commit versus the
+  // rollback journal's two, and it lets an external reader — the README's
+  // backup.sh, an operator's sqlite3 shell — read without blocking the app
+  // (busy_timeout just below already anticipates that visitor). A no-op on
+  // :memory:, which is why the tests still pass against one.
   d.exec('PRAGMA journal_mode = WAL');
   // FULL, not NORMAL: in WAL mode NORMAL fsyncs at checkpoints only, so a
   // committed webhook survives a process crash but not a host crash, power
