@@ -22,6 +22,13 @@ function templateVars(text) {
   return [...new Set(nums)].sort((a, b) => a - b);
 }
 
+// Meta's Manage Templates UI allows named variables ({{first_name}}); this
+// app's send path only fills positional ones ({{1}}, {{2}}…), matched by
+// buildParams reading S.config.paramValues by index. A leading letter or
+// underscore after the braces is the tell — a positional variable is only
+// ever digits.
+const NAMED_VAR = /\{\{\s*[A-Za-z_]/;
+
 // Meta rejects parameter values containing newlines, tabs, or 4+ consecutive
 // spaces. Collapse all whitespace runs to a single space.
 function sanitizeParam(v) {
@@ -316,6 +323,14 @@ function adoptTemplate(name, result, language) {
   S.config.templateStatus   = t.status;
   S.config.templateCategory = t.category;
   S.config.templateLanguage = t.language;
+  // This app only fills positional {{1}}, {{2}}… — a named variable in either
+  // the body or a TEXT header must refuse at Start with a sentence, not send
+  // the literal "{{first_name}}" text to a customer. Checked on both text
+  // sources and cleared here too, so switching back to a positional template
+  // does not leave a stale refusal from the last one adopted.
+  S.config.templateUnsupported = (NAMED_VAR.test(t.bodyText || '') || NAMED_VAR.test(t.headerText || ''))
+    ? 'This template uses named variables ({{first_name}}), which this app cannot fill yet — pick one that uses {{1}}, {{2}}…'
+    : null;
   resizeParamValues(templateVars(t.bodyText).length);
   CFG.templateName          = name;
   broadcast();

@@ -397,6 +397,39 @@ console.log('\nadoptTemplate — language variants');
   Object.assign(S.config, before);
 }
 
+console.log('\nadoptTemplate — named-variable templates are refused, not sent empty');
+{
+  const { adoptTemplate } = require('./server');
+  const before = JSON.parse(JSON.stringify(S.config));
+  const shapedBody = (name, bodyText, headerText = null) => ({ found: true, templates: [{
+    name, status: 'APPROVED', category: 'MARKETING', language: 'en',
+    bodyText, headerFormat: headerText ? 'TEXT' : null, headerText, buttons: [],
+  }] });
+
+  test('a body with a named variable sets templateUnsupported, naming the fix', () => {
+    S.config.templateName = '';
+    adoptTemplate('named_body', shapedBody('named_body', 'Hi {{first_name}}, welcome.'));
+    assert.match(S.config.templateUnsupported, /named variables/,
+      'the sentence must say why /start has to refuse this template rather than sending it empty');
+  });
+
+  test('a header with a named variable also sets templateUnsupported', () => {
+    S.config.templateName = '';
+    adoptTemplate('named_header', shapedBody('named_header', 'Hi {{1}}, welcome.', 'Sale {{promo_code}}'));
+    assert.match(S.config.templateUnsupported, /named variables/, 'a named header variable is just as unfillable as a named body one');
+  });
+
+  test('a positional-only body clears a stale templateUnsupported', () => {
+    S.config.templateName = '';
+    S.config.templateUnsupported = 'stale from a previous template';
+    adoptTemplate('positional', shapedBody('positional', 'Hi {{1}}, welcome.'));
+    assert.equal(S.config.templateUnsupported, null,
+      'switching to a {{1}}, {{2}}… template must clear the sentence left by the last one');
+  });
+
+  Object.assign(S.config, before);
+}
+
 console.log('\ntemplate routes — identity locked mid-campaign');
 {
   // http/express are required locally: the module-level const of the same name
