@@ -6737,6 +6737,42 @@ console.log('\na Reset that lands mid-send');
     });
   });
 
+  // ── A loop that crashes has to say so ───────────────────────────────────────
+  // startLoop's catch used to clear `running` and nothing else: the phase went on
+  // saying "running" with no loop behind it, campaignBlocker() answered every
+  // Start and upload with "still sending", and the only trace was one line in a
+  // 500-entry log. The queue is durable, so Resume can carry on from the same
+  // contact — the screen only has to say so.
+  testAsync('a loop that crashes parks with a sentence, and Resume carries on from the same contact', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.crash.${++sends}`), async h => {
+      const { S, flags, db: d } = h.M;
+      const phone = '919000033101';
+      const run = h.stage([{ dialStr: phone, name: 'Sarah' }], 'crash-parks');
+      // The loop's first query meets a missing table and throws — the same
+      // escape a disk-full or an SQL error takes. The table is back before the
+      // catch runs (a microtask later), so only the loop saw it gone.
+      d.exec('ALTER TABLE run_recipients RENAME TO run_recipients_away');
+      try { h.start(); } finally { d.exec('ALTER TABLE run_recipients_away RENAME TO run_recipients'); }
+      await h.until(() => !flags.running);
+
+      assert.equal(flags.running, false, 'the loop is gone');
+      assert.equal(S.phase, 'paused', 'so the phase must stop claiming a campaign is sending');
+      assert.match(S.pauseReason || '',
+        /^The send loop stopped on an error — .+\. Press Resume to carry on from the same contact\.$/,
+        'the operator is told what happened and which button fixes it');
+      assert.equal(flags.pauseFlag, true, 'set, so /api/resume treats the pause as the operator\'s to lift');
+      assert.match(h.M.campaignBlocker() || '', /paused part-way/, 'a Start or an upload is told the run is paused…');
+      assert.doesNotMatch(h.M.campaignBlocker() || '', /still sending/, '…never that it is still sending, when nothing is');
+
+      const resumed = await callRoute('post', '/resume');
+      assert.equal(resumed.ok, true, 'Resume is allowed');
+      await h.until(() => !flags.running && S.phase === 'done');
+      assert.equal(h.row(run, phone).wamid, 'wamid.crash.1', 'and it carried on from the same contact — nobody skipped');
+      assert.equal(sends, 1, 'and nobody messaged twice');
+    });
+  });
+
   // A thrown fetch (DNS, TLS, no network) is a moment, not three hours: it goes
   // through the same in-loop backoff a rate limit gets, and only lands on the
   // ladder after RATE_LIMIT_RETRIES straight misses.

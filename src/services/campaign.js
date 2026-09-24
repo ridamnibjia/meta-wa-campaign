@@ -480,7 +480,23 @@ function campaignBlocker() {
 function startLoop() {
   if (flags.running) return;
   flags.pauseFlag = false; flags.stopFlag = false; flags.running = true;
-  campaignLoop().catch(e => { log("error", "Loop: " + e.message); flags.running = false; });
+  campaignLoop().catch(e => {
+    flags.running = false;
+    // Park honestly. Left as it was, the phase went on saying 'running' with no
+    // loop behind it: the dashboard showed a campaign in progress that would
+    // never move, and campaignBlocker() answered every Start and upload with
+    // "still sending". pauseFlag is what makes /api/resume treat this as the
+    // operator's pause to lift — Resume restarts the loop at the same row,
+    // because the queue is on disk — and the reason is not USER_PAUSE, so a
+    // reboot resumes it on its own like every other pause the loop gave itself.
+    flags.pauseFlag = true;
+    S.phase = 'paused';
+    S.pauseReason = `The send loop stopped on an error — ${e?.message ?? e}. Press Resume to carry on from the same contact.`;
+    log('error', 'Loop: ' + (e?.message ?? e));
+    // Its own try: the crash may have BEEN the disk or the database, and a throw
+    // from here would be an unhandled rejection that takes the process down.
+    try { saveCampaignNow(); broadcast(); } catch { /* the park above is what matters */ }
+  });
 }
 
 async function campaignLoop() {
