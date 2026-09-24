@@ -6823,6 +6823,38 @@ console.log('\na Reset that lands mid-send');
       assert.equal(h.row(swapped, '919000033002').attempted_at, null, 'the uploaded list is untouched');
     });
   });
+
+  // A template this app cannot fill — named {{first_name}} variables — is marked
+  // in S.config.templateUnsupported by adoptTemplate (contract C6), and the two
+  // send doors are where that has to bite: every contact would fail at Meta on a
+  // slot nobody can fill. Set directly here, because adoptTemplate is not this
+  // file's to fake; what matters is that both doors refuse with the sentence.
+  testAsync('/start and /test-send refuse a template the app cannot fill, with its own sentence', async () => {
+    let sends = 0;
+    await withLoop(async url => {
+      if (String(url).includes('/message_templates')) return templateList('named_vars', 'Hi {{first_name}}');
+      if (String(url).endsWith('/messages')) { sends++; return graphOk(`wamid.named.${sends}`); }
+      return accountInfo();
+    }, async h => {
+      const { S, flags } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'named_vars';
+      S.config.templateUnsupported =
+        'This template uses named variables ({{first_name}}), which this app cannot fill yet — pick one that uses {{1}}, {{2}}…';
+      h.stage([{ dialStr: '919000033011', name: 'Marco' }], 'named-vars');
+      S.phase = 'idle';
+
+      const start = await callRoute('post', '/start');
+      assert.deepEqual(start, { ok: false, error: S.config.templateUnsupported },
+        'refused with the sentence that names the fix — not a campaign of identical failures');
+      assert.equal(flags.running, false, 'and no loop was started');
+
+      const tried = await callRoute('post', '/test-send', { numbers: ['+919000033012'] });
+      assert.deepEqual(tried, { ok: false, error: S.config.templateUnsupported },
+        'a test send goes through the same door, so it is refused the same way');
+      assert.equal(sends, 0, 'nothing reached Meta\'s /messages');
+    });
+  });
 }
 
 // ── The send queue's order, and the plan that makes it affordable ─────────────

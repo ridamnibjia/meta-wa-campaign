@@ -27,11 +27,17 @@ router.post('/test-send', async (req, res) => {
   if (!CFG.accessToken || !CFG.phoneNumberId) return res.json({ ok: false, error: 'Credentials not configured' });
 
   const check = await validateTemplate(S.config.templateName).catch(e => ({ error: e.message }));
-  adoptTemplate(S.config.templateName, check);
+  // The language travels with the name, exactly as in /start: of two language
+  // variants of one template, a test send must adopt the one the operator chose
+  // rather than whichever Meta lists first — or testing would switch the
+  // campaign's language under them.
+  adoptTemplate(S.config.templateName, check, S.config.templateLanguage);
   if (check.error) return res.json({ ok: false, error: `Could not verify template: ${check.error}` });
   if (S.config.templateStatus !== 'APPROVED') {
     return res.json({ ok: false, error: `Template "${S.config.templateName}" is ${S.config.templateStatus || 'not found'} — only APPROVED templates can be sent` });
   }
+  // Same door, same refusal as /start: a body with a slot this app cannot fill.
+  if (S.config.templateUnsupported) return res.json({ ok: false, error: S.config.templateUnsupported });
   // Same guard as /start: a media-header template sent with no file attached
   // fails at Meta with a code the operator has to look up. Refuse it here with
   // the fix instead.
@@ -102,7 +108,9 @@ router.post('/start', async (req, res) => {
   // could otherwise launch a campaign against a template that was since rejected.
   try {
     const r = await validateTemplate(S.config.templateName);
-    adoptTemplate(S.config.templateName, r);
+    // The selected language, so of two variants of one name the one the
+    // operator picked is the one adopted — not whichever Meta lists first.
+    adoptTemplate(S.config.templateName, r, S.config.templateLanguage);
     if (r.error) return res.json({ ok: false, error: `Could not verify template: ${r.error}` });
     if (S.config.templateStatus !== 'APPROVED') {
       return res.json({ ok: false, error: `Template "${S.config.templateName}" is ${S.config.templateStatus || 'not found'} — only APPROVED templates can be sent` });
@@ -110,6 +118,12 @@ router.post('/start', async (req, res) => {
   } catch (e) {
     return res.json({ ok: false, error: `Could not verify template: ${e.message}` });
   }
+
+  // A template this app cannot fill — named {{first_name}} variables, which
+  // adoptTemplate has just re-read from Meta's copy (contract C6). Every contact
+  // would fail at Meta on the slot nobody can fill, so refuse with the sentence
+  // that names the fix. Checked after the adopt, so it is today's verdict.
+  if (S.config.templateUnsupported) return res.json({ ok: false, error: S.config.templateUnsupported });
 
   // A media-header template with no file chosen would go out with no header
   // component at all, and Meta refuses that per contact — a whole run of
