@@ -6,7 +6,7 @@
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('node:crypto');
-const { CFG, UPLOAD_DIR, MEDIA_DIR, MEDIA_LIMITS } = require('../config');
+const { CFG, UPLOAD_DIR, MEDIA_DIR, MEDIA_LIMITS, TIMEOUTS } = require('../config');
 const { db }  = require('../lib/db');
 const { S, campaignActive, log } = require('../state');
 const { classify, extOf } = require('../lib/filerisk');
@@ -405,7 +405,8 @@ async function ensureHandle(id) {
       + `?file_name=${encodeURIComponent(asset.filename)}`
       + `&file_length=${asset.file_size}`
       + `&file_type=${encodeURIComponent(asset.mime_type)}`,
-      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` } },
+      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` },
+        signal: AbortSignal.timeout(TIMEOUTS.graphMs) },
     );
     const session = await start.json();
     if (session.error || !session.id) {
@@ -414,11 +415,13 @@ async function ensureHandle(id) {
 
     // OAuth, not Bearer. This second call is the one documented exception in
     // the whole Graph surface, and Bearer here returns a 400 that says nothing
-    // useful about why.
+    // useful about why. transferMs, not graphMs: this call is the one moving
+    // the file's bytes, not asking a small JSON question about them.
     const put = await fetch(`https://graph.facebook.com/${CFG.apiVersion}/${session.id}`, {
       method: 'POST',
       headers: { Authorization: `OAuth ${CFG.accessToken}`, file_offset: '0' },
       body: readBytes(asset),
+      signal: AbortSignal.timeout(TIMEOUTS.transferMs),
     });
     const done = await put.json();
     if (done.error || !done.h) {
@@ -466,7 +469,8 @@ async function ensureMediaId(id, { force = false } = {}) {
 
     const res = await fetch(
       `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/media`,
-      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` }, body: form },
+      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` }, body: form,
+        signal: AbortSignal.timeout(TIMEOUTS.transferMs) },
     );
     const data = await res.json();
     if (data.error || !data.id) {
@@ -687,7 +691,7 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
 
   try {
     const res = await fetch(`https://graph.facebook.com/${CFG.apiVersion}/${encodeURIComponent(mediaId)}`,
-      { headers: { Authorization: `Bearer ${CFG.accessToken}` } });
+      { headers: { Authorization: `Bearer ${CFG.accessToken}` }, signal: AbortSignal.timeout(TIMEOUTS.graphMs) });
     const meta = await res.json();
     if (meta.error || !meta.url) {
       return { ok: false, error: meta.error?.message || 'Meta returned no download url for this media' };
@@ -708,7 +712,8 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
       return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Nothing was saved.` };
     }
 
-    const dl = await fetch(meta.url, { headers: { Authorization: `Bearer ${CFG.accessToken}` } });
+    const dl = await fetch(meta.url,
+      { headers: { Authorization: `Bearer ${CFG.accessToken}` }, signal: AbortSignal.timeout(TIMEOUTS.transferMs) });
     if (!dl.ok) return { ok: false, error: `Download failed with HTTP ${dl.status}` };
     const buf = Buffer.from(await dl.arrayBuffer());
 

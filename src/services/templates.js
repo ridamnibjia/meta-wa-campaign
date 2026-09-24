@@ -418,7 +418,8 @@ async function deleteTemplate(name) {
 
   const url = `${wabaId}/message_templates?name=${encodeURIComponent(name)}`;
   try {
-    const res  = await fetch(graphUrl(url), { method: 'DELETE', headers: graphHeaders() });
+    const res  = await fetch(graphUrl(url), { method: 'DELETE', headers: graphHeaders(),
+                                               signal: AbortSignal.timeout(TIMEOUTS.graphMs) });
     const data = await res.json();
     if (data.error) {
       const code = data.error.code || 0;

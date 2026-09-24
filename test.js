@@ -303,6 +303,39 @@ console.log('\nfetchTemplates — pagination');
       assert.deepEqual(r.templates.map(t => t.name), ['a', 'b'], "both pages' templates must be returned, not just the first");
     } finally { global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
   });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers — a wedged
+  // connection here would hold up the templates picker or a delete for minutes.
+  testAsync('fetchTemplates carries graphMs on every page', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-timeout';
+    const { TIMEOUTS } = require('./src/config');
+    const realTimeout = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return realTimeout(ms); };
+    const real = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    try {
+      await fetchTemplates();
+      assert.deepEqual(seen, [TIMEOUTS.graphMs]);
+    } finally { AbortSignal.timeout = realTimeout; global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+
+  testAsync('deleteTemplate carries graphMs', async () => {
+    const { deleteTemplate } = require('./server');
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-del-timeout';
+    const { TIMEOUTS } = require('./src/config');
+    const realTimeout = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return realTimeout(ms); };
+    const real = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ success: true }) });
+    try {
+      await deleteTemplate('some_template');
+      assert.deepEqual(seen, [TIMEOUTS.graphMs]);
+    } finally { AbortSignal.timeout = realTimeout; global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
 }
 
 console.log('\ntemplate row memory');
@@ -4861,6 +4894,43 @@ console.log('\nmedia — Meta identifiers');
       });
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers, so one
+  // wedged connection would hold up a template submission or a campaign send
+  // for minutes. Verified by replacing AbortSignal.timeout with a spy — the
+  // real signal still runs underneath, so the request behaves identically.
+  const spyTimeout = () => {
+    const real = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return real(ms); };
+    return { seen, restore: () => { AbortSignal.timeout = real; } };
+  };
+
+  testAsync('ensureHandle: the session-open call carries graphMs, the byte-push carries transferMs', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    const { TIMEOUTS } = require('./src/config');
+    const spy = spyTimeout();
+    try {
+      await withFetch(url => url.includes('/uploads?') ? json({ id: 'upload:SESSION' }) : json({ h: 'h:X' }),
+        () => ensureHandle(id));
+      assert.deepEqual(spy.seen, [TIMEOUTS.graphMs, TIMEOUTS.transferMs],
+        'the session-open call is a small JSON request; the byte-push is what actually moves the file');
+    } finally { spy.restore(); CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureMediaId upload carries transferMs — it moves the file, it does not just ask about it', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    const { TIMEOUTS } = require('./src/config');
+    const spy = spyTimeout();
+    try {
+      await withFetch(() => json({ id: 'media-timeout-1' }), () => ensureMediaId(id));
+      assert.deepEqual(spy.seen, [TIMEOUTS.transferMs]);
+    } finally { spy.restore(); CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
 }
 
 console.log('\nsend path — header component');
@@ -5074,6 +5144,23 @@ console.log('\ninbound media — save, serve, expire');
       assert.ok(row.downloaded_at > 0);
       assert.equal(fsm.readFileSync(inboundPath(row)).toString(), bytes.toString());
     }));
+  });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers — a byte
+  // transfer (this app's own 100 MB document ceiling) genuinely needs longer
+  // than a small JSON call, which is why the two hops carry different budgets.
+  testAsync('saveInbound: the metadata GET carries graphMs, the CDN download carries transferMs', async () => {
+    const bytes = Buffer.from(`timeout-${Date.now()}`);
+    const id = seedInbound({ bytes });
+    const { TIMEOUTS } = require('./src/config');
+    const real = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return real(ms); };
+    try {
+      await withToken(() => withMeta(metaOk(bytes), () => saveInbound(id)));
+      assert.deepEqual(seen, [TIMEOUTS.graphMs, TIMEOUTS.transferMs],
+        'resolving the media id is a small JSON call; the CDN fetch is what actually pulls the file');
+    } finally { AbortSignal.timeout = real; }
   });
 
   testAsync('saving twice never refetches and never rewrites', async () => {
