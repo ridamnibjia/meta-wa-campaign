@@ -1,0 +1,15 @@
+# The tunnel or reverse proxy on this host is the only public entrance: the
+# port is published on loopback, never on 0.0.0.0.
+services:
+  app:
+    build: .
+    env_file: .env
+    environment:
+      WA_DATA_DIR: /data
+    volumes:
+      - wa-data:/data
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+volumes:
+  wa-data:

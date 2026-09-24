@@ -5,11 +5,16 @@ Description=WA Campaign nightly application backup (VACUUM INTO + state files)
 # them would mean an app that failed to start also silently stopped the backups,
 # which is the exact moment they matter.
 
+# Install: this file is public and must not carry a real hosting username, so
+# substitute your own before copying it into systemd's unit directory —
+#   sed 's/@APP_USER@/youruser/g' scripts/wa-backup.service | sudo tee /etc/systemd/system/wa-backup.service
+#   sudo cp scripts/wa-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wa-backup.timer
 [Service]
 Type=oneshot
-User=earlyearnly
-WorkingDirectory=/home/earlyearnly/app
-Environment=WA_APP_DIR=/home/earlyearnly/app
-Environment=WA_BACKUP_DIR=/home/earlyearnly/backups
+User=@APP_USER@
+WorkingDirectory=/home/@APP_USER@/app
+Environment=WA_APP_DIR=/home/@APP_USER@/app
+Environment=WA_BACKUP_DIR=/home/@APP_USER@/backups
 Environment=WA_BACKUP_DAYS=7
-ExecStart=/bin/sh /home/earlyearnly/app/scripts/backup.sh
+ExecStart=/bin/sh /home/@APP_USER@/app/scripts/backup.sh

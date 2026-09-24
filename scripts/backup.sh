@@ -10,8 +10,12 @@
 # Run by wa-backup.timer. Safe to run by hand at any time, including mid-send.
 set -eu
 
-APP=${WA_APP_DIR:-/home/earlyearnly/app}
-DEST=${WA_BACKUP_DIR:-/home/earlyearnly/backups}
+# Derived, not written down: the script lives in <app>/scripts, and the
+# backups default to the invoking user's home. A real hosting username in a
+# public repo is exactly what docs/ is gitignored for; WA_APP_DIR / WA_BACKUP_DIR
+# below let an installed unit still pin an exact path (see wa-backup.service).
+APP=${WA_APP_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
+DEST=${WA_BACKUP_DIR:-$HOME/backups}
 DAYS=${WA_BACKUP_DAYS:-7}
 STAMP=$(date -u +%Y-%m-%dT%H%M%SZ)
 WORK="$DEST/.partial-$$-$STAMP"

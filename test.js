@@ -7180,6 +7180,72 @@ test('a CSV that lists the same number twice reports the merge rather than hidin
   assert.equal(skipped.length, 1, 'a row with no usable number is still a different problem, counted separately');
 });
 
+// ── Deployment files ────────────────────────────────────────────────────────
+console.log('\ndeployment files');
+test('.dockerignore keeps secrets and customer data out of image layers', () => {
+  const lines = fsx.readFileSync(pathx.join(__dirname, '.dockerignore'), 'utf8')
+    .split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+  for (const must of ['.env*', '*.db', '*.db-wal', '.git', '*.csv', 'media/', 'uploads/', 'docs/', 'campaign.json', 'warmup.json', 'Thumbs.db'])
+    assert.ok(lines.includes(must), `${must} must stay out of the image — COPY . . ignores .gitignore`);
+});
+test('the image runs as a non-root user and binds all interfaces inside the container', () => {
+  const df = fsx.readFileSync(pathx.join(__dirname, 'Dockerfile'), 'utf8');
+  assert.match(df, /^USER node$/m, 'a process that holds a money-spending token should not be root');
+  assert.match(df, /BIND_HOST=0\.0\.0\.0/, 'loopback inside a container is unreachable through a published port');
+  assert.match(df, /process\.env\.PORT/, 'the healthcheck must follow PORT, not assume 3000');
+});
+test('docker-compose.yml publishes the port on loopback only, with state on a named volume', () => {
+  const dc = fsx.readFileSync(pathx.join(__dirname, 'docker-compose.yml'), 'utf8');
+  assert.match(dc, /build:\s*\.\s*$/m, 'must build from this repo\'s own Dockerfile, not run an image nobody can audit');
+  assert.match(dc, /env_file:\s*\.env/, 'credentials come from the operator\'s own .env, never baked into the image');
+  assert.match(dc, /"127\.0\.0\.1:3000:3000"/, 'binding 0.0.0.0 on the host exposes the app to the internet with no tunnel or proxy in front of it');
+  assert.match(dc, /restart:\s*unless-stopped/, 'a crash on a box nobody is watching must not need a manual restart');
+  assert.match(dc, /wa-data:\/data/, 'state must live on the named volume, or a rebuild silently deletes the database');
+});
+test('the repo carries an MIT license, so a self-hoster has a right to run it', () => {
+  assert.match(fsx.readFileSync(pathx.join(__dirname, 'LICENSE'), 'utf8'), /MIT License/,
+    'without a license the repo is all-rights-reserved and self-hosters have no right to run it');
+  assert.equal(require('./package.json').license, 'MIT',
+    'package.json is the machine-readable half — tools that read it should see the same answer as a human reading LICENSE');
+  assert.match(fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8'), /## License\s*\n+MIT/,
+    'the README is where a human actually looks, not just the LICENSE file');
+});
+test('CI runs the real suite on every push and PR, and reports audit advisories without blocking a merge', () => {
+  const wf = fsx.readFileSync(pathx.join(__dirname, '.github', 'workflows', 'test.yml'), 'utf8');
+  assert.match(wf, /^on:\s*\[push, *pull_request\]/m, 'a fork PR that never runs the suite is how a regression reaches main unseen');
+  assert.match(wf, /actions\/setup-node@v4/, 'pin the action major version, or a v5 someday changes behaviour under everyone at once');
+  assert.match(wf, /node-version:\s*'22'/, 'this app requires Node 22.5+ for node:sqlite — an older runner would fail for a reason unrelated to the change under review');
+  assert.match(wf, /run:\s*npm ci/, 'ci must install from the lockfile exactly, not npm install\'s "close enough"');
+  assert.match(wf, /run:\s*npm test/, 'the whole point of the workflow');
+  const auditLine = wf.split('\n').findIndex(l => /npm audit --omit=dev/.test(l));
+  assert.ok(auditLine >= 0, 'a transitive dev-tool CVE is information, not a reason to skip auditing entirely');
+  assert.match(wf.split('\n').slice(auditLine, auditLine + 2).join('\n'), /continue-on-error:\s*true/,
+    'an advisory must not turn a green suite into a red build — that is a decision for a human, not the audit step');
+});
+test('.gitignore keeps local assistant settings out of the public repo', () => {
+  const lines = fsx.readFileSync(pathx.join(__dirname, '.gitignore'), 'utf8').split('\n').map(s => s.trim());
+  assert.ok(lines.includes('.claude/'), 'a contributor\'s local Claude Code settings are not this project\'s to publish');
+  // A root-level rule is cheap protection even though a nested .gitignore under
+  // .superpowers/sdd/ already covers most of it: this repo's planning workspace
+  // has quoted the real hosting username in its working files before.
+  assert.ok(lines.includes('.superpowers/'), 'the planning workspace can quote real infrastructure details and must never reach a public commit');
+});
+test('README documents only a deployment the session cookie can actually authenticate on', () => {
+  const md = fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8');
+  assert.doesNotMatch(md, /Cloudflare Pages \(frontend\) \+ Render \(backend\)/,
+    'a split frontend/backend deploy cannot log in — the session cookie is sameSite: strict and never rides cross-site');
+  assert.doesNotMatch(md, /setup screen asking for your .*backend URL/,
+    'that screen does not exist in the code; the README must not promise a feature that was never built');
+  assert.match(md, /\bBIND_HOST\b/, 'the bind-host env var must be documented now that Docker and Render both set it differently than the 127.0.0.1 default');
+  assert.match(md, /\bWA_DATA_DIR\b/, 'the data directory env var must be documented for anyone running this outside the repo root, e.g. the Docker volume');
+  assert.match(md, /docker compose up/, 'the Docker deployment path needs its own instructions now that the Dockerfile and compose file exist');
+});
+test('the tracked backup scripts carry no hosting username', () => {
+  const read = f => fsx.readFileSync(pathx.join(__dirname, f), 'utf8');
+  assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service'), /\/home\/[a-z]/,
+    'a real hosting username in a public repo is exactly what docs/ is gitignored for');
+});
+
 // ── Frontend scripts share one global scope ──────────────────────────────────
 console.log('\nfrontend — global scope');
 test('no top-level name is declared in two frontend scripts', () => {

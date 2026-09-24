@@ -1,0 +1,28 @@
+# Docker does not read .gitignore. Without this file `COPY . .` bakes the live
+# Meta token, the customer database and any contact CSV into image layers.
+.env*
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.migrated
+*.log
+*.tmp
+*.csv
+.git
+docs/
+media/
+uploads/
+node_modules
+opt-outs.json
+warmup.json
+msg-index.json
+inbox.json
+campaign.json
+.remember/
+.claude/
+.superpowers/
+.playwright-mcp/
+test.js
+.DS_Store
+Thumbs.db
