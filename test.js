@@ -1664,10 +1664,10 @@ test('the schema creates every table', () => {
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_cap', 'idx_messages_out_at',
+  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_asset', 'idx_messages_cap',
                            'idx_messages_run', 'idx_messages_thread',
                            'idx_run_recipients_pending', 'idx_run_recipients_retry',
-                           'idx_run_recipients_seq']);
+                           'idx_run_recipients_seq', 'idx_webhook_unprocessed']);
 });
 // The two indexes the loop's per-message queries actually need, asserted on the
 // PLAN rather than on the schema — an index that exists but is not chosen is
@@ -1705,6 +1705,46 @@ test('the two per-message queries are answered by an index, not by a scan', () =
     "today's send count must be answered from today's rows — the scan it replaces grew with all history, forever");
   assert.doesNotMatch(cap, /SCAN messages/,
     'a full table scan here is once per message sent, on a synchronous driver, blocking webhook ingestion');
+});
+// Two lookups that had no index at all. The Storage page counts the sent
+// messages that use each library file — a full scan of the message history
+// per file, measured at a second for sixty files — and /health, outside the
+// password gate, counted unprocessed envelopes by scanning ninety days of them
+// on every probe.
+test('the storage and replay lookups are answered by an index, not by a scan', () => {
+  const d = openDb(':memory:');
+  const plan = sql => d.prepare('EXPLAIN QUERY PLAN ' + sql).all().map(r => r.detail).join(' | ');
+
+  // assetRefCounts is private to services/storage.js, so its SQL is read out of
+  // the source rather than retyped here: a retyped copy keeps passing while the
+  // statement the app actually runs drifts away from it.
+  const storageSrc = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, 'src', 'services', 'storage.js'), 'utf8');
+  const refs = /const assetRefCounts = db\.prepare\(`([\s\S]*?)`\)/.exec(storageSrc)?.[1];
+  assert.ok(refs, 'assetRefCounts moved — point this test at the statement the Storage page runs');
+  assert.match(plan(refs), /SEARCH m USING COVERING INDEX idx_messages_asset/,
+    'each library file must seek its sends, not scan every message ever sent');
+
+  const { UNPROCESSED_COUNT_SQL } = require('./server');
+  assert.match(plan(UNPROCESSED_COUNT_SQL), /idx_webhook_unprocessed/,
+    'an unauthenticated probe must read an index that is empty in steady state, not the whole envelope table');
+});
+// SCHEMA is all IF NOT EXISTS, so deleting a CREATE from it removes nothing
+// from a database that already has the index — and an index no query chooses
+// still costs a write on every outbound message, forever.
+test('idx_messages_out_at is dropped from a database that already has it', () => {
+  const f = require('node:path').join(require('node:os').tmpdir(), `wa-dropidx-${process.pid}-${Date.now()}.db`);
+  try {
+    const old = openDb(f);
+    old.exec("CREATE INDEX IF NOT EXISTS idx_messages_out_at ON messages(at) WHERE dir = 'out'");
+    old.close();
+    const d = openDb(f);
+    const has = d.prepare("SELECT 1 AS hit FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_out_at'").get();
+    d.close();
+    assert.equal(has, undefined, 'chosen by no query since idx_messages_cap took sentSince, so it goes at the next boot');
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) { try { require('node:fs').unlinkSync(f + suffix); } catch {} }
+  }
 });
 test('opening twice does not throw', () => {
   const d = openDb(':memory:');

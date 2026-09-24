@@ -288,7 +288,10 @@ const sendingDays = () => sendingDaysQ.all().map(r => r.day);
 // webhook is one Meta redelivers, which is a problem that fixes itself.
 const insertEvent = db.prepare('INSERT INTO webhook_events (received_at, body) VALUES (?, ?)');
 const stampEvent  = db.prepare('UPDATE webhook_events SET processed_at = ? WHERE id = ?');
-const countUnprocessed = db.prepare('SELECT count(*) AS n FROM webhook_events WHERE processed_at IS NULL');
+// Exported so test.js asserts the plan of this exact string: /health asks it on
+// every probe, and it must stay on idx_webhook_unprocessed (src/lib/db.js).
+const UNPROCESSED_COUNT_SQL = 'SELECT count(*) AS n FROM webhook_events WHERE processed_at IS NULL';
+const countUnprocessed = db.prepare(UNPROCESSED_COUNT_SQL);
 
 // Throws on failure by design. The route turns that throw into a 500.
 function recordEnvelope(rawText) {
@@ -995,5 +998,5 @@ module.exports = {
   recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
   nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
-  waIdForWamid,
+  waIdForWamid, UNPROCESSED_COUNT_SQL,
 };
