@@ -7067,6 +7067,28 @@ console.log('\na Reset that lands mid-send');
       assert.equal(sends, 0, 'nothing reached Meta\'s /messages');
     });
   });
+
+  // A test send is a template this number really sent, and reconcileWarmupDays
+  // already counts its day at the next boot. Only the loop marked the day live,
+  // so a day of test sends alone climbed no rung until a restart — and then the
+  // ceiling on screen moved with nothing sent in between. withLoop snapshots
+  // W.days and warmup.json, so marking the day here writes nothing that lasts.
+  testAsync('a test send counts as a sending day live, as it already does after a reboot', async () => {
+    await withLoop(async url => {
+      if (String(url).includes('/message_templates')) return templateList('warm_day');
+      if (String(url).endsWith('/messages')) return graphOk('wamid.warmday.1');
+      return accountInfo();
+    }, async h => {
+      const { S, W } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'warm_day';
+      W.days = W.days.filter(d => d !== todayKey());      // nothing has gone out today
+      const r = await callRoute('post', '/test-send', { numbers: ['+919000033021'] });
+      assert.equal(r.ok, true, 'the stubbed send was accepted');
+      assert.ok(W.days.includes(todayKey()),
+        'the day a template went out is a sending day, whichever button sent it');
+    });
+  });
 }
 
 // ── The send queue's order, and the plan that makes it affordable ─────────────

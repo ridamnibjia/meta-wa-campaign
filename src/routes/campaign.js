@@ -4,7 +4,7 @@ const { CFG } = require('../config');
 const { S, flags, log, todayKey } = require('../state');
 const { broadcast } = require('../services/status');
 const { isDisabled, markMessaged, getRow } = require('../services/contacts');
-const { W, effectiveCap, graduated } = require('../services/warmup');
+const { W, effectiveCap, graduated, markWarmupDay } = require('../services/warmup');
 const { recordOutbound, progressForRun, skippedForRun,
         listRuns, runDetail } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
@@ -64,6 +64,10 @@ router.post('/test-send', async (req, res) => {
       // counted — by the daily cap (a query over these rows) and by
       // countsForRun. It stages no queue row, so the funnel-driven tiles
       // deliberately do not move; the confirmation is the phone in your hand.
+      // And it is a sending day: reconcileWarmupDays already counts this row's
+      // day at the next boot, so not marking it here made the rung on screen
+      // move across a restart with nothing sent in between.
+      markWarmupDay();
       markMessaged(dialStr);
       recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, r.params)
