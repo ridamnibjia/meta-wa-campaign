@@ -29,6 +29,16 @@ function templateVars(text) {
 // ever digits.
 const NAMED_VAR = /\{\{\s*[A-Za-z_]/;
 
+// One function, so adoptTemplate and /template/create — which adopts a
+// successful submission by writing S.config directly, since its source is
+// Meta's own reply rather than a fetched list to select from — cannot drift
+// on what counts as an unsupported template.
+function namedVariableMsg(bodyText, headerText) {
+  return (NAMED_VAR.test(bodyText || '') || NAMED_VAR.test(headerText || ''))
+    ? 'This template uses named variables ({{first_name}}), which this app cannot fill yet — pick one that uses {{1}}, {{2}}…'
+    : null;
+}
+
 // Meta rejects parameter values containing newlines, tabs, or 4+ consecutive
 // spaces. Collapse all whitespace runs to a single space.
 function sanitizeParam(v) {
@@ -357,12 +367,10 @@ function adoptTemplate(name, result, language) {
   S.config.templateLanguage = t.language;
   // This app only fills positional {{1}}, {{2}}… — a named variable in either
   // the body or a TEXT header must refuse at Start with a sentence, not send
-  // the literal "{{first_name}}" text to a customer. Checked on both text
-  // sources and cleared here too, so switching back to a positional template
-  // does not leave a stale refusal from the last one adopted.
-  S.config.templateUnsupported = (NAMED_VAR.test(t.bodyText || '') || NAMED_VAR.test(t.headerText || ''))
-    ? 'This template uses named variables ({{first_name}}), which this app cannot fill yet — pick one that uses {{1}}, {{2}}…'
-    : null;
+  // the literal "{{first_name}}" text to a customer. Cleared here too, so
+  // switching back to a positional template does not leave a stale refusal
+  // from the last one adopted.
+  S.config.templateUnsupported = namedVariableMsg(t.bodyText, t.headerText);
   resizeParamValues(templateVars(t.bodyText).length);
   CFG.templateName          = name;
   broadcast();
@@ -441,6 +449,6 @@ async function deleteTemplate(name) {
 module.exports = {
   slugify, templateVars, sanitizeParam, renderBody, validateTemplateInput, buildTemplatePayload,
   shapeTemplate, fetchTemplates, validateTemplate, resizeParamValues, adoptTemplate,
-  templateLocked, deleteTemplate, graphSend,
+  templateLocked, namedVariableMsg, deleteTemplate, graphSend,
   BUTTON_LIMITS, MAX_BUTTONS, saveTemplateRow, getTemplateRow,
 };

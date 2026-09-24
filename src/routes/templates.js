@@ -8,7 +8,7 @@ const { graphSend, resolveWabaId } = require('../services/graph');
 const {
   fetchTemplates, validateTemplate, adoptTemplate, deleteTemplate,
   validateTemplateInput, buildTemplatePayload, templateVars, resizeParamValues,
-  saveTemplateRow, templateLocked,
+  saveTemplateRow, templateLocked, namedVariableMsg,
 } = require('../services/templates');
 const { ensureHandle } = require('../services/media');
 
@@ -131,6 +131,9 @@ router.post('/template/create', async (req, res) => {
     S.config.templateBody     = input.bodyText;
     S.config.headerFormat     = input.headerFormat;
     S.config.headerAssetId    = input.headerAssetId;
+    // Same check adoptTemplate runs: this route adopts by writing S.config
+    // directly rather than calling it, so it has to ask the same question.
+    S.config.templateUnsupported = namedVariableMsg(input.bodyText, input.headerText);
     resizeParamValues(templateVars(bodyComponent.text).length);
     saveTemplateRow({
       name:          payload.name,

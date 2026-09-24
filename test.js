@@ -625,6 +625,35 @@ console.log('\ntemplate routes — identity locked mid-campaign');
       CFG.accessToken = savedToken; CFG.wabaId = savedWaba;
     }
   });
+
+  // /template/create adopts a successful submission by writing S.config
+  // directly rather than calling adoptTemplate (its row is Meta's own reply,
+  // not a fetched list to select from) — so the named-variable check has to
+  // be asked here too, or a template composed with {{first_name}} would read
+  // as sendable until the next unrelated re-validation happened to catch it.
+  testAsync('POST /api/template/create sets templateUnsupported for a named-variable body it still adopts', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId, savedUnsupported = S.config.templateUnsupported;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-named';
+    const real = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).startsWith('http://127.0.0.1')) return real(url, opts);
+      return { ok: true, status: 200, json: async () => ({ id: 'meta-tpl-named', status: 'PENDING' }) };
+    };
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/template/create`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: 'Named Var', bodyText: 'Hi {{first_name}}, welcome.' }),
+      })).json();
+      assert.equal(r.ok, true, 'Meta accepts named variables — this app only cannot fill them later');
+      assert.match(S.config.templateUnsupported, /named variables/,
+        'adopting outside adoptTemplate must not skip the same unsupported check');
+    } finally {
+      global.fetch = real; s.close();
+      CFG.accessToken = savedToken; CFG.wabaId = savedWaba; S.config.templateUnsupported = savedUnsupported;
+    }
+  });
 }
 
 console.log('\nbuildParams');
