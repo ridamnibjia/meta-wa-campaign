@@ -309,17 +309,31 @@ function adoptTemplate(name, result, language) {
   // reaches S.config, which is what lets startRun keep its one-argument
   // signature: the body arrives here or not at all.
   S.config.templateBody     = t.bodyText || null;
-  // Meta knows the template has a document header; only our own row knows WHICH
-  // document, because Graph never saw our disk. Fall back to Meta's shape so an
-  // externally created template is still recognisably a media template.
+  // Meta decides the shape, and ONLY Meta — components are fetched fresh on
+  // every validate, so t.headerFormat is never stale the way a locally
+  // remembered row can be. `?? row?.header_format` looks like a safer
+  // fallback and is exactly backwards: when Meta's current copy has no
+  // header, t.headerFormat is null, and `??` treats null as "ask the row
+  // instead" — resurrecting a header a re-approved template no longer has.
+  // `||` deliberately does not fall through here.
+  S.config.headerFormat     = t.headerFormat || null;
   const row = getTemplateRow(name);
-  S.config.headerFormat     = row?.header_format ?? t.headerFormat ?? null;
-  // The row is a fallback, never an override: switching templates (or a cleared
-  // selection — /api/config sets null on purpose) restores the approval-time
-  // asset, but the operator's live choice for the active template wins.
-  S.config.headerAssetId    = samePick && S.config.headerAssetId != null
-    ? S.config.headerAssetId
-    : row?.header_asset ?? null;
+  // The row's only remaining job is WHICH file, and only when Meta says there
+  // is a media header to send one for. A format that is not IMAGE/VIDEO/
+  // DOCUMENT has nothing to attach, so any remembered pick is cleared — that
+  // is what lets /start's "choose a file" check trust S.config.headerAssetId
+  // rather than re-deriving the shape itself.
+  if (!['IMAGE', 'VIDEO', 'DOCUMENT'].includes(S.config.headerFormat)) {
+    S.config.headerAssetId = null;
+  } else {
+    // The row is a fallback, never an override: switching templates (or a
+    // cleared selection — /api/config sets null on purpose) restores the
+    // approval-time asset, but the operator's live choice for the active
+    // template wins.
+    S.config.headerAssetId = samePick && S.config.headerAssetId != null
+      ? S.config.headerAssetId
+      : row?.header_asset ?? null;
+  }
   S.config.templateStatus   = t.status;
   S.config.templateCategory = t.category;
   S.config.templateLanguage = t.language;

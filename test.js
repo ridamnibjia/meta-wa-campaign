@@ -345,6 +345,31 @@ console.log('\nadopting a template — the attachment picked this session surviv
     } finally { S.phase = savedPhase; }
   });
 
+  test('Meta header shape wins over a stale row — no header on Meta clears both fields', () => {
+    saveTemplateRow({ name: 'adopt_stale_header', displayName: 'Stale', headerFormat: 'DOCUMENT',
+                      headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
+    S.config.templateName = '';
+    adoptTemplate('adopt_stale_header', { found: true, templates: [{
+      name: 'adopt_stale_header', status: 'APPROVED', category: 'MARKETING', language: 'en',
+      bodyText: 'Hi {{1}}', headerFormat: null, headerText: null, buttons: [],
+    }] });
+    assert.equal(S.config.headerFormat, null,
+      'Meta\'s current copy has no header — the row remembering DOCUMENT must not resurrect one');
+    assert.equal(S.config.headerAssetId, null, 'nothing to send a file for once there is no header');
+  });
+
+  test('Meta DOCUMENT header with a row still supplies which file', () => {
+    saveTemplateRow({ name: 'adopt_doc_header', displayName: 'Doc', headerFormat: 'DOCUMENT',
+                      headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
+    S.config.templateName = '';
+    adoptTemplate('adopt_doc_header', { found: true, templates: [{
+      name: 'adopt_doc_header', status: 'APPROVED', category: 'MARKETING', language: 'en',
+      bodyText: 'Hi {{1}}', headerFormat: 'DOCUMENT', headerText: null, buttons: [],
+    }] });
+    assert.equal(S.config.headerFormat, 'DOCUMENT', 'Meta decides the shape');
+    assert.equal(S.config.headerAssetId, approvedAsset, 'and the row still says which file for that shape');
+  });
+
   Object.assign(S.config, before);   // adoptTemplate writes broadly; leave S as found
 }
 
