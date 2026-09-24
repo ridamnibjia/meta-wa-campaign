@@ -1040,6 +1040,30 @@ console.log('\nundeliverable numbers switch themselves off');
     assert.equal(suppressIfPermanent(phone, 999999, 'Unknown'), false);
     assert.equal(M.contacts.isDisabled(phone), false);
   });
+
+  // Meta sometimes puts the real reason in error_subcode under a generic code —
+  // 100 "invalid parameter" carrying 131026. The skip branch matched on the
+  // subcode but reported the CODE, so everything downstream saw 100, which
+  // skipDisposition calls 'fix': the number was never switched off, the next run
+  // paid to try it again, and the report told the operator to re-check the
+  // template.
+  testAsync('a skip signalled by subcode is acted on by the code that matched', async () => {
+    const phone = '919400000011';
+    await withLoop(async () => graphErr({ code: 100, error_subcode: 131026, message: 'x' }), async h => {
+      const r = await M.sendTemplate({ name: 'Marco', dialStr: phone });
+      assert.equal(r.skip, true, 'the subcode is a skippable code, so this is a skip');
+      assert.equal(r.errorCode, 131026,
+        'the code acted on is the code that matched — reporting 100 files a dead number under "fix the template"');
+      assert.match(r.hint || '', /not on WhatsApp/, 'and the hint explains that code, not the generic one');
+
+      const run = h.stage([{ dialStr: phone, name: 'Marco' }], 'subcode-skip');
+      h.start();
+      await h.until(() => h.M.S.phase === 'done');
+      assert.equal(M.contacts.isDisabled(phone), true,
+        'switched off like any other 131026 — or every later run pays to try it again');
+      assert.equal(h.row(run, phone).error_code, 131026, 'and the queue row carries the code the report explains');
+    });
+  });
 }
 
 console.log('\nstatus');

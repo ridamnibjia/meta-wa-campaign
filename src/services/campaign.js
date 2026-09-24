@@ -114,6 +114,11 @@ function missingParams() {
     .filter(Boolean);
 }
 
+// The codes sendTemplate reports as a skip rather than a failure — each one is
+// about the recipient or the moment, never about the request itself. One list,
+// asked of both the code and the subcode.
+const SKIPPABLE = [131026, 131047, 131049, 131051];
+
 // ── Meta Cloud API — send one template message ─────────────────────────────────
 async function sendTemplate(contact) {
   if (!CFG.accessToken || !CFG.phoneNumberId) {
@@ -191,11 +196,19 @@ async function sendTemplate(contact) {
     const code    = err.code        || 0;
     const subcode = err.error_subcode || 0;
     const msg     = err.message     || JSON.stringify(data);
-    // Skippable: opted out, ecosystem health, re-engagement window
-    const hint = explainError(code) || explainError(subcode);
-    if ([131026, 131047, 131049, 131051].includes(code) ||
-        [131026, 131047, 131049, 131051].includes(subcode)) {
-      return { ok: false, skip: true, error: msg, errorCode: code, hint };
+    // Skippable: undeliverable, ecosystem health, re-engagement window. Meta
+    // can signal one in error_subcode under a generic code (100 carrying
+    // 131026), and the code that MATCHED is the one everything downstream must
+    // act on: reporting the generic 100 made skipDisposition call a dead number
+    // 'fix' — never switched off, re-tried by every later run, and explained to
+    // the operator as a template problem. Resolved once, so the hint and the
+    // code cannot describe two different failures.
+    const eff  = SKIPPABLE.includes(code) ? code
+               : SKIPPABLE.includes(subcode) ? subcode
+               : code;
+    const hint = explainError(eff) || explainError(code) || explainError(subcode);
+    if (SKIPPABLE.includes(eff)) {
+      return { ok: false, skip: true, error: msg, errorCode: eff, hint };
     }
     // Rate limit: back off and retry same contact
     if ([130429, 80007, 4].includes(code)) {
