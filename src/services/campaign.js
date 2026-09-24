@@ -394,17 +394,46 @@ function suppressIfPermanent(dialStr, code, name = null, prefix = '') {
 // the per-user marketing cap the ladder was lengthened to five rungs FOR, almost
 // always arrives this way rather than in the send response.
 //
-// This runs on the webhook thread, never inside the loop, and it deliberately
-// does not interrupt anything: it only edits the queue row. A campaign still
-// sending walks past the row and picks it up when the deadline comes due; a
-// campaign that already finished is restarted below. Either way the contacts
-// still un-messaged are reached first, and the parked failures come after.
+// This runs on the webhook thread, never inside the loop, and a retry does not
+// interrupt anything: it only edits the queue row. A campaign still sending
+// walks past the row and picks it up when the deadline comes due; a campaign
+// that already finished is restarted below. Either way the contacts still
+// un-messaged are reached first, and the parked failures come after. The one
+// interruption is a fault that fails every send (the halt at the top), which
+// stops the loop through the same pauseFlag an operator's Pause sets.
 //
 // Which codes get a second attempt is lib/errors.js:skipDisposition, the same
 // whitelist the send-time path uses — a wrong number or a number not on
 // WhatsApp is 'permanent' and is switched off rather than retried, because no
 // number of attempts changes the answer and each one costs a send slot.
 function handleDeliveryFailure({ waId, runId, wamid, code }) {
+  // ── A fault that fails EVERY send, arriving after the accept ──────────────────
+  // Billing holds, paused templates and account restrictions mostly arrive here
+  // rather than in the send response — Meta accepts, then refuses. The loop's
+  // halt only saw the send-time half, so a campaign walked on into the fault and
+  // every accepted send came back refused: the whole list spent on one fact.
+  // Same park the loop uses (lib/errors.js:haltsCampaign), minus the skip: the
+  // row already carries its failure, and the contacts still pending stay
+  // pending, so Resume after the fix loses nobody.
+  //
+  // Only the live campaign, and only the current run. A stale run has nothing
+  // walking it; an idle or finished one has no loop to stop, and a flag left set
+  // there would greet the next Start as a pause. Parks once: a second halt, or
+  // one landing on a pause already under the flag — the operator's own included
+  // — changes nothing, so a redelivery or a replay is free.
+  if (haltsCampaign(code) && runId === S.currentRunId && campaignActive()) {
+    if (!flags.pauseFlag) {
+      const hint = explainError(code);
+      flags.pauseFlag = true;
+      S.phase = 'paused';
+      S.pauseReason = `Campaign paused — ${hint || 'Meta refused a delivery for a reason that fails every send'} [${code}]`;
+      log('error', `+${waId} — Meta refused a delivery [${code}] for a reason that fails every send — campaign paused. Fix the cause, then press Resume.`);
+      if (hint) log('error', `   ↳ ${hint}`);
+      saveCampaignNow(); broadcast();
+    }
+    return 'halted';
+  }
+
   const disp = skipDisposition(code);
 
   // About the NUMBER, not about the moment. The send-time path disables these

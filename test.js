@@ -3628,6 +3628,85 @@ console.log('\ndelivery failures that arrive over the webhook');
       assert.equal(progressForRun(run).retrying, 1, 'the row still waits, for whenever it is started');
     } finally { S.phase = savedPhase; S.currentRunId = savedRun; M.flags.running = savedRunning; }
   });
+
+  // ── A fault that fails every send, arriving after the accept ────────────────
+  // Billing holds, paused templates and account restrictions mostly do not come
+  // back in the send response: Meta accepts, then refuses over the status
+  // webhook. The loop's halt only ever saw the send-time half, so a campaign
+  // walked on into a billing hold and every accepted send was refused minutes
+  // later — the whole list spent on one fact. The webhook entrance parks the
+  // campaign the same way. The park writes campaign.json and the loop's flags,
+  // both shared with every other test, so both are put back.
+  const withLiveCampaign = (phase, fn) => {
+    const fsc = require('node:fs');
+    const cfile = require('./src/config').FILES.campaign;
+    const fileWas = fsc.existsSync(cfile) ? fsc.readFileSync(cfile) : null;
+    const saved = { phase: S.phase, run: S.currentRunId, reason: S.pauseReason, pause: M.flags.pauseFlag };
+    S.phase = phase; S.pauseReason = null; M.flags.pauseFlag = false;
+    try { fn(); } finally {
+      Object.assign(S, { phase: saved.phase, currentRunId: saved.run, pauseReason: saved.reason });
+      M.flags.pauseFlag = saved.pause;
+      if (fileWas) fsc.writeFileSync(cfile, fileWas); else fsc.rmSync(cfile, { force: true });
+    }
+  };
+
+  test('an account-level failure that arrives by webhook pauses the live campaign', () => withLiveCampaign('running', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.halt');
+
+    assert.equal(webhook('w.halt', 131042), 'halted');
+    assert.equal(M.flags.pauseFlag, true,
+      'the flag is what stops the loop at its next iteration, and what makes Resume the operator\'s to press once it is fixed');
+    assert.equal(S.phase, 'paused');
+    assert.match(S.pauseReason, /^Campaign paused — Billing not set up for this business — .+ \[131042\]$/,
+      'the same sentence the send-time halt gives: the fault, the fix, and the code');
+    assert.equal(rowFor(run, p[0].dialStr).wamid, 'w.halt',
+      'nothing is skipped or requeued — the refused send is already recorded as failed on its own row');
+    assert.equal(progressForRun(run).pending, 1, 'and the contact nobody has reached yet is still owed their message');
+  }));
+
+  test('the webhook park is for the live campaign only', () => {
+    withLiveCampaign('running', () => {
+      const old = newRun();
+      const p = people(1);
+      buildRun(old, p);
+      accepted(old, p[0], 'w.halt.old');
+      newRun();                                   // a later upload made another run current
+      assert.notEqual(webhook('w.halt.old', 131042), 'halted');
+      assert.equal(M.flags.pauseFlag, false,
+        'a failure from a run nothing walks any more must not stop the one that is being walked');
+      assert.equal(S.phase, 'running');
+    });
+    for (const phase of ['idle', 'done']) {
+      withLiveCampaign(phase, () => {
+        const run = newRun();
+        const p = people(1);
+        buildRun(run, p);
+        accepted(run, p[0], `w.halt.${phase}`);
+        assert.equal(webhook(`w.halt.${phase}`, 131042), 'fix', 'reported like any fault a human has to correct');
+        assert.equal(M.flags.pauseFlag, false,
+          `a campaign that is ${phase} has no loop to stop, and a flag left set would greet the next Start as a pause`);
+        assert.equal(S.phase, phase);
+      });
+    }
+  });
+
+  test('a halt delivered twice parks once', () => withLiveCampaign('waiting', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.halt.twice');
+    const failure = applyStatus({ id: 'w.halt.twice', status: 'failed', errors: [{ code: 132015, title: 'Template paused' }] });
+    assert.equal(handleDeliveryFailure(failure), 'halted', 'a paused template fails every send, whichever phase the loop is in');
+    const reason = S.pauseReason, lastLog = S.logs[S.logs.length - 1];
+    assert.equal(handleDeliveryFailure(failure), 'halted');
+    assert.equal(S.pauseReason, reason, 'the park is not re-announced');
+    assert.equal(S.logs[S.logs.length - 1], lastLog, 'and nothing new is logged');
+    assert.equal(webhook('w.halt.twice', 132015), 'ignored',
+      'and Meta\'s own redelivery never reaches it: the status was already failed');
+  }));
 }
 
 // ── Progress cannot exceed the list ───────────────────────────────────────────
@@ -6942,6 +7021,41 @@ console.log('\na Reset that lands mid-send');
       if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
     }
+  });
+
+  // The same halt arriving the way it mostly does: Meta accepted the send and
+  // refuses it over the status webhook while the loop is already on to the next
+  // contact. The send in flight cannot be recalled; nobody after it is sent into
+  // the fault, and Resume carries on from the next contact.
+  testAsync('an account-level failure that arrives by webhook stops the loop before the next contact', async () => {
+    let sends = 0, halted = null;
+    await withLoop(async () => {
+      if (++sends === 2) {
+        // Meta refuses the FIRST send while the loop is sending the second.
+        const failure = M.applyStatus({ id: 'wamid.haltw.1', status: 'failed',
+                                        errors: [{ code: 131042, title: 'Business eligibility payment issue' }] });
+        halted = failure && M.handleDeliveryFailure(failure);
+      }
+      return graphOk(`wamid.haltw.${sends}`);
+    }, async h => {
+      const { S } = h.M;
+      const p = ['919000035101', '919000035102', '919000035103'];
+      const run = h.stage(p.map((dialStr, i) => ({ dialStr, name: ['Asha', 'Rahul', 'Marco'][i] })), 'halt-webhook');
+      h.start();
+      await h.until(() => h.row(run, p[1]).wamid !== null);        // the send in flight has landed
+      await new Promise(r => setTimeout(r, 100));                   // room for a third, were the loop still walking
+
+      assert.equal(halted, 'halted', 'the billing hold parked the campaign from the webhook');
+      assert.equal(S.phase, 'paused');
+      assert.match(S.pauseReason || '', /131042/, 'and the reason names the code the operator has to fix');
+      assert.equal(sends, 2, 'the send already in flight completes; nobody after it is sent into the fault');
+      assert.equal(h.row(run, p[2]).attempted_at, null, 'the third contact is untouched');
+
+      const resumed = await callRoute('post', '/resume');
+      assert.equal(resumed.ok, true, 'Resume is how the operator says "fixed it" — the flag makes it theirs to press');
+      await h.until(() => h.row(run, p[2]).wamid !== null);
+      assert.equal(sends, 3, 'and the loop carries on from the next contact, skipping nobody');
+    });
   });
 
   // ── A throttle on the NUMBER parks the whole loop ───────────────────────────
