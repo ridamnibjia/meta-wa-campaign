@@ -1698,9 +1698,10 @@ test('the two per-message queries are answered by an index, not by a scan', () =
   assert.doesNotMatch(due, /TEMP B-TREE/,
     'which orders by the deadline for free — a sort here means the index was not chosen');
 
-  const cap = plan("SELECT count(*) AS n FROM (SELECT wa_id FROM messages WHERE dir = 'out' "
-    + "AND type = 'template' AND at >= ? GROUP BY wa_id "
-    + "HAVING sum(CASE WHEN status = 'failed' THEN 0 ELSE 1 END) > 0)");
+  // The statement sentSince() actually runs, not a retyped copy of it: a copy
+  // keeps passing while the shipped query drifts off its index, which is the
+  // exact regression this assertion exists to catch.
+  const cap = plan(require('./server').SENT_SINCE_SQL);
   assert.match(cap, /idx_messages_cap/,
     "today's send count must be answered from today's rows — the scan it replaces grew with all history, forever");
   assert.doesNotMatch(cap, /SCAN messages/,

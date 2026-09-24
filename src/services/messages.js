@@ -246,14 +246,18 @@ function countsForRun(runId) {
 // window, are not marketing, and Meta does not count them against the messaging
 // tier this cap exists to stay under — so answering a customer must not spend a
 // campaign's allowance. Campaign sends and test sends are the 'template' rows.
-const sentSinceQ = db.prepare(`
+//
+// Exported as a string so test.js asserts the plan of the statement this app
+// actually runs — once per message sent, on idx_messages_cap (src/lib/db.js).
+const SENT_SINCE_SQL = `
   SELECT count(*) AS n FROM (
       SELECT wa_id FROM messages
        WHERE dir = 'out' AND type = 'template' AND at >= ?
        GROUP BY wa_id
       HAVING sum(CASE WHEN status = 'failed' THEN 0 ELSE 1 END) > 0
   )
-`);
+`;
+const sentSinceQ = db.prepare(SENT_SINCE_SQL);
 
 const sentSince = at => sentSinceQ.get(at).n || 0;
 
@@ -998,5 +1002,5 @@ module.exports = {
   recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
   nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
-  waIdForWamid, UNPROCESSED_COUNT_SQL,
+  waIdForWamid, UNPROCESSED_COUNT_SQL, SENT_SINCE_SQL,
 };
