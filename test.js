@@ -5444,6 +5444,26 @@ console.log('\ninbound media — save, serve, expire');
       assert.ok(!fsm.existsSync(file), 'a late signature hit must remove the bytes, not just relabel them');
     });
 
+    testAsync('rescanIfNeeded refuses a row whose path escapes MEDIA_DIR, and never reads or unlinks it', async () => {
+      const pathx = require('path');
+      const { MEDIA_DIR } = require('./src/config');
+      // A REAL file one level above MEDIA_DIR — if the containment guard were
+      // missing, this is exactly what a crafted `path` would get read and
+      // (on an infected verdict) unlinked.
+      const name    = `wa-outside-${process.pid}-${Date.now()}.txt`;
+      const outside = pathx.join(MEDIA_DIR, '..', name);
+      fsm.mkdirSync(pathx.dirname(outside), { recursive: true });
+      fsm.writeFileSync(outside, 'not actually inbound media');
+      const id = seedInbound({ bytes: Buffer.from('irrelevant') });
+      db.prepare("UPDATE media SET path = ?, scan_status = 'skipped' WHERE media_id = ?")
+        .run(pathx.join('..', name), id);
+      try {
+        const after = await withClamd('stream: Eicar-Test-Signature FOUND\x00', () => rescanIfNeeded(getInbound(id)));
+        assert.equal(after.scan_status, 'skipped', 'the row is returned unchanged, not scanned');
+        assert.ok(fsm.existsSync(outside), 'a file outside MEDIA_DIR must never be touched, let alone unlinked');
+      } finally { fsm.unlinkSync(outside); }
+    });
+
     testAsync('a transient rescan failure leaves the row retryable', async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`f${Date.now()}`)]);
       const id = seedInbound({ bytes });

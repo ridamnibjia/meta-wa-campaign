@@ -298,8 +298,7 @@ function deleteAsset(id, { force = false } = {}) {
   // a column is data. Resolving it and checking it still lands inside UPLOAD_DIR
   // is what stops a crafted or corrupted row unlinking something else.
   const full = path.resolve(assetPath(asset));
-  const root = path.resolve(UPLOAD_DIR);
-  if (full !== root && !full.startsWith(root + path.sep)) {
+  if (!insideDir(UPLOAD_DIR, full)) {
     log('error', `Refused to delete asset ${asset.id}: ${asset.path} resolves outside UPLOAD_DIR`);
     return { ok: false, error: 'That file is stored outside the uploads directory and was not deleted.' };
   }
@@ -550,9 +549,7 @@ function dropBytes(row) {
   if (!row || !row.path) return { removed: false, freed: 0, shared: false };
 
   const file = inboundPath(row);
-  const dir  = path.resolve(MEDIA_DIR);
-  const rel  = path.relative(dir, path.resolve(file));
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+  if (!insideDir(MEDIA_DIR, file)) {
     return { removed: false, freed: 0, shared: false,
              error: `the path stored for ${row.media_id} resolves outside the media directory` };
   }
@@ -570,6 +567,21 @@ function dropBytes(row) {
   fs.rmSync(file, { force: true });
   clearInboundFile.run(row.media_id);
   return { removed: true, freed, shared: false };
+}
+
+// The one path-containment check, shared by every function that turns a
+// stored `path` column into a real filesystem path before reading or
+// unlinking it. A column is data, not a trusted path: dropBytes and
+// deleteAsset each carried their own copy of this check already, and
+// rescanIfNeeded read and unlinked bytes with no check at all — the same bug
+// in a third place, just waiting for a corrupted or crafted row. Refuses the
+// directory itself, not only paths outside it: a stored path of "." would
+// otherwise resolve to the bare directory, and unlinking a directory is never
+// a legitimate outcome for any of these callers.
+function insideDir(dir, file) {
+  const root = path.resolve(dir);
+  const rel  = path.relative(root, path.resolve(file));
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
 // Meta reports one sha256 in two encodings — base64 in the webhook envelope,
@@ -803,6 +815,10 @@ async function rescanIfNeeded(row) {
   if (!row || !row.path || row.scan_status !== 'skipped' || !scannerConfigured()) return row;
 
   const file = inboundPath(row);
+  // Same containment guard dropBytes and deleteAsset hold: `path` is a
+  // database column, not a trusted filesystem path, and this function reads
+  // and — on an infected verdict — unlinks bytes on the strength of it.
+  if (!insideDir(MEDIA_DIR, file)) return row;
   if (!fs.existsSync(file)) return row;
 
   const scan = await scanBuffer(fs.readFileSync(file));
