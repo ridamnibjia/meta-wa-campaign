@@ -6154,6 +6154,20 @@ console.log('\nfile risk classification');
     assert.equal(classify({ mime: 'image/png', filename: 'logo.png', bytes: Buffer.from('  <svg onload=alert(1)>') }).tier, 'block');
   });
 
+  // Google Docs and Notepad both export HTML/SVG with a UTF-8 BOM (EF BB BF)
+  // prefix. Decoded as latin1 — which the MARKUP test does — those three bytes
+  // become three unrelated Latin-1 characters, never U+FEFF, so a class that
+  // tried to skip the BOM there matched nothing and the whole file voted `ok`
+  // instead of `block`.
+  test('a UTF-8 BOM before markup does not hide it from the block tier', () => {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const htmlWithBom = Buffer.concat([bom, Buffer.from('<html><script>x</script>')]);
+    assert.equal(classify({ mime: 'text/plain', filename: 'a.txt', bytes: htmlWithBom }).tier, 'block');
+
+    const svgWithBom = Buffer.concat([bom, Buffer.from('<svg onload=alert(1)>')]);
+    assert.equal(classify({ mime: 'text/plain', filename: 'a.txt', bytes: svgWithBom }).tier, 'block');
+  });
+
   test('zip resolves by extension because the magic bytes cannot', () => {
     assert.equal(classify({ mime: 'application/zip', filename: 'app.apk',  bytes: zip }).tier, 'block');
     assert.equal(classify({ mime: 'application/zip', filename: 'lib.jar',  bytes: zip }).tier, 'block');
