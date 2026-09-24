@@ -207,11 +207,26 @@ test('validateTemplateInput buttons — accepts a legal mix, enforces per-type c
   assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: false, buttons: [...qr(2), ...url(2), ...tel(1)] }), [], 'accepts a legal mix');
   assert.match(validateTemplateInput({ ...okBase, buttons: url(3) }).join(), /at most 2 URL/i, 'rejects 3 URL buttons');
   assert.match(validateTemplateInput({ ...okBase, buttons: tel(2) }).join(), /at most 1 (phone|call)/i, 'rejects 2 phone buttons');
-  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(3) }).join(), /at most 3 quick/i, 'the opt-out button counts toward the 3 quick-reply ceiling');
+  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(10) }).join(), /at most 10 quick/i, 'the opt-out button counts toward the 10 quick-reply ceiling');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop' }] }).join(), /needs a URL/i, 'rejects a URL button with no url');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop', url: 'javascript:alert(1)' }] }).join(), /https?:/i, 'rejects a non-http URL');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', url: 'https://example.com' }] }).join(), /label/i, 'rejects a button with no label');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'COPY_CODE', text: 'x' }] }).join(), /button type/i, 'rejects an unknown button type');
+});
+
+test('validateTemplateInput buttons — 10 quick replies are current Meta policy, not the old 3', () => {
+  assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(9) }), [],
+    '10 total (the opt-out plus 9 more) must be accepted, not just 3');
+});
+
+test('validateTemplateInput buttons — quick replies must sit together, opt-out included', () => {
+  const mixed = validateTemplateInput({ ...okBase, addOptOut: true, buttons: [url(1)[0], qr(1)[0]] }).join();
+  assert.match(mixed, /sit together/i,
+    'the opt-out (index 0) and the operator\'s own QUICK_REPLY (index 2) are split by a URL button — Meta rejects that order');
+
+  assert.deepEqual(
+    validateTemplateInput({ ...okBase, addOptOut: true, buttons: [...qr(2), ...url(1)] }),
+    [], 'both quick replies are contiguous with the opt-out — grouped, so this is fine');
 });
 
 test('the opt-out button is emitted first, before the operator\'s own', () => {

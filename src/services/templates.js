@@ -51,7 +51,7 @@ function renderBody(bodyText, params = []) {
 
 // Meta's ceilings, per button type and overall. The opt-out quick reply counts
 // toward the quick-reply allowance like any other.
-const BUTTON_LIMITS  = { QUICK_REPLY: 3, URL: 2, PHONE_NUMBER: 1 };
+const BUTTON_LIMITS  = { QUICK_REPLY: 10, URL: 2, PHONE_NUMBER: 1 };
 const MAX_BUTTONS    = 10;
 const HEADER_FORMATS = ['TEXT', 'IMAGE', 'VIDEO', 'DOCUMENT'];
 const BUTTON_LABEL   = { QUICK_REPLY: 'quick-reply', URL: 'URL', PHONE_NUMBER: 'call' };
@@ -138,6 +138,11 @@ function validateTemplateInput({ displayName, bodyText, footerText, sampleValues
     if (n > BUTTON_LIMITS[type]) {
       errors.push(`Meta allows at most ${BUTTON_LIMITS[type]} ${BUTTON_LABEL[type]} button${BUTTON_LIMITS[type] > 1 ? 's' : ''} — this has ${n}`);
     }
+  }
+  // Meta rejects a template whose quick replies are split by other button types.
+  const qr = all.map((b, i) => (b?.type === 'QUICK_REPLY' ? i : -1)).filter(i => i >= 0);
+  if (qr.length && qr[qr.length - 1] - qr[0] + 1 !== qr.length) {
+    errors.push('Quick-reply buttons must sit together — move them next to each other (Meta rejects mixed orders).');
   }
 
   return errors;
