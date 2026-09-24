@@ -4083,6 +4083,28 @@ console.log('\nwebhook ingest — what an envelope means');
       'recorded as the customer asking to stop, which only an explicit re-enable may undo');
     markRead(waId);
   });
+
+  // summary() rebuilds the whole thread list — two correlated subqueries per
+  // thread that ever replied — and recordInbound used to emit one per MESSAGE.
+  // Meta batches, so an envelope of fifty replies was fifty rebuilds pushed down
+  // every open socket to render the same final list.
+  testAsync('an envelope of three messages rebuilds the thread list once, not three times', async () => {
+    const senders = ['919000004901', '919000004902', '919000004903'];
+    const three = envelopeOf('messages', {
+      contacts: senders.map((wa_id, i) => ({ wa_id, profile: { name: ['Asha', 'Rahul', 'Sarah'][i] } })),
+      messages: senders.map((from, i) => ({ id: `wamid.batch-${i}`, from, timestamp: '1700000000',
+                                            type: 'text', text: { body: `hello ${i}` } })),
+    });
+    const first = (await listening(() => processEnvelope(three))).filter(h => h.event === 'inbox');
+    assert.equal(first.length, 1,
+      'one thread-list rebuild per webhook — summary() walks every thread that ever replied, and Meta batches');
+    const ids = first[0].payload.threads.map(t => t.waId);
+    assert.ok(senders.every(s => ids.includes(s)), 'and the one it sends already carries all three conversations');
+
+    const again = (await listening(() => processEnvelope(three))).filter(h => h.event === 'inbox');
+    assert.equal(again.length, 0, 'a redelivery records nothing new, so there is nothing to announce');
+    senders.forEach(markRead);
+  });
 }
 
 console.log('\ndiagnostics');

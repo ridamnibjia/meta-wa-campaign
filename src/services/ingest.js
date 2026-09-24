@@ -21,10 +21,11 @@ const inbox = require('./inbox');
 // including the per-contact funnel — and Meta batches statuses, so a single
 // webhook carrying fifty of them was fifty full rebuilds pushed down every open
 // socket to render the same final number. The clients only ever see the last
-// one; the other forty-nine were work nobody could observe.
+// one; the other forty-nine were work nobody could observe. The inbox thread
+// list follows the same rule, for the same reason (see `inbound` below).
 function processEnvelope(body) {
   if (body.object !== 'whatsapp_business_account') return;
-  let changed = false;
+  let changed = false, inbound = 0;
   for (const entry of (body.entry || [])) {
     // Meta stamps every webhook with the WABA ID that produced it. A System User
     // token without business_management cannot look that ID up from the Business
@@ -86,7 +87,9 @@ function processEnvelope(body) {
       const contactsArr = change.value?.contacts || [];
       for (const m of (change.value?.messages || [])) {
         const profileName = contactsArr.find(c => c.wa_id === m.from)?.profile?.name;
-        inbox.recordInbound(m, profileName);
+        // Counted only when something new landed: a redelivery returns null,
+        // and re-announcing an unchanged thread list is work nobody sees.
+        if (inbox.recordInbound(m, profileName)) inbound++;
 
         const label = m.button?.text || m.interactive?.button_reply?.title;
         if (label && label.trim().toLowerCase() === OPT_OUT_LABEL.toLowerCase()) {
@@ -128,6 +131,10 @@ function processEnvelope(body) {
       }
     }
   }
+  // One thread-list rebuild per envelope. recordInbound is the only writer of
+  // inbound rows and emits nothing itself, so this is the one place a reply
+  // reaches the open inbox screens.
+  if (inbound) emit('inbox', inbox.summary());
   if (changed) broadcast();
 }
 
