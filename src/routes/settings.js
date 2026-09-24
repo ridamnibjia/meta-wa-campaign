@@ -9,6 +9,7 @@ const { W, saveWarmup, warmupCap, warmupStep, graduated } = require('../services
 const { missingParams } = require('../services/campaign');
 const diagnostics = require('../services/diagnostics');
 const { replayUnprocessed } = require('../services/ingest');
+const { templateLocked } = require('../services/templates');
 
 const router = express.Router();
 
@@ -18,6 +19,13 @@ router.post('/config', (req, res) => {
   if (phoneNumberId)    CFG.phoneNumberId    = phoneNumberId;
   if (accessToken)      CFG.accessToken      = accessToken;
   if (wabaId)           CFG.wabaId           = wabaId;
+  // A campaign reads S.config.templateName/templateLanguage on every send, so
+  // switching either while one is running sends the rest of the list a
+  // different message. templateLocked is vacuously null when neither field is
+  // present (a request that only touches, say, dailyCap), so this is safe to
+  // call unconditionally ahead of both assignments below.
+  const templateLockMsg = templateLocked(templateName, templateLanguage);
+  if (templateLockMsg) return res.json({ ok: false, error: templateLockMsg });
   if (templateName)     { CFG.templateName     = templateName;     S.config.templateName     = templateName; }
   if (templateLanguage) { CFG.templateLanguage = templateLanguage; S.config.templateLanguage = templateLanguage; }
   if (templateCategory) { CFG.templateCategory = templateCategory; S.config.templateCategory = templateCategory; }

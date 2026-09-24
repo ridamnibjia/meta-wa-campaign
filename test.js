@@ -322,7 +322,125 @@ console.log('\nadopting a template — the attachment picked this session surviv
       'a session pick belongs to the template it was picked for');
   });
 
+  test('adoptTemplate refuses to switch template while a campaign is active', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.phase = 'waiting';
+    try {
+      const r = adoptTemplate('promo_b', shapedFor('promo_b'));
+      assert.deepEqual(r, { ok: false, error: 'A campaign is sending “promo_a” right now — stop it before switching templates.' },
+        'the remaining contacts of a live run must get the message the operator started');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { S.phase = savedPhase; }
+  });
+
+  test('adoptTemplate still allows re-validating the SAME template mid-campaign', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.phase = 'waiting';
+    try {
+      const r = adoptTemplate('promo_a', shapedFor('promo_a'));
+      assert.equal(r, undefined, 'a status refresh of the template already sending must not be refused');
+      assert.equal(S.config.templateStatus, 'APPROVED');
+    } finally { S.phase = savedPhase; }
+  });
+
   Object.assign(S.config, before);   // adoptTemplate writes broadly; leave S as found
+}
+
+console.log('\ntemplate routes — identity locked mid-campaign');
+{
+  // http/express are required locally: the module-level const of the same name
+  // further down the file is in the temporal dead zone at this point in the
+  // file's own top-to-bottom execution.
+  const http    = require('http');
+  const express = require('express');
+
+  const startTemplateServer = () => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/templates'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  };
+  const startSettingsServer = () => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/settings'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  };
+
+  testAsync('/validate-template refuses a different template mid-campaign, and adopts nothing', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/validate-template?name=promo_b`)).json();
+      assert.equal(r.ok, false, 'the remaining contacts of a live run must get the message the operator started');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; }
+  });
+
+  testAsync('/validate-template still lets the same template re-validate mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName, savedToken = CFG.accessToken;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    // No token: fetchTemplates answers 'Access Token not set' rather than hitting
+    // the network. Getting THAT sentence back (not the lock's) is what proves the
+    // request reached the Graph call instead of being refused up front.
+    CFG.accessToken = '';
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/validate-template?name=promo_a`)).json();
+      assert.equal(r.error, 'Access Token not set', 'a same-template refresh reaches the Graph call rather than being refused by the lock');
+      assert.notEqual(r.ok, false, 'a same-template refresh must not read as a lock refusal');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; CFG.accessToken = savedToken; }
+  });
+
+  testAsync('POST /api/config refuses a templateName change mid-campaign, unchanged', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ templateName: 'promo_b' }),
+      })).json();
+      assert.equal(r.ok, false, '/config {templateName} must be refused while a campaign is sending promo_a');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; }
+  });
+
+  testAsync('POST /api/template/create still submits to Meta but does not adopt, mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-id';
+    const real = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).startsWith('http://127.0.0.1')) return real(url, opts);
+      return { ok: true, status: 200, json: async () => ({ id: 'meta-tpl-1', status: 'PENDING' }) };
+    };
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/template/create`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: 'Promo B Lock', bodyText: 'Hi {{1}}, our range is live.', sampleValues: ['Asha'] }),
+      })).json();
+      assert.equal(r.ok, false, 'C4: create still submits but does not adopt mid-campaign');
+      assert.equal(r.adopted, false);
+      assert.equal(S.config.templateName, 'promo_a', 'the live run keeps sending what it started with');
+      assert.ok(getTemplateRow('promo_b_lock'), 'Meta accepted the submission, so the local row still remembers it');
+    } finally {
+      global.fetch = real; s.close();
+      S.phase = savedPhase; S.config.templateName = savedName;
+      CFG.accessToken = savedToken; CFG.wabaId = savedWaba;
+    }
+  });
 }
 
 console.log('\nbuildParams');

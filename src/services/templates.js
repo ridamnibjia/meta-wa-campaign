@@ -1,7 +1,7 @@
 'use strict';
-const { CFG, LIMITS, OPT_OUT_LABEL } = require('../config');
+const { CFG, LIMITS, OPT_OUT_LABEL, TIMEOUTS } = require('../config');
 const { db } = require('../lib/db');
-const { S, log } = require('../state');
+const { S, log, campaignActive } = require('../state');
 const { graphHeaders, graphUrl, graphSend, resolveWabaId } = require('./graph');
 const { explainError } = require('../lib/errors');
 const { broadcast } = require('./status');
@@ -246,9 +246,31 @@ function resizeParamValues(count) {
     prev[i] || { source: i === 0 ? 'name' : 'fixed', value: '' });
 }
 
+// A campaign reads S.config.templateName (and templateLanguage) on every
+// send, so changing either mid-run sends the rest of the list a different
+// message. DELETE was already refused for this reason; adoption, /config and
+// create are the same identity question asked from three different doors.
+// Same-identity re-validation (a status refresh of the template already
+// sending) is allowed — sameName/sameLang are vacuously true when the caller
+// does not name a name or a language at all, which is how routes that never
+// touch identity (like the 15s status poll's bare re-adopt) pass through.
+function templateLocked(name, language) {
+  if (!campaignActive() || !S.config.templateName) return null;
+  const sameName = !name || name === S.config.templateName;
+  const sameLang = !language || language === S.config.templateLanguage;
+  return sameName && sameLang ? null
+    : `A campaign is sending “${S.config.templateName}” right now — stop it before switching templates.`;
+}
+
 // When a template lookup succeeds, make it the active one: remember its status
 // (gates Start) and how many variables its body needs (drives buildParams).
-function adoptTemplate(name, result) {
+function adoptTemplate(name, result, language) {
+  // Defence in depth: /validate-template and /config already check this
+  // before calling in, but /start (routes/campaign.js) calls straight through
+  // to here, so the guard has to hold even when nothing upstream asked first.
+  const lockMsg = templateLocked(name, language);
+  if (lockMsg) return { ok: false, error: lockMsg };
+
   const t = result?.templates?.[0];
   if (!t) {
     if (result && result.found === false) S.config.templateStatus = 'NOT_FOUND';
@@ -358,6 +380,6 @@ async function deleteTemplate(name) {
 module.exports = {
   slugify, templateVars, sanitizeParam, renderBody, validateTemplateInput, buildTemplatePayload,
   shapeTemplate, fetchTemplates, validateTemplate, resizeParamValues, adoptTemplate,
-  deleteTemplate, graphSend,
+  templateLocked, deleteTemplate, graphSend,
   BUTTON_LIMITS, MAX_BUTTONS, saveTemplateRow, getTemplateRow,
 };

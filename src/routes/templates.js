@@ -8,7 +8,7 @@ const { graphSend, resolveWabaId } = require('../services/graph');
 const {
   fetchTemplates, validateTemplate, adoptTemplate, deleteTemplate,
   validateTemplateInput, buildTemplatePayload, templateVars, resizeParamValues,
-  saveTemplateRow,
+  saveTemplateRow, templateLocked,
 } = require('../services/templates');
 const { ensureHandle } = require('../services/media');
 
@@ -26,11 +26,15 @@ router.get('/templates', async (req, res) => {
 });
 
 router.get('/validate-template', async (req, res) => {
-  const { name } = req.query;
+  const { name, language } = req.query;
   if (!name) return res.json({ error: 'Template name is required' });
+  // Checked before the Graph call, not only inside adoptTemplate: a refused
+  // switch should not spend an API call finding out what it already knows.
+  const lockMsg = templateLocked(name, language);
+  if (lockMsg) return res.json({ ok: false, error: lockMsg });
   try {
     const r = await validateTemplate(name);
-    adoptTemplate(name, r);
+    adoptTemplate(name, r, language);
     res.json(r);
   } catch (e) { res.json({ error: e.message }); }
 });
@@ -89,15 +93,44 @@ router.post('/template/create', async (req, res) => {
       return res.json({ ok: false, errors: errs });
     }
 
+    // By type, not by index: components[0] is the HEADER whenever there is one.
+    const bodyComponent = payload.components.find(c => c.type === 'BODY');
+    const submittedStatus = data.status || 'PENDING';
+
+    // Meta has already accepted the template by this point, so the row is
+    // saved either way — this app must not forget what it submitted. Only
+    // ADOPTING it into S.config (making it what the next send goes out as) is
+    // refused: a campaign mid-run reads S.config.templateName on every send,
+    // and this route is the UI's "writing a new template is fine meanwhile"
+    // path, which is exactly the advice that was wrong.
+    const lockMsg = templateLocked(payload.name, payload.language);
+    if (lockMsg) {
+      saveTemplateRow({
+        name:          payload.name,
+        displayName:   input.displayName,
+        language:      payload.language,
+        category:      payload.category,
+        headerFormat:  input.headerFormat,
+        headerText:    input.headerText,
+        headerAssetId: input.headerAssetId,
+        bodyText:      input.bodyText,
+        footerText:    input.footerText,
+        buttons:       input.buttons,
+        varCount:      templateVars(bodyComponent.text).length,
+        status:        submittedStatus,
+      });
+      log('warn', `Template "${payload.name}" submitted but not adopted — ${lockMsg}`);
+      return res.json({ ok: false, error: lockMsg, adopted: false,
+                        name: payload.name, id: data.id, status: submittedStatus });
+    }
+
     S.config.templateName     = payload.name;
     S.config.templateLanguage = payload.language;
     S.config.templateCategory = payload.category;
-    S.config.templateStatus   = data.status || 'PENDING';
+    S.config.templateStatus   = submittedStatus;
     S.config.templateBody     = input.bodyText;
     S.config.headerFormat     = input.headerFormat;
     S.config.headerAssetId    = input.headerAssetId;
-    // By type, not by index: components[0] is the HEADER whenever there is one.
-    const bodyComponent = payload.components.find(c => c.type === 'BODY');
     resizeParamValues(templateVars(bodyComponent.text).length);
     saveTemplateRow({
       name:          payload.name,
