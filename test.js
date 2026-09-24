@@ -6787,6 +6787,42 @@ console.log('\na Reset that lands mid-send');
       S.config.mmLite = saved.mm; S.config.templateCategory = saved.cat; S.config.headerAssetId = saved.header;
     }
   });
+
+  // ── The campaign routes, across their own awaits ────────────────────────────
+  // Meta's answers for /start's two Graph calls: the template list, and the
+  // phone number's account info.
+  const templateList = (name, text = 'Hello') => ({ ok: true, json: async () => ({ data: [{
+    name, status: 'APPROVED', category: 'MARKETING', language: 'en',
+    components: [{ type: 'BODY', text }] }] }) });
+  const accountInfo = () => ({ ok: true, json: async () => ({ quality_rating: 'GREEN', messaging_limit_tier: 'TIER_1K' }) });
+
+  // /start checks the staged run, then awaits two Graph calls with no loop
+  // running and the phase still idle — so a CSV uploaded in another tab passes
+  // its own blocker in that window and stages a NEW run. /start then started
+  // that one: a list nobody had pressed Start for, validated against nothing.
+  testAsync('/start refuses when a CSV upload swaps the staged list during its awaits', async () => {
+    let swapped = null;
+    await withLoop(async url => {
+      if (!String(url).includes('/message_templates')) return accountInfo();
+      // The upload lands while /start is waiting on Meta.
+      swapped = M.stageRun([{ dialStr: '919000033002', name: 'Rahul' }], 'uploaded-in-another-tab');
+      return templateList('swap_check');
+    }, async h => {
+      const { S, flags } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'swap_check';
+      const checked = h.stage([{ dialStr: '919000033001', name: 'Asha' }], 'the-list-that-was-checked');
+      S.phase = 'idle';
+
+      const r = await callRoute('post', '/start');
+      assert.ok(swapped && swapped !== checked, 'the swap really happened, inside the await');
+      assert.deepEqual(r, { ok: false, error: 'The staged list changed while starting — check it and press Start again.' },
+        'a list uploaded in another tab must never be sent without its own Start');
+      assert.equal(flags.running, false, 'no loop was started');
+      assert.notEqual(S.phase, 'running', 'and nothing on screen claims one was');
+      assert.equal(h.row(swapped, '919000033002').attempted_at, null, 'the uploaded list is untouched');
+    });
+  });
 }
 
 // ── The send queue's order, and the plan that makes it affordable ─────────────

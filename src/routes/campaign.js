@@ -91,7 +91,10 @@ router.post('/start', async (req, res) => {
   if (blocked) return res.json({ ok: false, error: blocked });
   if (!CFG.phoneNumberId) return res.json({ ok: false, error: 'Phone Number ID not configured' });
   if (!CFG.accessToken)   return res.json({ ok: false, error: 'Access Token not configured' });
-  const staged = progressForRun(S.currentRunId);
+  // The run every check below is about, read once before the awaits — the same
+  // capture-before-await rule the loop follows for S.currentRunId.
+  const runId  = S.currentRunId;
+  const staged = progressForRun(runId);
   if (!staged.total) return res.json({ ok: false, error: 'Upload a CSV first' });
   if (!staged.pending) return res.json({ ok: false, error: 'Every contact in this run has already been attempted. Upload a CSV to start a new one.' });
 
@@ -128,6 +131,15 @@ router.post('/start', async (req, res) => {
   // value cached from whenever the dashboard last loaded.
   const info = await fetchAccountInfo().catch(() => ({}));
   if (info.qualityRating) S.quality = info.qualityRating;
+
+  // Two awaits above, and no loop is running during them, so a CSV upload in
+  // another tab passes its own campaignBlocker() here and stages a new run.
+  // Starting now would send THAT list — with no Start pressed for it and none of
+  // the checks above made against it. Refused rather than restarted: the
+  // operator has not seen the list that is now staged.
+  if (S.currentRunId !== runId) {
+    return res.json({ ok: false, error: 'The staged list changed while starting — check it and press Start again.' });
+  }
 
   // The queue was staged at upload and is NOT rebuilt here. Rebuilding would
   // reset every wamid, and /start after a pause would re-send to everyone who
