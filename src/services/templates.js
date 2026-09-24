@@ -271,9 +271,22 @@ function adoptTemplate(name, result, language) {
   const lockMsg = templateLocked(name, language);
   if (lockMsg) return { ok: false, error: lockMsg };
 
-  const t = result?.templates?.[0];
+  // Exact name first — Graph's own &name= filter should already guarantee
+  // this, but a caller can hand in an unfiltered list (fetchTemplates() with
+  // no name), and a fuzzy match here would adopt the wrong template's status
+  // and body under a name the operator did not pick. With no language given,
+  // prefer an APPROVED variant — the one that can actually send — over
+  // whichever Graph happened to list first.
+  const list = (result?.templates || []).filter(x => x.name === name);
+  const t = language ? list.find(x => x.language === language)
+                     : (list.find(x => x.status === 'APPROVED') || list[0]);
   if (!t) {
-    if (result && result.found === false) S.config.templateStatus = 'NOT_FOUND';
+    // NOT_FOUND either way: the name matched nothing, or it matched but not
+    // this language — an explicit language Meta has no variant for must not
+    // silently fall back to a different one and send it. A fetch error
+    // (result.error set) is the one case left alone: "could not ask Meta" is
+    // not the same fact as "Meta says this does not exist".
+    if (result && !result.error) S.config.templateStatus = 'NOT_FOUND';
     return;
   }
   // Read BEFORE templateName is overwritten: re-adopting the template that is

@@ -348,6 +348,55 @@ console.log('\nadopting a template — the attachment picked this session surviv
   Object.assign(S.config, before);   // adoptTemplate writes broadly; leave S as found
 }
 
+console.log('\nadoptTemplate — language variants');
+{
+  const { adoptTemplate } = require('./server');
+  const before = JSON.parse(JSON.stringify(S.config));
+  const variants = { found: true, templates: [
+    { name: 'promo', language: 'en', status: 'REJECTED', category: 'MARKETING', bodyText: 'Hi {{1}}, en copy.', headerFormat: null, headerText: null },
+    { name: 'promo', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy.', headerFormat: null, headerText: null },
+  ] };
+
+  test('an explicit language adopts that variant, not whichever came first', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants, 'hi');
+    assert.equal(S.config.templateLanguage, 'hi');
+    assert.equal(S.config.templateStatus, 'APPROVED');
+    assert.equal(S.config.templateBody, 'Hi {{1}}, hi copy.');
+  });
+
+  test('no language given prefers the APPROVED variant over whichever Graph listed first', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants);
+    assert.equal(S.config.templateLanguage, 'hi', 'hi is APPROVED and en (listed first) is REJECTED');
+    assert.equal(S.config.templateStatus, 'APPROVED');
+  });
+
+  test('an explicit language Meta has no variant for is NOT_FOUND, not a silent fallback to another', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants, 'fr');
+    assert.equal(S.config.templateStatus, 'NOT_FOUND',
+      'sending under "fr" when only en/hi exist would be worse than silently sending a different language');
+  });
+
+  test('exact name beats a fuzzy match — a differently-named entry is never selected', () => {
+    const withDecoy = { found: true, templates: [
+      ...variants.templates,
+      // Graph's own &name= filter would never return this for name=promo;
+      // kept to prove the local selection does not trust an unfiltered
+      // result either. APPROVED, so a filter that forgot the name check
+      // would wrongly prefer it over BOTH real "promo" variants.
+      { name: 'promo_2', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'decoy', headerFormat: null, headerText: null },
+    ] };
+    S.config.templateName = '';
+    adoptTemplate('promo', withDecoy);
+    assert.equal(S.config.templateLanguage, 'hi', 'still the APPROVED promo variant, never promo_2');
+    assert.notEqual(S.config.templateBody, 'decoy');
+  });
+
+  Object.assign(S.config, before);
+}
+
 console.log('\ntemplate routes — identity locked mid-campaign');
 {
   // http/express are required locally: the module-level const of the same name
