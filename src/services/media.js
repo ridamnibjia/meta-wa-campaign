@@ -168,7 +168,12 @@ function saveUpload(file) {
     return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Delete a file you no longer send from the library, then try again. Nothing was saved.` };
   }
 
-  const ext  = (path.extname(file.originalname || '') || '').slice(0, 10).toLowerCase();
+  // extOf, not path.extname: the originalname is operator-supplied and this is
+  // the only one of them that reaches a filesystem path. path.extname does not
+  // validate characters, so a NUL byte survives into `name` below and Node's
+  // fs calls throw on any path containing one; extOf drops anything outside
+  // [a-z0-9] instead of passing it through.
+  const ext  = extOf(file.originalname);
   const name = `${sha}${ext}`;
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   fs.writeFileSync(path.join(UPLOAD_DIR, name), file.buffer);

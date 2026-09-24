@@ -2141,6 +2141,15 @@ console.log('\nmedia — saveUpload');
     assert.match(d.error, /outside the uploads directory/);
   });
 
+  test('an originalname with a NUL byte in its extension never throws', () => {
+    // path.extname does not validate characters — a NUL byte survives into the
+    // filename fs.writeFileSync is given, and Node refuses any path containing
+    // one. extOf drops anything outside [a-z0-9] from the extension instead.
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 nul-ext ${Math.random()}`), 'x.a\u0000b', 'application/pdf'));
+    assert.equal(typeof r, 'object');
+    assert.equal(r.ok, true, r.error);
+  });
+
   test('kindFor maps each accepted type to its kind', () => {
     assert.equal(kindFor('image/png'), 'image');
     assert.equal(kindFor('video/mp4'), 'video');
