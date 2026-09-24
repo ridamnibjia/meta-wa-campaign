@@ -4687,6 +4687,7 @@ console.log('\nmedia routes');
 
 console.log('\nmedia — Meta identifiers');
 {
+  const fsx = require('fs');
   const seed = () => {
     const r = saveUpload({ buffer: Buffer.from(`bytes-${Math.random()}`),
                            originalname: 'sheet.pdf', mimetype: 'application/pdf' });
@@ -4776,6 +4777,19 @@ console.log('\nmedia — Meta identifiers');
     } finally { CFG.appId = savedApp; }
   });
 
+  testAsync('ensureHandle refuses a missing file before any fetch, not with a network error', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    fsx.unlinkSync(assetPath(getAsset(id)));   // e.g. wa.db restored without the uploads directory
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch for a file that is not on disk'); },
+        () => ensureHandle(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i, 'not "Could not reach graph.facebook.com" — there was nothing to send it');
+    } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
   testAsync('ensureMediaId uploads once and caches', async () => {
     const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
     CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
@@ -4819,6 +4833,19 @@ console.log('\nmedia — Meta identifiers');
       await withFetch(() => json({ id: 'bbb' }), async () => {
         assert.equal((await ensureMediaId(id, { force: true })).mediaId, 'bbb');
       });
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  testAsync('ensureMediaId refuses a missing file before any fetch, not with a network error', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    fsx.unlinkSync(assetPath(getAsset(id)));
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch for a file that is not on disk'); },
+        () => ensureMediaId(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i);
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
 
