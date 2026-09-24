@@ -2326,6 +2326,36 @@ test('an outbound send to a thread that replied leaves the window intact', () =>
 });
 
 console.log('\nstate snapshot');
+// buildState() costs more as a run grows — about a third of a second at 100k
+// contacts — while the broadcast window was a fixed 250 ms. Once one rebuild
+// outlasts the window, rebuilding state is all the event loop does, and webhook
+// acknowledgements queue behind it. Driven through the real coalescer with a
+// rebuild the test controls, rather than by seeding a run big enough to be slow.
+testAsync('broadcast — a slow rebuild stretches the window to 4× its cost, and the last state still lands', async () => {
+  const { coalesce, coalesceDelay } = require('./src/services/status');
+  assert.equal(coalesceDelay(10), 250, 'a cheap rebuild keeps the 250 ms floor, so one event still feels instant');
+  assert.equal(coalesceDelay(300), 1200, 'rebuilds may never take more than about a quarter of the event loop');
+
+  const BUILD = 70;                            // 4 × 70 = 280 ms — past the floor
+  const sent = [];
+  let state = 0;
+  const fire = coalesce(() => {
+    const t = performance.now();
+    while (performance.now() - t < BUILD) {}   // synchronous, as buildState is
+    sent.push({ state, at: performance.now() });
+  });
+  state = 1; fire();                           // leading edge: sent at once
+  state = 2; fire();                           // inside the window: deferred…
+  state = 3; fire();                           // …and folded into the same trailing send
+  assert.equal(sent.length, 1, 'the leading edge is not delayed — a single event still arrives at once');
+
+  const until = Date.now() + 3000;
+  while (sent.length < 2 && Date.now() < until) await new Promise(r => setTimeout(r, 20));
+  assert.equal(sent.length, 2, 'three calls inside one window cost two rebuilds, not three');
+  assert.ok(sent[1].at - sent[0].at >= 4 * BUILD,
+    `sent ${Math.round(sent[1].at - sent[0].at)} ms apart — the window must stretch with the cost of a rebuild`);
+  assert.equal(sent[1].state, 3, 'and the trailing edge carries the LAST state: deferred, never dropped');
+});
 test('displayed counters are derived from the current run', () => {
   const runId = startRun('snapshot-run');
   recordOutbound({ wamid: 'snap-1', waId: '919911000001', name: 'One', body: 'x', runId });
