@@ -633,7 +633,19 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
   // Already here. A Preview on a kept file must not demote it back to
   // provisional and put a 24-hour clock on something an operator kept on
   // purpose, so this returns the row as it stands rather than re-stamping it.
-  if (row.path) return { ok: true, media: row, already: true };
+  //
+  // The mirror case: Save on a row a Preview already fetched must not re-pull
+  // bytes already on disk, but it DOES have to drop the 24-hour preview clock
+  // — Preview and Save are the same fetch on different clocks, and this is
+  // the moment an operator moves from one to the other without asking Meta
+  // again.
+  if (row.path) {
+    if (row.provisional && !provisional) {
+      setKept.run(row.media_id);
+      return { ok: true, media: getInbound(mediaId), promoted: true };
+    }
+    return { ok: true, media: row, already: true };
+  }
   // Terminal, and deliberately checked before the expiry and token checks: a
   // file we have already identified as malware must not be re-fetched just
   // because someone clicked Save twice.

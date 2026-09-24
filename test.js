@@ -5835,6 +5835,19 @@ console.log('\ninbound media — save, serve, expire');
         'a Preview click must not put a 24-hour clock on something kept on purpose');
     });
 
+    // The mirror of the test above: Save on an already-previewed row must not
+    // re-fetch bytes already on disk, but it DOES have to drop the 24-hour
+    // preview clock — Preview and Save are the same fetch on different clocks.
+    testAsync('Save on an already-previewed row promotes it without re-fetching', async () => {
+      const id = await previewOne();
+      assert.equal(getInbound(id).provisional, 1, 'starts on the short preview clock');
+      const r = await withMeta(() => { throw new Error('Save must not re-fetch bytes already on disk'); },
+        () => saveInbound(id, { provisional: false }));
+      assert.equal(r.ok, true, r.error);
+      assert.equal(r.promoted, true, 'the route needs to know this was a promotion, not a fresh save');
+      assert.equal(getInbound(id).provisional, 0, 'Save moves it onto the 90-day clock like any other kept file');
+    });
+
     testAsync('Keep refuses a row with nothing on disk', () => {
       const id = seedInbound({ bytes: Buffer.from([0xff, 0xd8, 0xff, 0x01]) });
       const r = keepInbound(id);
