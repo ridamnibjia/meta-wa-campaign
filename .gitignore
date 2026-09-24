@@ -42,6 +42,11 @@ docs/
 # Local Claude Code settings — per-contributor, not project config.
 .claude/
 
+# Planning workspace. A nested .gitignore under .superpowers/sdd/ already
+# covers most of this, but its working files have quoted the real hosting
+# username before — a root-level rule is cheap insurance on a public repo.
+.superpowers/
+
 # Never commit a real contact list. Phone numbers are personal data, and a
 # public repo is a permanent, indexed copy. contacts-template.csv is the
 # exception — it is synthetic and deliberately tracked.

@@ -25,3 +25,4 @@ campaign.json
 .playwright-mcp/
 test.js
 .DS_Store
+Thumbs.db

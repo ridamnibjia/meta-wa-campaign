@@ -6810,7 +6810,7 @@ console.log('\ndeployment files');
 test('.dockerignore keeps secrets and customer data out of image layers', () => {
   const lines = fsx.readFileSync(pathx.join(__dirname, '.dockerignore'), 'utf8')
     .split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
-  for (const must of ['.env*', '*.db', '*.db-wal', '.git', '*.csv', 'media/', 'uploads/', 'docs/', 'campaign.json', 'warmup.json'])
+  for (const must of ['.env*', '*.db', '*.db-wal', '.git', '*.csv', 'media/', 'uploads/', 'docs/', 'campaign.json', 'warmup.json', 'Thumbs.db'])
     assert.ok(lines.includes(must), `${must} must stay out of the image — COPY . . ignores .gitignore`);
 });
 test('the image runs as a non-root user and binds all interfaces inside the container', () => {
@@ -6850,12 +6850,16 @@ test('CI runs the real suite on every push and PR, and reports audit advisories 
 test('.gitignore keeps local assistant settings out of the public repo', () => {
   const lines = fsx.readFileSync(pathx.join(__dirname, '.gitignore'), 'utf8').split('\n').map(s => s.trim());
   assert.ok(lines.includes('.claude/'), 'a contributor\'s local Claude Code settings are not this project\'s to publish');
+  // A root-level rule is cheap protection even though a nested .gitignore under
+  // .superpowers/sdd/ already covers most of it: this repo's planning workspace
+  // has quoted the real hosting username in its working files before.
+  assert.ok(lines.includes('.superpowers/'), 'the planning workspace can quote real infrastructure details and must never reach a public commit');
 });
 test('README documents only a deployment the session cookie can actually authenticate on', () => {
   const md = fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8');
   assert.doesNotMatch(md, /Cloudflare Pages \(frontend\) \+ Render \(backend\)/,
     'a split frontend/backend deploy cannot log in — the session cookie is sameSite: strict and never rides cross-site');
-  assert.doesNotMatch(md, /setup screen asking for your backend URL/,
+  assert.doesNotMatch(md, /setup screen asking for your .*backend URL/,
     'that screen does not exist in the code; the README must not promise a feature that was never built');
   assert.match(md, /\bBIND_HOST\b/, 'the bind-host env var must be documented now that Docker and Render both set it differently than the 127.0.0.1 default');
   assert.match(md, /\bWA_DATA_DIR\b/, 'the data directory env var must be documented for anyone running this outside the repo root, e.g. the Docker volume');
