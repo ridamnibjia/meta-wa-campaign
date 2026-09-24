@@ -1,5 +1,5 @@
 'use strict';
-const { CFG, FILES, QUIET_HOURS } = require('../config');
+const { CFG, FILES, QUIET_HOURS, TIMEOUTS } = require('../config');
 const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
 const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep } = require('../state');
 const { broadcast } = require('./status');
@@ -165,9 +165,14 @@ async function sendTemplate(contact) {
     if (params.length) components.push({ type: 'body', parameters: params });
     if (components.length) body.template.components = components;
 
+    // A timeout of its own, read per call: the loop is single, and with no
+    // signal a wedged connection held it — and Stop — on undici's five-minute
+    // timers, once per contact. An abort throws into the catch below, which is
+    // already the transient -1 path: back off seconds, retry this contact.
     const res = await fetch(
       `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/${endpoint}`,
-      { method: 'POST', headers: graphHeaders(), body: JSON.stringify(body) }
+      { method: 'POST', headers: graphHeaders(), body: JSON.stringify(body),
+        signal: AbortSignal.timeout(TIMEOUTS.graphMs) }
     );
     return { res, data: await res.json() };
   };

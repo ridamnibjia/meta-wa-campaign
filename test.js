@@ -6925,6 +6925,50 @@ console.log('\na Reset that lands mid-send');
     }
   });
 
+  // A connection that never answers is the other half of "fetch threw". With no
+  // signal, fetch waits on undici's own ~5-minute timers, and the loop is single
+  // — so one wedged socket held every remaining send, and Stop, for minutes per
+  // contact. The stub hangs forever unless it is handed a signal, and only the
+  // signal's abort ends it; the race is here so a regression fails rather than
+  // hanging the suite.
+  const hungFetch = (u, o = {}) => new Promise((_, rej) =>
+    o.signal?.addEventListener('abort', () => rej(o.signal.reason)));
+  const orHang = (p, ms = 1000) => Promise.race([p, new Promise(r => setTimeout(() => r('still waiting'), ms))]);
+
+  testAsync('a campaign send that never answers times out into the transient path', async () => {
+    const { TIMEOUTS } = require('./src/config');
+    const saved = { fetch: global.fetch, graphMs: TIMEOUTS.graphMs, header: S.config.headerAssetId };
+    TIMEOUTS.graphMs = 20; S.config.headerAssetId = null;
+    global.fetch = hungFetch;
+    try {
+      const t0 = Date.now();
+      const r = await orHang(M.sendTemplate({ name: 'X', dialStr: '919300000905' }));
+      assert.notEqual(r, 'still waiting', 'the send must carry a timeout — without one a wedged socket holds the whole loop');
+      assert.equal(r.errorCode, -1, 'an abort is a network failure like any other…');
+      assert.equal(r.transient, true, '…so the loop backs off and retries this contact in seconds, not on the ladder');
+      assert.ok(Date.now() - t0 < 500, 'and it is the Graph timeout that ended it, not a five-minute one');
+    } finally {
+      global.fetch = saved.fetch; TIMEOUTS.graphMs = saved.graphMs; S.config.headerAssetId = saved.header;
+    }
+  });
+
+  testAsync('every Graph helper call carries the timeout too', async () => {
+    const { TIMEOUTS } = require('./src/config');
+    const saved = { fetch: global.fetch, graphMs: TIMEOUTS.graphMs };
+    TIMEOUTS.graphMs = 20;
+    global.fetch = hungFetch;
+    try {
+      // /start awaits this with the loop not yet running; hung, Start never answered.
+      const info = await orHang(M.fetchAccountInfo().catch(e => e));
+      assert.notEqual(info, 'still waiting', 'fetchAccountInfo must give up rather than hang /start and /account-info');
+      assert.match(String(info?.name || info), /TimeoutError|AbortError/, 'it gives up with the abort, which every caller already catches');
+      const sent = await orHang(M.graphSend('POST', 'test-phone/messages', { x: 1 }).catch(e => e));
+      assert.notEqual(sent, 'still waiting', 'graphSend carries the inbox replies — a hung one held the operator\'s request open');
+    } finally {
+      global.fetch = saved.fetch; TIMEOUTS.graphMs = saved.graphMs;
+    }
+  });
+
   // MM Lite: same payload, sibling endpoint, marketing templates only. A WABA
   // that has not signed the MM Lite ToS is routed back through the Cloud API by
   // Meta itself, which is why the flag is safe to expose.
