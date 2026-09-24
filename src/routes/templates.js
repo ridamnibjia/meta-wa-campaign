@@ -156,29 +156,6 @@ router.post('/template/create', async (req, res) => {
   }
 });
 
-// Polled by the UI every 15s while a template is PENDING.
-router.get('/template/status', async (req, res) => {
-  const name = req.query.name || S.config.templateName;
-  if (!name) return res.json({ error: 'Template name is required' });
-  try {
-    const r = await validateTemplate(name);
-    adoptTemplate(name, r);
-    const t = r?.templates?.[0];
-    res.json({
-      name,
-      found:          !!t,
-      status:         t?.status || (r.error ? null : 'NOT_FOUND'),
-      category:       t?.category || null,
-      language:       t?.language || null,
-      bodyText:       t?.bodyText || null,
-      rejectedReason: t?.rejectedReason || null,
-      qualityScore:   t?.qualityScore || null,
-      paramCount:     S.config.paramCount,
-      error:          r.error || null,
-    });
-  } catch (e) { res.json({ error: e.message }); }
-});
-
 // Deletion is permanent on Meta's side and takes every language variant with it.
 // Refused mid-campaign: deleting the template a running loop is sending would
 // turn every remaining contact into a failure.
