@@ -10,7 +10,7 @@ const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
         nextRetryForRun, progressForRun, senderThrottleUntil, slotFreesAt } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
-const { explainError, skipDisposition, haltsCampaign } = require('../lib/errors');
+const { explainError, skipDisposition, haltsCampaign, disableReasonFor } = require('../lib/errors');
 const { deferPastQuietHours, nextIstMidnight } = require('../lib/schedule');
 const { graphHeaders, fetchAccountInfo } = require('./graph');
 const { headerComponent } = require('./media');
@@ -116,8 +116,10 @@ function missingParams() {
 
 // The codes sendTemplate reports as a skip rather than a failure — each one is
 // about the recipient or the moment, never about the request itself. One list,
-// asked of both the code and the subcode.
-const SKIPPABLE = [131026, 131047, 131049, 131051];
+// asked of both the code and the subcode. 131050 (marketing turned off by the
+// person, in WhatsApp) is about the recipient like 131026: a skip, not a failure
+// the operator can fix, and one Meta can signal as a subcode too.
+const SKIPPABLE = [131026, 131047, 131049, 131050, 131051];
 
 // ── Meta Cloud API — send one template message ─────────────────────────────────
 async function sendTemplate(contact) {
@@ -372,6 +374,12 @@ function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
 // different idea of which codes count. Which ones do is
 // lib/errors.js:skipDisposition; `permanent` is its name for exactly this.
 //
+// Not every permanent code is about the number. 131050 is the person turning
+// marketing from this business off inside WhatsApp: switched off just the same,
+// but as an opt-out (lib/errors.js:disableReasonFor), so the report files them
+// with the people who asked us to stop rather than calling them "not on
+// WhatsApp" — and the log line says which of the two it was.
+//
 // disable() writes both the contacts row and the suppressed row, and it is a
 // no-op when the contact is already off for the same reason — so a redelivered
 // webhook, a replayed envelope and a second run all cost nothing. The
@@ -381,8 +389,11 @@ function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
 // Returns true only on the transition, so the caller logs once.
 function suppressIfPermanent(dialStr, code, name = null, prefix = '') {
   if (skipDisposition(code) !== 'permanent') return false;
-  if (!disable(dialStr, 'failed_hard', name)) return false;
-  log('warn', `${prefix} ${name || '+' + dialStr} switched off — Meta reports this number as undeliverable (usually: not on WhatsApp), so no later run will try it`.trim());
+  const reason = disableReasonFor(code);
+  if (!disable(dialStr, reason, name)) return false;
+  log('warn', `${prefix} ${name || '+' + dialStr} switched off — ${reason === 'opt_out'
+    ? 'they turned off marketing from you in WhatsApp, so no later run will message them unless they opt back in'
+    : 'Meta reports this number as undeliverable (usually: not on WhatsApp), so no later run will try it'}`.trim());
   return true;
 }
 
@@ -822,9 +833,11 @@ async function campaignLoop() {
       log('success', `${n} accepted — ${capWindow() === '24h' ? 'last 24h' : 'today'}:${capCount()}/${cap ?? 'no cap'}`);
     } else if (result.skip) {
       // A property of the NUMBER, not of the attempt: not on WhatsApp, or
-      // blocked by Meta on quality grounds. Retrying it is never right, and left
-      // enabled it burns a send slot on every run, forever. The other skippable
-      // codes are about the moment, so they change nothing.
+      // blocked by Meta on quality grounds — or the person's own choice, having
+      // turned our marketing off in WhatsApp (131050, switched off as an
+      // opt-out). Retrying is never right, and left enabled it burns a send
+      // slot on every run, forever. The other skippable codes are about the
+      // moment, so they change nothing.
       suppressIfPermanent(contact.dialStr, result.errorCode, contact.name, n);
       // 131049 lands here: the per-person marketing cap is about the moment, so
       // it goes back on the queue rather than out of the run.

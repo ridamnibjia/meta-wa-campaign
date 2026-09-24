@@ -34,6 +34,12 @@ const META_ERRORS = {
   // Left unclassified on purpose, which is exactly "reported, never retried,
   // never written off" — this entry is here so that report is a sentence rather
   // than a bare number.
+  // A policy about WHERE this business may send, not about the number or the
+  // moment — typically marketing templates to US numbers. Deliberately not in
+  // RETRY (every attempt inside the block fails the same way) and not PERMANENT
+  // (the block can lift, and the number is fine): unclassified is exactly
+  // "reported, never retried, never written off".
+  130497: ['Meta blocks this business from messaging users in that country', 'Typically marketing templates to US numbers. Not retried — every attempt fails the same way while the block stands — and the contact stays on your list, because the block can lift and nothing is wrong with the number.'],
   130472: ['Meta held this one back for an experiment', 'This recipient is in a Meta marketing-message holdout group — a slice of users Meta excludes to measure how the rest respond. Not your error, nothing is wrong with the number, and nothing on your side fixes it. It is not retried, because these windows run for days or weeks and every attempt inside one fails the same way. Include them in a later campaign.'],
   131000: ['Meta-side error, cause unspecified',      'Transient. Retry the campaign; if every send fails, check status at metastatus.com.'],
   131008: ['A required parameter was missing',        'Template variables do not match the approved template. Re-run Check Template.'],
@@ -55,6 +61,10 @@ const META_ERRORS = {
   // quality rating that gates the messaging tier. The retry ladder is the
   // answer, and it is already running.
   131049: ['Meta chose not to deliver this one',      'This recipient hit their per-user marketing limit — a rolling, per-person cap Meta applies across every business messaging them. Not your error, and nothing on your side fixes it. The campaign retries them automatically about once a day, up to three more times — Meta itself asks for at least 24 hours between attempts, and retrying sooner extends the block.'],
+  // The PERSON's choice, made inside WhatsApp — not a fact about the number, and
+  // not something a retry changes. Switched off as an opt-out (disableReasonFor
+  // below), so the report files them with the people who asked us to stop.
+  131050: ['This person turned off marketing messages from your business inside WhatsApp', 'They have been switched off like an opt-out, so later campaigns skip them. Re-enable them only if they opt back in.'],
   131051: ['Unsupported message type',                'The template was changed after approval. Re-run Check Template.'],
   131052: ['The media file could not be downloaded',  'Meta could not fetch the file for this message. Re-pick or re-upload the attachment.'],
   131053: ['The media file could not be uploaded',    'Meta refused the file — usually an unsupported type or a corrupt upload. Re-export it and upload again.'],
@@ -90,9 +100,11 @@ function explainError(code) {
 //   'retry'      — the send failed because of this moment. A rate limit, a Meta
 //                  outage, a per-user marketing cap that resets. Trying again
 //                  on another day is reasonable and may well work.
-//   'permanent'  — the send failed because of this NUMBER. Not on WhatsApp,
-//                  blocked on quality grounds. Retrying is never right, and the
-//                  contact has already been disabled with 'failed_hard'.
+//   'permanent'  — the send failed because of this NUMBER, or because of the
+//                  person's own choice. Not on WhatsApp, blocked on quality
+//                  grounds, marketing turned off inside WhatsApp. Retrying is
+//                  never right, and the contact has already been disabled — with
+//                  the reason disableReasonFor gives.
 //   'fix'        — the send failed because of something on OUR side that a
 //                  human can correct: a template that needs re-approval, a
 //                  billing problem, a bad variable. Retrying unchanged repeats
@@ -129,9 +141,21 @@ const SKIP_DISPOSITIONS = ['retry', 'permanent', 'fix', 'unclassified'];
 //   131057 is Meta's own maintenance mode.
 const RETRY = new Set([-1, 4, 80007, 130429, 131000, 131016, 131048, 131049, 131056, 131057]);
 
-// About the NUMBER. No amount of retrying changes the answer, and the contact
-// has already been disabled with 'failed_hard' by the campaign loop.
-const PERMANENT = new Set([131026]);
+// About the NUMBER — or, for 131050, about the person's own choice. No amount of
+// retrying changes the answer, and campaign.js:suppressIfPermanent has already
+// switched the contact off, with the reason disableReasonFor gives.
+//   131026 undeliverable: not on WhatsApp, or blocked on quality grounds.
+//   131050 they turned off marketing messages from this business in WhatsApp.
+const PERMANENT = new Set([131026, 131050]);
+
+// WHY a permanent code switches the contact off. 131050 is the person saying
+// stop, so it is an opt-out — filed with the people who asked us to stop, never
+// as "not on WhatsApp", which would be the report inventing a fact about their
+// number. Every other permanent code is about the number: 'failed_hard'. The
+// funnel splits its buckets on this same answer (messages.js:bucketOf for the
+// attempted half, the disabled_reason it writes for the never-attempted half),
+// so a code cannot be an opt-out on one screen and unreachable on another.
+const disableReasonFor = code => (Number(code) === 131050 ? 'opt_out' : 'failed_hard');
 
 // About US. A human can correct the cause, and doing so makes the whole
 // remaining list sendable — which is why these are not 'retry': retrying
@@ -185,4 +209,4 @@ const SENDER_LEVEL = new Set([131048]);
 const isSenderLevel = code => SENDER_LEVEL.has(Number(code));
 
 module.exports = { META_ERRORS, explainError, skipDisposition, SKIP_DISPOSITIONS, haltsCampaign,
-                   SENDER_LEVEL, isSenderLevel };
+                   SENDER_LEVEL, isSenderLevel, disableReasonFor };

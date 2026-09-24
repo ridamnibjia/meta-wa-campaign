@@ -1,7 +1,7 @@
 'use strict';
 const { db } = require('../lib/db');
 const { S, flags, campaignActive, log } = require('../state');
-const { explainError, skipDisposition, SENDER_LEVEL } = require('../lib/errors');
+const { explainError, skipDisposition, SENDER_LEVEL, disableReasonFor } = require('../lib/errors');
 
 // An unknown ID means a message this server never sent — traffic from another
 // tool on the same number, or a status for a message from before the SQL store.
@@ -585,7 +585,12 @@ const funnelQ = db.prepare(`
 function bucketOf(raw, code) {
   if (raw === 'read')   return 'delivered';
   if (raw !== 'gaveUp') return raw;
-  return skipDisposition(code) === 'permanent' ? 'unreachable' : 'failed';
+  if (skipDisposition(code) !== 'permanent') return 'failed';
+  // A permanent code that is the person's own choice (131050) is an opt-out,
+  // not an undeliverable number — the same split BUCKET_CASE makes for the
+  // never-attempted half through c.disabled_reason, and from the same answer
+  // suppressIfPermanent wrote there, so the two halves cannot disagree.
+  return disableReasonFor(code) === 'opt_out' ? 'optedOut' : 'unreachable';
 }
 
 const ZERO_FUNNEL = {
@@ -598,7 +603,8 @@ const ZERO_FUNNEL = {
 // "not on WhatsApp". It gathers both halves of that fact: someone disabled by an
 // EARLIER run's hard failure and never attempted here, and someone attempted
 // here who came back 131026. Which codes count is lib/errors.js:skipDisposition,
-// not a list kept twice.
+// not a list kept twice — and 131050, permanent but the person's own choice,
+// goes to optedOut beside the people who asked us to stop (bucketOf above).
 function funnelForRun(runId) {
   const f = { ...ZERO_FUNNEL };
   if (runId == null) return f;

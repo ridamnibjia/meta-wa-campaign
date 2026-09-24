@@ -1069,6 +1069,30 @@ console.log('\nthe funnel — every contact in exactly one bucket');
     assert.equal(sums(f), f.total);
   });
 
+  // An ATTEMPTED contact reaches optedOut only through bucketOf — the half of the
+  // rule SQL cannot express — so 131050 is exactly where the card and the list
+  // behind it could disagree, if one asked bucketOf and the other did not.
+  test('a contact who turned marketing off is an opt-out in the counts and the list alike', () => {
+    const run = openRun('funnel-131050');
+    const p = who(3);
+    buildRun(run, p);
+    recordRecipientSkipped(run, p[0].dialStr, 'failed', 131050);             // met at send time
+    recordRecipientSent(run, p[1].dialStr, 'fo-1');                           // accepted, refused by webhook
+    out({ wamid: 'fo-1', waId: p[1].dialStr, name: p[1].name, body: 'x', runId: run });
+    applyStatus({ id: 'fo-1', status: 'failed', errors: [{ code: 131050, title: 'x' }] });
+    recordRecipientSkipped(run, p[2].dialStr, 'skipped', 131026);           // a number that cannot receive
+
+    const f = funnelForRun(run);
+    assert.equal(f.optedOut, 2, 'both entrances file a 131050 with the opt-outs');
+    assert.equal(f.unreachable, 1, 'only the number Meta cannot deliver to is unreachable');
+    assert.equal(sums(f), f.total, 'and the buckets still sum to the list');
+    const counted = {};
+    for (const r of M.recipientsForRun(run)) counted[r.bucket] = (counted[r.bucket] || 0) + 1;
+    for (const k of ['delivered', 'sent', 'pending', 'retrying', 'failed', 'unreachable', 'optedOut']) {
+      assert.equal(counted[k] || 0, f[k], `the "${k}" list has ${counted[k] || 0} contacts but the card says ${f[k]}`);
+    }
+  });
+
   // A delivery failure the webhook put back on the ladder un-stamps the wamid.
   // The contact is owed another attempt, so they read as retrying rather than as
   // the send Meta already refused.
@@ -1137,6 +1161,43 @@ console.log('\nundeliverable numbers switch themselves off');
       assert.equal(h.row(run, phone).error_code, 131026, 'and the queue row carries the code the report explains');
     });
   });
+
+  // 131050 is the person turning marketing from this business off inside
+  // WhatsApp. Switched off by the same one decision, but as an OPT-OUT: filed
+  // with the people who asked us to stop, never with the numbers that cannot
+  // receive messages — and still off when the next run is staged.
+  testAsync('a 131050 at send time switches the contact off as an opt-out, not as unreachable', async () => {
+    const phone = '919400000031';
+    await withLoop(async () => graphErr({ code: 131050, message: 'Unable to deliver message: the user has stopped marketing messages' }), async h => {
+      const run = h.stage([{ dialStr: phone, name: 'Asha' }], 'optout-send');
+      h.start();
+      await h.until(() => h.M.S.phase === 'done');
+      assert.equal(M.contacts.getRow(phone)?.disabled_reason, 'opt_out',
+        'they asked to stop — "not on WhatsApp" would be the report inventing a fact about their number');
+      const f = M.funnelForRun(run);
+      assert.equal(f.optedOut, 1, 'counted with the people who asked us to stop');
+      assert.equal(f.unreachable, 0, 'and not as a number Meta cannot deliver to');
+      assert.equal(f.delivered + f.sent + f.pending + f.retrying + f.failed + f.unreachable + f.optedOut, f.total,
+        'the buckets still sum to the list');
+      assert.equal(h.row(run, phone).skipped_reason, 'skipped',
+        'a skip, like 131026 — an opt-out is not a failure the operator can fix');
+      assert.equal(h.M.S.failLog.some(x => x.phone === phone), false, 'so it stays out of the failure list');
+
+      const next = h.M.stageRun([{ dialStr: phone, name: 'Asha' }], 'optout-next');
+      assert.equal(h.row(next, phone).skipped_reason, 'disabled', 'the next run stages them already switched off');
+      assert.equal(M.funnelForRun(next).optedOut, 1, 'and counts them as an opt-out there too');
+    });
+  });
+
+  // The subcode case 3.6 fixed for 131026 applies here too: under a generic 100
+  // the person would be filed as "fix the template" and messaged again next run.
+  testAsync('a 131050 signalled by subcode is still the person opting out', async () => {
+    await withLoop(async () => graphErr({ code: 100, error_subcode: 131050, message: 'x' }), async () => {
+      const r = await M.sendTemplate({ name: 'Rahul', dialStr: '919400000032' });
+      assert.equal(r.skip, true, 'about the recipient, so a skip');
+      assert.equal(r.errorCode, 131050, 'acted on by the code that matched, which is what switches them off as an opt-out');
+    });
+  });
 }
 
 console.log('\nstatus');
@@ -1154,6 +1215,12 @@ const seedOut = (wamid, waId = '911', runId = null, status = 'accepted') => {
         .run(wamid, waId, status, runId);
 };
 const statusOf = wamid => testDb.prepare('SELECT status, error_code, error_title FROM messages WHERE wamid = ?').get(wamid);
+// A run of the test's own, taken from the sequence. These tests used fixed ids
+// (7, 9, 10, 11), which only held while no earlier test happened to create that
+// many runs: one more run anywhere above, and run 9 was a funnel test's run with
+// its own messages, counted into these assertions.
+const freshRun = () => Number(testDb.prepare('INSERT INTO campaign_runs (started_at) VALUES (?)')
+  .run(Date.now()).lastInsertRowid);
 
 test('status advances sent to delivered to read', () => {
   seedOut('m1');
@@ -1171,9 +1238,10 @@ test('a late delivered after read is ignored', () => {
   assert.equal(statusOf('m2').status, 'read');
 });
 test('a read with no preceding delivered counts as delivered', () => {
-  seedOut('m3', '911', 7);
+  const run = freshRun();
+  seedOut('m3', '911', run);
   applyStatus({ id: 'm3', status: 'read' });
-  assert.equal(countsForRun(7).delivered, 1);
+  assert.equal(countsForRun(run).delivered, 1);
 });
 test('an unknown status value is ignored', () => {
   seedOut('m4', '911', null, 'sent');
@@ -1209,33 +1277,36 @@ test('a status for an unknown wamid changes nothing and does not throw', () => {
   assert.equal(statusOf('never-sent'), undefined);
 });
 test('countsForRun sums per-contact statuses', () => {
-  seedOut('r1', '9111', 9); seedOut('r2', '9112', 9); seedOut('r3', '9113', 9); seedOut('r4', '9114', 9);
+  const run = freshRun();
+  seedOut('r1', '9111', run); seedOut('r2', '9112', run); seedOut('r3', '9113', run); seedOut('r4', '9114', run);
   applyStatus({ id: 'r1', status: 'read' });
   applyStatus({ id: 'r2', status: 'delivered' });
   applyStatus({ id: 'r3', status: 'failed', errors: [{ code: 1, title: 'x' }] });
-  assert.deepEqual(countsForRun(9), { accepted: 4, delivered: 2, read: 1, failed: 1 });
+  assert.deepEqual(countsForRun(run), { accepted: 4, delivered: 2, read: 1, failed: 1 });
 });
 // The counts are about people, not rows. A contact the retry ladder reaches on
 // a second attempt has TWO outbound rows in one run, and counting rows reported
 // three accepted on a run of two while leaving the recovered contact inside
 // `failed` beside their own `delivered`.
+const laterRun = freshRun();          // shared with the test after this one
 test('a contact reached on a later attempt is delivered, not accepted twice and not still failed', () => {
-  seedOut('r5a', '9115', 10); seedOut('r6', '9116', 10);
+  seedOut('r5a', '9115', laterRun); seedOut('r6', '9116', laterRun);
   applyStatus({ id: 'r5a', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
   applyStatus({ id: 'r6', status: 'delivered' });
-  assert.deepEqual(countsForRun(10), { accepted: 2, delivered: 1, read: 0, failed: 1 },
+  assert.deepEqual(countsForRun(laterRun), { accepted: 2, delivered: 1, read: 0, failed: 1 },
     'while the retry is still pending the contact is honestly a failure');
 
-  seedOut('r5b', '9115', 10);                       // the retry goes out
+  seedOut('r5b', '9115', laterRun);                 // the retry goes out
   applyStatus({ id: 'r5b', status: 'delivered' });
-  assert.deepEqual(countsForRun(10), { accepted: 2, delivered: 2, read: 0, failed: 0 },
+  assert.deepEqual(countsForRun(laterRun), { accepted: 2, delivered: 2, read: 0, failed: 0 },
     'two people were on this run, and both of them heard from us');
 });
 test('a contact whose every attempt failed stays failed', () => {
-  seedOut('r7a', '9117', 11); seedOut('r7b', '9117', 11);
+  const run = freshRun();
+  seedOut('r7a', '9117', run); seedOut('r7b', '9117', run);
   applyStatus({ id: 'r7a', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
   applyStatus({ id: 'r7b', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
-  assert.deepEqual(countsForRun(11), { accepted: 1, delivered: 0, read: 0, failed: 1 });
+  assert.deepEqual(countsForRun(run), { accepted: 1, delivered: 0, read: 0, failed: 1 });
 });
 test('countsForRun on an empty run returns zeros, not nulls', () => {
   assert.deepEqual(countsForRun(999), { accepted: 0, delivered: 0, read: 0, failed: 0 });
@@ -2775,6 +2846,31 @@ console.log('\nskipDisposition — the classifier the report groups by');
     assert.equal(skipDisposition(999999), 'unclassified',
       'a new Meta code must not silently cost re-sends, nor silently write someone off');
   });
+
+  // 131050 is the person choosing, inside WhatsApp, to stop marketing from this
+  // business. Permanent — no retry changes their mind — but it is an opt-out,
+  // not a number that cannot receive messages, and the two are switched off
+  // with different reasons so the report files them apart.
+  test('131050 is permanent and switches the contact off as an opt-out', () => {
+    const { disableReasonFor, explainError: explain } = require('./server');
+    assert.equal(skipDisposition(131050), 'permanent', 'retrying someone who turned marketing off is messaging them against their wish');
+    assert.equal(disableReasonFor(131050), 'opt_out', 'they asked to stop — they are not "not on WhatsApp"');
+    assert.equal(disableReasonFor(131026), 'failed_hard', 'every other permanent code is about the number');
+    assert.match(explain(131050) || '', /turned off marketing messages/, 'the report says what the person did');
+    assert.match(explain(131050), /opt back in/, 'and when re-enabling them is right');
+  });
+
+  // 130497 is a country-level block on this business — typically marketing to
+  // US numbers. A policy that can lift, so the number must not be written off,
+  // and every retry inside it fails the same way: reported, never retried.
+  test('130497 is explained, and neither retried nor written off', () => {
+    const { explainError: explain } = require('./server');
+    assert.equal(skipDisposition(130497), 'unclassified', 'not retried, and not a reason to switch a real customer off');
+    assert.match(explain(130497) || '', /country/, 'a sentence the operator can act on, not a bare number to look up');
+    const phone = '919400000021';
+    assert.equal(suppressIfPermanent(phone, 130497, 'Sarah'), false);
+    assert.equal(require('./server').contacts.isDisabled(phone), false, 'the country block can lift; the contact stays on the list');
+  });
 }
 
 // ── Quiet hours ───────────────────────────────────────────────────────────────
@@ -3501,6 +3597,25 @@ console.log('\ndelivery failures that arrive over the webhook');
       'no ladder changes the answer for a wrong number, and each rung costs a send slot');
     assert.equal(rowFor(run, p[0].dialStr).wamid, 'w.gone', 'and the queue row is left resolved');
     assert.equal(progressForRun(run).pending, 0);
+  });
+
+  // Meta mostly reports 131050 this way — accepted, then refused — and it is the
+  // same fact as at send time: the person turned marketing off. Switched off as
+  // an opt-out by the same one decision, never requeued.
+  test('a 131050 by webhook switches the contact off as an opt-out, never retried', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    C.upsertFromCsv(p, {});
+    accepted(run, p[0], 'w.optout');
+
+    assert.equal(webhook('w.optout', 131050), 'permanent');
+    assert.equal(C.getRow(p[0].dialStr).disabled_reason, 'opt_out',
+      'filed with the people who asked us to stop, not with the numbers that cannot receive messages');
+    assert.equal(rowFor(run, p[0].dialStr).wamid, 'w.optout', 'no ladder changes their mind — the row stays resolved');
+    const f = M.funnelForRun(run);
+    assert.equal(f.optedOut, 1, 'counted as an opt-out');
+    assert.equal(f.unreachable, 0, 'and not as "not on WhatsApp"');
   });
 
   test('a code nobody has ruled on is reported, not retried', () => {
