@@ -14,6 +14,7 @@ const { skipDisposition, explainError } = require('../lib/errors');
 const {
   sendTemplate, missingParams, startLoop, saveCampaignNow, clearCampaignFile,
   campaignBlocker, campaignActive, suppressIfPermanent, USER_PAUSE,
+  handleDeliveryFailure,
 } = require('../services/campaign');
 
 const router = express.Router();
@@ -59,10 +60,11 @@ router.post('/test-send', async (req, res) => {
       // countsForRun. It stages no queue row, so the funnel-driven tiles
       // deliberately do not move; the confirmation is the phone in your hand.
       markMessaged(dialStr);
-      recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
+      const early = recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, r.params)
                              ?? `[template: ${S.config.templateName}]`,
                        runId: S.currentRunId });
+      if (early) handleDeliveryFailure(early);   // its failure webhook beat this send's response
       log('success', `test send accepted — +${dialStr}`);
     } else {
       log('error', `test send failed — +${dialStr} [${r.errorCode}] ${r.error}`);

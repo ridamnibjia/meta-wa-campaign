@@ -1143,6 +1143,48 @@ test('a contact whose every attempt failed stays failed', () => {
 test('countsForRun on an empty run returns zeros, not nulls', () => {
   assert.deepEqual(countsForRun(999), { accepted: 0, delivered: 0, read: 0, failed: 0 });
 });
+// Meta's status webhook can beat the send API's own response, and the message
+// row only exists once recordOutbound runs — after the send's awaits. A status
+// landing in that window used to be logged and dropped, with the envelope
+// stamped processed, so not even Replay could bring it back.
+// Below the tests above on purpose: they bind run ids 7–11 by hand, and an
+// auto-numbered run made before them could take one of those ids.
+const newRunRow = label => Number(testDb
+  .prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)').run(Date.now(), label).lastInsertRowid);
+test('a status that beats its own send is applied when the send is recorded', () => {
+  const runId = newRunRow('race');
+  applyStatus({ id: 'wamid.RACE', status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)),
+                errors: [{ code: 131049, title: 'x' }], recipient_id: '919000004301' });
+  assert.equal(statusOf('wamid.RACE'), undefined, 'nothing to update yet — the send has not been recorded');
+
+  const f = recordOutbound({ wamid: 'wamid.RACE', waId: '919000004301', name: 'Asha', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE').status, 'failed', 'the early status is applied, not lost');
+  assert.deepEqual(f, { failed: true, waId: '919000004301', runId, wamid: 'wamid.RACE', code: 131049, title: 'x' },
+    'and handed back in the shape handleDeliveryFailure takes — a failure the ladder never sees is a contact never retried');
+
+  assert.equal(recordOutbound({ wamid: 'wamid.CALM', waId: '919000004302', name: 'Rahul', body: 'x', runId }), null,
+    'a send nothing raced returns null, so the caller has nothing to hand on');
+  applyStatus({ id: 'wamid.EARLY-SENT', status: 'sent' });
+  assert.equal(recordOutbound({ wamid: 'wamid.EARLY-SENT', waId: '919000004303', name: 'Marco', body: 'x', runId }), null,
+    'an early status that is not a failure is applied quietly — there is nothing to retry');
+  assert.equal(statusOf('wamid.EARLY-SENT').status, 'sent');
+});
+test('the early-status hold is bounded — statuses nobody claims cannot grow it forever', () => {
+  // Another tool sending from the same number produces a status for every
+  // message it sends, and none of them will ever be claimed. The hold keeps the
+  // newest 500. Muted and restored: 501 identical warnings say nothing, and a
+  // full ring buffer would break every later test that reads S.logs.
+  const logs = S.logs.slice(), out = console.log;
+  console.log = () => {};
+  try {
+    for (let i = 0; i <= 500; i++) applyStatus({ id: `wamid.FLOOD${i}`, status: 'delivered' });
+  } finally { console.log = out; S.logs.splice(0, S.logs.length, ...logs); }
+
+  recordOutbound({ wamid: 'wamid.FLOOD0', waId: '919000004304', name: 'Sarah', body: 'x' });
+  assert.equal(statusOf('wamid.FLOOD0').status, 'accepted', 'the oldest was let go — the hold is capped, not a leak');
+  recordOutbound({ wamid: 'wamid.FLOOD500', waId: '919000004304', name: 'Sarah', body: 'x' });
+  assert.equal(statusOf('wamid.FLOOD500').status, 'delivered', 'while the newest is still there to be claimed');
+});
 
 
 console.log('\npricing');
@@ -6468,6 +6510,141 @@ console.log('\na Reset that lands mid-send');
       flags.stopFlag = false; flags.pauseFlag = false;
       if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
+    }
+  });
+
+  // ── A failure webhook that beats the send's own response ────────────────────
+  // The other mid-send race. Meta's status webhook can arrive while the send API
+  // has still not answered, and the message row that status is about only
+  // exists once the loop records the send. It used to be logged and dropped,
+  // with the envelope stamped processed — and a dropped `failed` is a contact
+  // the retry ladder never sees: the run closed "1 of 1 sent", nobody owed.
+  const failedEnvelope = (wamid, to, code, title) => ({
+    object: 'whatsapp_business_account',
+    entry: [{ changes: [{ field: 'messages', value: { statuses: [{
+      id: wamid, status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)),
+      recipient_id: to, errors: [{ code, title }] }] } }] }],
+  });
+
+  testAsync('a failure webhook that beats its own send response still reaches the retry ladder', async () => {
+    const { processEnvelope } = require('./src/services/ingest');
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, fetch: global.fetch,
+                    days: [...W.days], enabled: W.enabled, delay: S.config.delaySec,
+                    cap: S.config.dailyCap, header: S.config.headerAssetId,
+                    run: S.currentRunId, phase: S.phase };
+    const hadC = fsr.existsSync(FILESr.campaign);
+    const prevC = hadC ? fsr.readFileSync(FILESr.campaign) : null;
+    const hadW = fsr.existsSync(FILESr.warmup);
+    const prevW = hadW ? fsr.readFileSync(FILESr.warmup) : null;
+
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p';
+    S.config.delaySec = 0; S.config.dailyCap = 0; S.config.headerAssetId = null;
+    W.enabled = false;
+    if (!W.days.includes(todayKey())) W.days.push(todayKey());
+
+    const runId = startRun('status-before-send');
+    buildRun(runId, [{ dialStr: '919300000555', name: 'Early' }]);
+    S.currentRunId = runId;
+    S.phase = 'running';
+    flags.stopFlag = false; flags.pauseFlag = false;
+
+    // Meta refuses the message — and says so over the webhook — while the send
+    // itself is still inside this await. The whole race, made deterministic.
+    global.fetch = async () => {
+      processEnvelope(failedEnvelope('wamid.beaten', '919300000555', 131049, 'Not delivered'));
+      return { ok: true, headers: new Map(),
+               json: async () => ({ messages: [{ id: 'wamid.beaten' }] }) };
+    };
+
+    const rowQ = db.prepare(
+      'SELECT wamid, skipped_reason, error_code, attempts FROM run_recipients WHERE run_id = ? AND phone = ?');
+    let row;
+    try {
+      startLoop();
+      const until = Date.now() + 8000;
+      while (Date.now() < until) {
+        row = rowQ.get(runId, '919300000555');
+        if (row.skipped_reason === 'retry' || !flags.running) break;
+        await new Promise(r => setTimeout(r, 25));
+      }
+      // Parked a day out on the 131049 ladder, which is where it belongs. Stop
+      // it so the suite does not wait with it.
+      flags.stopFlag = true;
+      const gone = Date.now() + 4000;
+      while (flags.running && Date.now() < gone) await new Promise(r => setTimeout(r, 25));
+
+      assert.equal(db.prepare("SELECT status FROM messages WHERE wamid = 'wamid.beaten'").get().status, 'failed',
+        'the held status is applied the moment the send is recorded');
+      assert.equal(row.skipped_reason, 'retry',
+        'and the ladder saw it — a failure it never sees is a contact never retried');
+      assert.equal(row.wamid, null, 'un-stamped, so the queue knows another attempt is owed');
+      assert.equal(row.error_code, 131049, 'stamped with what Meta actually said');
+      assert.equal(row.attempts, 1, 'one rung, exactly as if the webhook had come second');
+    } finally {
+      global.fetch = saved.fetch;
+      CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
+      S.config.delaySec = saved.delay; S.config.dailyCap = saved.cap; S.config.headerAssetId = saved.header;
+      W.days = saved.days; W.enabled = saved.enabled;
+      S.currentRunId = saved.run; S.phase = saved.phase;
+      flags.stopFlag = false; flags.pauseFlag = false;
+      if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
+      if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
+    }
+  });
+
+  // /test-send records through the same recordOutbound, so the same race lands
+  // there. A test send is the cheapest place to learn a number is not on
+  // WhatsApp, and that must not depend on which arrived first.
+  testAsync('a test send whose failure beats its response still switches the dead number off', async () => {
+    const { processEnvelope } = require('./src/services/ingest');
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, waba: CFGr.wabaId,
+                    fetch: global.fetch, config: { ...S.config }, days: [...W.days], phase: S.phase };
+    const hadW = fsr.existsSync(FILESr.warmup);
+    const prevW = hadW ? fsr.readFileSync(FILESr.warmup) : null;
+
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p'; CFGr.wabaId = 'waba-test';
+    Object.assign(S.config, { templateName: 'race_check', headerAssetId: null, mmLite: false });
+    S.phase = 'idle';
+    // Already a sending day, so a successful send stamps nothing into warmup.json.
+    if (!W.days.includes(todayKey())) W.days.push(todayKey());
+
+    const dialStr = '919300000556';
+    const real = saved.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.startsWith('http://127.0.0.1')) return real(url, opts);
+      if (u.includes('/message_templates')) {
+        return { ok: true, json: async () => ({ data: [{
+          name: 'race_check', status: 'APPROVED', category: 'MARKETING', language: S.config.templateLanguage,
+          components: [{ type: 'BODY', text: 'Hello from the race test' }] }] }) };
+      }
+      processEnvelope(failedEnvelope('wamid.ts-beaten', dialStr, 131026, 'Message undeliverable'));
+      return { ok: true, headers: new Map(),
+               json: async () => ({ messages: [{ id: 'wamid.ts-beaten' }] }) };
+    };
+
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/campaign'));
+    const server = http.createServer(a);
+    await new Promise(r => server.listen(0, r));
+    try {
+      const r = await (await real(`http://127.0.0.1:${server.address().port}/api/test-send`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ numbers: [dialStr] }),
+      })).json();
+      assert.equal(r.ok, true, `the send itself was accepted: ${JSON.stringify(r)}`);
+      assert.equal(db.prepare("SELECT status FROM messages WHERE wamid = 'wamid.ts-beaten'").get().status, 'failed',
+        'the held status is applied to the test send too');
+      assert.equal(contacts.isDisabled(dialStr), true,
+        'and an undeliverable number is switched off whichever arrived first — the webhook or the response');
+    } finally {
+      server.close();
+      global.fetch = saved.fetch;
+      CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone; CFGr.wabaId = saved.waba;
+      Object.assign(S.config, saved.config);
+      W.days = saved.days; S.phase = saved.phase;
+      if (hadW) fsr.writeFileSync(FILESr.warmup, prevW); else fsr.rmSync(FILESr.warmup, { force: true });
     }
   });
 

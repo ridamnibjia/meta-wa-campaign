@@ -3,11 +3,49 @@ const { db } = require('../lib/db');
 const { S, flags, campaignActive, log } = require('../state');
 const { explainError, skipDisposition } = require('../lib/errors');
 
-// An unknown ID means a message this server never sent — traffic from another
-// tool on the same number, or a status for a message from before the SQL store.
-// Log it rather than swallow it.
+// An unknown ID is usually a message this server never sent — traffic from
+// another tool on the same number, or a status from before the SQL store. But
+// not always: Meta's status webhook can beat the send API's own response, and
+// the row only exists once recordOutbound runs, after the send's awaits. A
+// status dropped in that window was lost for good — the envelope is stamped
+// processed either way — and a lost `failed` is a contact the retry ladder
+// never sees. So it is HELD, keyed on its wamid, and recordOutbound claims it.
+//
+// The envelope still being marked processed is deliberate: leaving it
+// unprocessed would strand every foreign tool's statuses in the replay queue
+// forever, and a held status needs no replay — its own send claims it.
+//
+// ponytail: in memory, newest 500 wamids. A restart or an eviction loses only
+// what was already logged here as unknown — the outcome before the hold
+// existed — and a table would keep nothing useful: a send cut off mid-await is
+// never recorded, so nothing would ever claim its status. Evicting one that
+// WOULD be claimed takes 500 other unknown wamids inside one send's round
+// trip; if a second tool on the number is ever that busy, evict by age instead
+// of by count.
+const HELD_MAX = 500;
+const held = new Map();   // wamid → [status, …] in arrival order, one per status value
+
 function onUnknownStatus(status) {
-  log('warn', `status "${status.status}" for unknown message ${status.id} — ignored`);
+  log('warn', `status "${status.status}" for unknown message ${status.id} — held in case its send is still being recorded`);
+  // One entry per status value, the latest winning: a redelivered failure can
+  // carry a better error code, and a redelivery must not grow the list.
+  const list = (held.get(status.id) || []).filter(s => s.status !== status.status);
+  list.push(status);
+  held.delete(status.id);            // re-inserted, so "oldest" means least recently heard
+  held.set(status.id, list);
+  if (held.size > HELD_MAX) held.delete(held.keys().next().value);
+}
+
+// Applies whatever arrived for this wamid before its row did, in arrival order.
+// applyStatus's own rank guards make the order safe either way. Returns the
+// failure descriptor when one of them was the transition into 'failed'.
+function claimHeld(wamid) {
+  const early = held.get(wamid);
+  if (!early) return null;
+  held.delete(wamid);
+  let failure = null;
+  for (const s of early) failure = applyStatus(s) || failure;
+  return failure;
 }
 
 // Meta redelivers statuses and does not promise order, so a `delivered` can land
@@ -321,6 +359,12 @@ const upsertOutThread = db.prepare(`
     last_at = max(threads.last_at, excluded.last_at)
 `);
 
+// Returns what applyStatus returns on the transition into 'failed' — or null —
+// for a status that arrived before this send was recorded (see onUnknownStatus
+// above). The CALLER hands that to services/campaign.js:handleDeliveryFailure,
+// exactly as services/ingest.js would have: what to do about a failure is a
+// campaign decision, and this module does not import the loop. Claimed after
+// the COMMIT, so the row the held status is about already exists.
 function recordOutbound({ wamid, waId, name, type = 'template', body = null, at = Date.now(), runId = null }) {
   db.exec('BEGIN');
   try {
@@ -331,6 +375,7 @@ function recordOutbound({ wamid, waId, name, type = 'template', body = null, at 
     db.exec('ROLLBACK');
     throw e;
   }
+  return claimHeld(wamid);
 }
 
 // The number an outbound message was sent TO, in the form the campaign dialed

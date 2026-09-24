@@ -661,10 +661,11 @@ async function campaignLoop() {
       // leave a sent message the queue still considers pending, and the resume
       // would message that person twice.
       recordRecipientSent(runId, contact.dialStr, result.messageId);
-      recordOutbound({ wamid: result.messageId, waId: contact.dialStr, name: contact.name,
+      const early = recordOutbound({ wamid: result.messageId, waId: contact.dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, result.params)
                              ?? `[template: ${S.config.templateName}]`,
                        runId });
+      if (early) handleDeliveryFailure(early);   // its failure webhook beat this send's response
       // Re-read rather than `today + 1`: the message row is already written, and
       // asking the queue again is what keeps this line and the cap check reading
       // the same number even when a failure webhook landed mid-send.
