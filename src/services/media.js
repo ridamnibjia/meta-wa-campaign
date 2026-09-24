@@ -389,7 +389,13 @@ async function ensureHandle(id) {
   const freshHandle = asset.meta_handle && asset.meta_handle_at
     && (Date.now() - asset.meta_handle_at) < HANDLE_TTL_MS;
   if (freshHandle) return { ok: true, handle: asset.meta_handle, asset };
-  if (!fs.existsSync(assetPath(asset))) return { ok: false, error: missingMsg(asset) };
+  // Same containment guard dropBytes/deleteAsset/rescanIfNeeded hold: `path`
+  // is a column, and readBytes() below turns it into a filesystem path with
+  // no check of its own. A tampered row escaping UPLOAD_DIR is treated the
+  // same as a missing file — re-uploading the same file repairs either one.
+  if (!insideDir(UPLOAD_DIR, assetPath(asset)) || !fs.existsSync(assetPath(asset))) {
+    return { ok: false, error: missingMsg(asset) };
+  }
   if (!CFG.accessToken) return { ok: false, error: 'Access Token not configured' };
   if (!CFG.appId) {
     return { ok: false, error: 'APP_ID is not set. A media header needs Meta\'s Resumable Upload API, which keys on the app id — copy it from Meta for Developers → your app → Settings → Basic, put it in .env as APP_ID, and restart.' };
@@ -450,7 +456,10 @@ async function ensureMediaId(id, { force = false } = {}) {
     && (Date.now() - asset.media_id_at) < MEDIA_ID_TTL_MS;
   if (fresh && !force) return { ok: true, mediaId: asset.media_id, asset };
 
-  if (!fs.existsSync(assetPath(asset))) return { ok: false, error: missingMsg(asset) };
+  // Same containment guard as ensureHandle above — see its comment.
+  if (!insideDir(UPLOAD_DIR, assetPath(asset)) || !fs.existsSync(assetPath(asset))) {
+    return { ok: false, error: missingMsg(asset) };
+  }
   if (!CFG.accessToken || !CFG.phoneNumberId) {
     return { ok: false, error: 'Credentials not configured' };
   }

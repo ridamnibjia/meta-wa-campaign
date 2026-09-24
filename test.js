@@ -4882,6 +4882,47 @@ console.log('\nmedia — Meta identifiers');
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
 
+  // readBytes() turns `media_assets.path` into a filesystem path with no
+  // containment check of its own — the same class of bug 6.11 closed for
+  // dropBytes/deleteAsset/rescanIfNeeded, just reached from these two instead.
+  // A tampered row must not get its target read and handed to Meta as though
+  // it were the operator's own file.
+  testAsync('ensureHandle refuses an asset whose path escapes UPLOAD_DIR, never reading it', async () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    const outside = pathx.join(UPLOAD_DIR, '..', `wa-outside-${process.pid}-${Date.now()}.txt`);
+    fsx.writeFileSync(outside, 'not actually an uploaded asset');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', pathx.basename(outside)), id);
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
+        () => ensureHandle(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i, 'a path outside UPLOAD_DIR is refused the same way a missing file is');
+    } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureMediaId refuses an asset whose path escapes UPLOAD_DIR, never reading it', async () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    const outside = pathx.join(UPLOAD_DIR, '..', `wa-outside-${process.pid}-${Date.now()}-2.txt`);
+    fsx.writeFileSync(outside, 'not actually an uploaded asset');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', pathx.basename(outside)), id);
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
+        () => ensureMediaId(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i);
+    } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
   testAsync('a Graph error is returned as a message, not thrown', async () => {
     const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
     CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
