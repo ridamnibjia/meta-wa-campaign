@@ -8,11 +8,12 @@
 // recovering from something.
 const { CFG, OPT_OUT_LABEL } = require('../config');
 const { db } = require('../lib/db');
-const { log, emit } = require('../state');
+const { S, log, emit } = require('../state');
 const { broadcast } = require('./status');
 const { disable } = require('./contacts');
-const { applyStatus, markEnvelopeProcessed } = require('./messages');
+const { applyStatus, markEnvelopeProcessed, waIdForWamid } = require('./messages');
 const { handleDeliveryFailure } = require('./campaign');
+const { fetchAccountInfo } = require('./graph');
 const inbox = require('./inbox');
 
 // One broadcast per envelope, not one per message and one per status.
@@ -20,10 +21,11 @@ const inbox = require('./inbox');
 // including the per-contact funnel — and Meta batches statuses, so a single
 // webhook carrying fifty of them was fifty full rebuilds pushed down every open
 // socket to render the same final number. The clients only ever see the last
-// one; the other forty-nine were work nobody could observe.
+// one; the other forty-nine were work nobody could observe. The inbox thread
+// list follows the same rule, for the same reason (see `inbound` below).
 function processEnvelope(body) {
   if (body.object !== 'whatsapp_business_account') return;
-  let changed = false;
+  let changed = false, inbound = 0;
   for (const entry of (body.entry || [])) {
     // Meta stamps every webhook with the WABA ID that produced it. A System User
     // token without business_management cannot look that ID up from the Business
@@ -47,6 +49,32 @@ function processEnvelope(body) {
         continue;
       }
 
+      // The number's quality rating moved, or its messaging tier did. The
+      // warm-up gate re-derives its rung from S.quality on every send, and
+      // until this nothing refreshed that value while a campaign ran — only an
+      // operator opening a page, or the next Start — so on a retry ladder that
+      // spans days, a slip to YELLOW on day two changed nothing. The payload
+      // names an EVENT (FLAGGED, DOWNGRADE, …) and the tier, not the rating, so
+      // the rating is re-read from Graph rather than guessed from the event.
+      // Not awaited: this function stays synchronous, and a re-read is the one
+      // write replay cannot get wrong — it only ever fetches the rating as it is
+      // NOW. Subscribing to this field is README §10's job.
+      if (change.field === 'phone_number_quality_update') {
+        const v = change.value || {};
+        log(['UPGRADE', 'UNFLAGGED'].includes(v.event) ? 'info' : 'warn',
+            `Meta quality update: ${v.event || 'changed'}${v.current_limit ? ` · limit ${v.current_limit}` : ''}`);
+        fetchAccountInfo()
+          .then(i => {
+            // fetchAccountInfo reports a Graph refusal as { error } rather than
+            // throwing; both land in the same catch, so neither is silent.
+            if (!i?.qualityRating) throw new Error(i?.error || 'Graph returned no rating');
+            S.quality = i.qualityRating;
+            broadcast();
+          })
+          .catch(e => log('warn', `Could not re-read the quality rating: ${e.message}`));
+        continue;
+      }
+
       // Inbound messages. A quick-reply tap on a template arrives as type
       // 'button'; the same label from an interactive message arrives as
       // button_reply. Everything — including the opt-out tap — is also recorded
@@ -59,7 +87,9 @@ function processEnvelope(body) {
       const contactsArr = change.value?.contacts || [];
       for (const m of (change.value?.messages || [])) {
         const profileName = contactsArr.find(c => c.wa_id === m.from)?.profile?.name;
-        inbox.recordInbound(m, profileName);
+        // Counted only when something new landed: a redelivery returns null,
+        // and re-announcing an unchanged thread list is work nobody sees.
+        if (inbox.recordInbound(m, profileName)) inbound++;
 
         const label = m.button?.text || m.interactive?.button_reply?.title;
         if (label && label.trim().toLowerCase() === OPT_OUT_LABEL.toLowerCase()) {
@@ -69,10 +99,39 @@ function processEnvelope(body) {
           if (disable(m.from, 'opt_out', profileName)) {
             log('warn', `opt-out — +${m.from} will be skipped by campaigns from now on`);
           }
+          // wa_id is not always the number we dialed: Brazil's ninth digit,
+          // Mexico's 521 and Argentina's 9 all come back from Meta in a
+          // different form from the one in the CSV, and the loop checks the
+          // CSV form. The tap answers a template, and context.id is that
+          // template's wamid — which names the form we dialed. disable() is a
+          // no-op when that number is already off for this reason, so a
+          // redelivered tap or a replay costs nothing.
+          // ponytail: only a button tap is an opt-out here, and every tap
+          // carries context.id. A typed stop word would not — learning wa_id
+          // aliases from each send response (data.contacts[0].wa_id) is the
+          // fix if that ever becomes an opt-out path.
+          const dialed = m.context?.id ? waIdForWamid(m.context.id) : null;
+          if (dialed && dialed !== m.from && disable(dialed, 'opt_out', profileName)) {
+            log('warn', `opt-out — +${dialed} (the number campaigns dial for +${m.from}) will be skipped too`);
+          }
         }
         changed = true;
       }
 
+      // ponytail: each status below is 1-3 standalone autocommits — applyStatus's
+      // own UPDATE, and on a failure markFailed + restampThread + the ladder's
+      // requeue on top — and under synchronous=FULL every one of those is its
+      // own fsync. A batched envelope of fifty statuses is 50-150 fsyncs
+      // blocking the event loop, not one. None of that buys durability: these
+      // are derived writes, replayable from the envelope recordEnvelope already
+      // fsynced before the 200 OK, and replay is idempotent by construction —
+      // applyStatus only moves a status forward, the ladder's requeue is
+      // guarded on the transition into 'failed' plus the wamid. The upgrade
+      // path is one transaction for the whole envelope; recordInbound's and
+      // recordOutbound's own db.exec('BEGIN') would then have to become
+      // SAVEPOINTs, since node:sqlite throws on a nested BEGIN. Worth doing
+      // only once a real webhook burst is measured stalling the loop — FULL
+      // stays exactly as it is for recordEnvelope either way.
       for (const status of (change.value?.statuses || [])) {
         // applyStatus returns a descriptor only on the transition INTO 'failed'.
         // Meta accepts most sends and refuses them later over this webhook, so
@@ -86,6 +145,10 @@ function processEnvelope(body) {
       }
     }
   }
+  // One thread-list rebuild per envelope. recordInbound is the only writer of
+  // inbound rows and emits nothing itself, so this is the one place a reply
+  // reaches the open inbox screens.
+  if (inbound) emit('inbox', inbox.summary());
   if (changed) broadcast();
 }
 

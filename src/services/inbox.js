@@ -72,6 +72,11 @@ const touchThread = db.prepare('UPDATE threads SET last_at = max(last_at, ?) WHE
 // Meta redelivers webhooks it did not get a 200 for, so the same wamid can
 // arrive more than once. The dedupe is now the messages primary key, checked
 // before the thread upsert so a retry cannot re-increment the unread badge.
+//
+// Emits nothing. The caller announces the new thread list once per envelope
+// (services/ingest.js): summary() rebuilds every thread that ever replied, and
+// an emit per message was that rebuild once per reply in a batch Meta sent as
+// one. Null for a redelivery, which is how the caller knows nothing is new.
 function recordInbound(m, profileName) {
   const waId = normalizePhone(m.from) || m.from;
   if (seenWamid.get(m.id)) return null;
@@ -99,7 +104,6 @@ function recordInbound(m, profileName) {
     throw e;
   }
 
-  emit('inbox', summary());
   log('info', `reply from ${name} (+${waId}): ${text.slice(0, 60)}`);
   return { id: m.id, dir: 'in', type: m.type || 'text', text, at };
 }

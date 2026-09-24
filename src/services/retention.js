@@ -99,18 +99,48 @@ function sweepWebhookEvents({ now = Date.now() } = {}) {
   return { removed };
 }
 
-// Once at boot, so a box that was off for a week catches up, and daily after.
-// unref() so the timer never holds the process open — a sweep is housekeeping,
-// not work worth delaying a shutdown for.
+// Hourly, not daily: previewHours defaults to 24 and is configurable down to
+// 1, and a daily tick could only ever act on ITS OWN clock, not the file's —
+// a preview fetched just after a tick survived until the next one, up to ~48h
+// at the default and ~25h even at the 1h setting. That is the enforcement
+// granularity equalling or exceeding the whole promise, and this file's own
+// standard (above) is that a promise nothing enforces is a lie. sweepMedia and
+// sweepWebhookEvents are both indexed SELECTs that return nothing when
+// nothing is due, so the 23 extra ticks a day cost is one cheap query each.
+const SWEEP_EVERY_MS = HOUR_MS;
+
+// PRAGMA optimize refreshes the query planner's stat1 statistics, which never
+// update on their own as tables grow — it is SQLite's own recommended
+// one-liner for this and is cheap when stats are already fresh, but there is
+// no reason to pay it on every hourly tick when the tables have not moved
+// much in an hour. Gated to once a day, inside the same tick rather than a
+// second timer, so there is still only one clock to reason about.
+const OPTIMIZE_EVERY_MS = DAY_MS;
+let lastOptimize = 0;
+
+// Once at boot, so a box that was off for a week catches up, and hourly
+// after. unref() so the timer never holds the process open — a sweep is
+// housekeeping, not work worth delaying a shutdown for.
 //
-// ponytail: setInterval, not a cron dependency. The requirement is "about once
-// a day", and a restart resetting the clock costs nothing.
+// ponytail: setInterval, not a cron dependency. The requirement is "about
+// once an hour", and a restart resetting the clock costs nothing — the next
+// tick is at most an hour away either way.
 function startRetention() {
-  const sweep = () => { sweepMedia(); sweepWebhookEvents(); };
+  const sweep = () => {
+    sweepMedia();
+    sweepWebhookEvents();
+    if (Date.now() - lastOptimize >= OPTIMIZE_EVERY_MS) {
+      db.exec('PRAGMA optimize');
+      lastOptimize = Date.now();
+    }
+  };
   sweep();
-  const t = setInterval(sweep, DAY_MS);
+  const t = setInterval(sweep, SWEEP_EVERY_MS);
   t.unref();
   return t;
 }
 
-module.exports = { sweepMedia, sweepWebhookEvents, startRetention, DAY_MS, WEBHOOK_RETENTION_DAYS };
+module.exports = {
+  sweepMedia, sweepWebhookEvents, startRetention, DAY_MS, WEBHOOK_RETENTION_DAYS,
+  SWEEP_EVERY_MS,
+};

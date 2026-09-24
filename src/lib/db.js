@@ -196,10 +196,6 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(wa_id, at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_run    ON messages(run_id, status);
--- Today's send count is a query now rather than an integer, and the loop asks it
--- once per message. Partial on dir so it stays a fraction of the table however
--- much inbound traffic the inbox accumulates.
-CREATE INDEX IF NOT EXISTS idx_messages_out_at ON messages(at) WHERE dir = 'out';
 -- COVERING, and it is the one index in this file whose absence gets worse with
 -- time rather than with load. sentSince() groups by wa_id, and a GROUP BY makes
 -- SQLite prefer idx_messages_thread (wa_id, at) — which has the grouping column
@@ -234,8 +230,14 @@ function addColumn(d, table, column, decl) {
 
 function openDb(file) {
   const d = new DatabaseSync(file);
-  // WAL lets the socket broadcast read while a webhook batch writes. It is a
-  // no-op on :memory:, which is why the tests still pass against one.
+  // Not read/write concurrency: there is exactly one DatabaseSync connection,
+  // synchronous, on one thread, so a read can never overlap a write in this
+  // process — that benefit cannot occur here. The real ones: under
+  // synchronous=FULL below, WAL costs one fsync per commit versus the
+  // rollback journal's two, and it lets an external reader — the README's
+  // backup.sh, an operator's sqlite3 shell — read without blocking the app
+  // (busy_timeout just below already anticipates that visitor). A no-op on
+  // :memory:, which is why the tests still pass against one.
   d.exec('PRAGMA journal_mode = WAL');
   // FULL, not NORMAL: in WAL mode NORMAL fsyncs at checkpoints only, so a
   // committed webhook survives a process crash but not a host crash, power
@@ -257,6 +259,22 @@ function openDb(file) {
   // Pointing an outbound send at it would put the operator's price list under
   // that sweep and delete it from disk with nothing anywhere to say why.
   addColumn(d, 'messages', 'asset_id', 'INTEGER REFERENCES media_assets(id)');
+  // After addColumn, never in SCHEMA — see idx_run_recipients_retry below. The
+  // Storage page and deleteAsset ask "which sent messages use this file", and
+  // without it that was a scan of the whole message history per library file.
+  // Partial, because only media sends carry an asset: it stays near-empty
+  // however many templates go out.
+  d.exec('CREATE INDEX IF NOT EXISTS idx_messages_asset ON messages(asset_id) WHERE asset_id IS NOT NULL');
+  // Empty in steady state, which is the point: /health — outside the password
+  // gate, so a probe anyone can send — and Replay both ask "anything
+  // unprocessed?", and without it that read ninety days of raw envelopes, body
+  // overflow pages included, to answer zero.
+  d.exec('CREATE INDEX IF NOT EXISTS idx_webhook_unprocessed ON webhook_events(id) WHERE processed_at IS NULL');
+  // Chosen by no query since idx_messages_cap took over sentSince, and an index
+  // nobody picks still costs a write on every outbound message. Removing its
+  // CREATE from SCHEMA only stops new databases getting it; this is what takes
+  // it off the ones that already have it.
+  d.exec('DROP INDEX IF EXISTS idx_messages_out_at');
   // Provenance grew a column: row_count is the UNIQUE contacts a file yielded,
   // and without the duplicate count "971 rows in my sheet, 775 in the app"
   // cannot be answered from the record of the upload itself.

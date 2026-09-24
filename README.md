@@ -982,7 +982,7 @@ Railway provides $5/month free credit. This app easily stays within free limits.
 
 Campaigns send fine without a webhook. What you lose without one is everything
 that comes *back*: `Delivered` and `Read` counts, inbound replies in the inbox,
-one-tap opt-outs, and template approval notifications.
+one-tap opt-outs, template approval notifications, and quality-rating changes.
 
 **Requirement:** a public HTTPS URL. Render, Railway and a Cloudflare Tunnel all
 provide one.
@@ -1009,6 +1009,10 @@ anything.
 6. Click **Manage** and subscribe to these fields:
    - `messages` — delivery receipts, read receipts, inbound replies, opt-out taps
    - `message_template_status_update` — approval / rejection notifications
+   - `phone_number_quality_update` — quality rating and tier changes. The warm-up
+     ladder steps back a rung the moment the rating slips, instead of whenever
+     someone next opens the dashboard, which matters on a campaign whose retries
+     run for days
 
 Step 6 is the one people miss. Without `message_template_status_update`, the app
 falls back to polling Meta every 15 seconds for template status, which works but
