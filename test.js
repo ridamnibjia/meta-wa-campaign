@@ -1624,15 +1624,18 @@ test('the two per-message queries are answered by an index, not by a scan', () =
   // own clean seek. Merged into one disjunction they were neither: the WHERE
   // implied no index's predicate, so SQLite fell back to the primary key plus a
   // temp b-tree sort — a full scan of the run, once per message sent.
-  const untried = plan('SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL '
-    + 'AND skipped_reason IS NULL ORDER BY seq LIMIT 1');
+  //
+  // The SQL EXPLAINed is the SQL the app prepares, exported for the purpose. A
+  // copy retyped here stays green while the shipped statement drifts off its
+  // index — the one regression this test exists to catch.
+  const { NEXT_UNTRIED_SQL, NEXT_DUE_RETRY_SQL } = require('./server');
+  const untried = plan(NEXT_UNTRIED_SQL);
   assert.match(untried, /idx_run_recipients_pending/,
     'the untried half must seek the run rather than scan it — this is once per message sent');
   assert.doesNotMatch(untried, /TEMP B-TREE/,
     'and the index must supply the ORDER BY, or every send sorts the whole queue again');
 
-  const due = plan("SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL "
-    + "AND skipped_reason = 'retry' AND retry_after <= ? ORDER BY retry_after LIMIT 1");
+  const due = plan(NEXT_DUE_RETRY_SQL);
   assert.match(due, /idx_run_recipients_retry/,
     'and the ladder half must use its own partial index, on (run_id, retry_after)');
   assert.doesNotMatch(due, /TEMP B-TREE/,
@@ -2858,6 +2861,29 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       'the spam throttle backs off harder each time, never faster — hammering it feeds the signal that raised it');
   });
 
+  // Both entrances ask this one helper, so they cannot disagree about which rung
+  // a contact is on. The rung is counted per CODE; the ceiling over all of them
+  // is the total, and the total is what the report shows.
+  test('ladderPosition — the rung is per code, the ceiling is the total', () => {
+    const { ladderPosition, MAX_RETRIES_TOTAL } = M;
+    const fresh = ladderPosition({ attempts: 0, ladder_code: null, ladder_attempts: 0 }, 131049);
+    assert.deepEqual([fresh.made, fresh.exhausted], [0, false], 'a contact never retried is on the first rung');
+    assert.equal(fresh.ladder, M.backoffFor(131049), 'and the rungs are that code\'s own');
+
+    const afterBlips = ladderPosition({ attempts: 3, ladder_code: -1, ladder_attempts: 3 }, 131049);
+    assert.deepEqual([afterBlips.made, afterBlips.exhausted], [0, false],
+      'three network blips are rungs of the -1 ladder, not of 131049\'s');
+    const midway = ladderPosition({ attempts: 5, ladder_code: 131049, ladder_attempts: 2 }, 131049);
+    assert.deepEqual([midway.made, midway.exhausted], [2, false], 'the same code climbs its own ladder');
+    const spent = ladderPosition({ attempts: 6, ladder_code: 131049, ladder_attempts: 3 }, 131049);
+    assert.equal(spent.exhausted, true, 'three day-rungs is the whole 131049 ladder');
+    const ceiling = ladderPosition({ attempts: MAX_RETRIES_TOTAL, ladder_code: 131049, ladder_attempts: 1 }, -1);
+    assert.equal(ceiling.exhausted, true,
+      'past the total ceiling nothing retries, whatever ladder the next code starts — or two codes taking turns never end');
+    assert.equal(ladderPosition({ attempts: 1, ladder_code: '131049', ladder_attempts: 1 }, 131049).made, 1,
+      'a code read back as text is the same code');
+  });
+
   test('haltsCampaign — campaign-wide faults only, never one row\'s problem', () => {
     const M2 = require('./server');
     for (const code of [190, 131042, 132001, 132015, 133010, 131063]) {
@@ -3233,6 +3259,88 @@ console.log('\ndelivery failures that arrive over the webhook');
       + 'the run must be allowed to close');
     assert.equal(progressForRun(run).pending, 0, 'and the campaign is finally allowed to be finished');
     assert.equal(countsForRun(run).failed, 1, 'reported as a failure, which is what it is');
+  });
+
+  // ── One ladder per code, and a ceiling over all of them ─────────────────────
+  // The ladder a contact is on is the ladder of the code that failed them, and
+  // its position used to be read off `attempts` — the TOTAL. A contact who had
+  // burned three network blips (-1) was already "three rungs up" when their
+  // first 131049 arrived, so 131049's three day-spaced rungs were spent before
+  // one of them happened. The review's fix — count per code with a CASE on
+  // error_code — is wrong on this app: markSent nulls error_code on every
+  // accept, and the webhook failure arrives AFTER the accept, so that CASE
+  // restarts at 1 on every rung and the ladder never ends. Unbounded paid sends.
+  test('a contact with transient retries still gets every 131049 day-rung, and attempts stays the total', () => {
+    const run = newRun();
+    const p = people(1);
+    const phone = p[0].dialStr;
+    buildRun(run, p);
+    const savedPhase = S.phase;
+    S.phase = 'idle';                 // a 'done' phase left behind would make each requeue restart the loop
+    try {
+      for (let i = 0; i < 3; i++) M.recordRecipientRetry(run, phone, -1, Date.now() - 1);
+      for (let rung = 1; rung <= backoffFor(131049).length; rung++) {
+        accepted(run, p[0], `w.day${rung}`);
+        assert.equal(webhook(`w.day${rung}`, 131049), 'retrying',
+          `131049 rung ${rung} must happen — errors.js promises the operator up to three day-spaced retries, and three network blips earlier do not change that`);
+      }
+      accepted(run, p[0], 'w.day.last');
+      assert.equal(webhook('w.day.last', 131049), 'exhausted', 'and then the 131049 ladder ends, after its own three');
+      assert.equal(M.recipientFor(run, phone).attempts, 6,
+        'attempts stays the TOTAL — "tried N×" and the report CSV render it, and resetting it would understate how often someone was messaged');
+    } finally { S.phase = savedPhase; }
+  });
+
+  test('repeated webhook 131049s exhaust after three rungs — a count keyed on error_code never would', () => {
+    const run = newRun();
+    const p = people(1);
+    const phone = p[0].dialStr;
+    buildRun(run, p);
+    // The review's proposal, evaluated against the row each webhook actually meets.
+    const naive = db.prepare('SELECT CASE WHEN error_code IS ? THEN attempts + 1 ELSE 1 END AS n '
+      + 'FROM run_recipients WHERE run_id = ? AND phone = ?');
+    const rungs = backoffFor(131049).length;
+    for (let i = 0; i < rungs; i++) {
+      accepted(run, p[0], `w.naive${i}`);
+      assert.equal(rowFor(run, phone).error_code, null,
+        'every accept clears error_code — the webhook failure always arrives after it');
+      assert.equal(naive.get(131049, run, phone).n, 1,
+        `so a per-code count keyed on error_code restarts at 1 on rung ${i + 1}, and would on every rung after — a ladder that never ends is unbounded paid sends`);
+      assert.equal(webhook(`w.naive${i}`, 131049), 'retrying');
+      const row = M.recipientFor(run, phone);
+      assert.deepEqual([row.ladder_code, row.ladder_attempts], [131049, i + 1],
+        'the per-code count lives in ladder_code/ladder_attempts, which no success clears');
+    }
+    accepted(run, p[0], `w.naive${rungs}`);
+    assert.equal(webhook(`w.naive${rungs}`, 131049), 'exhausted',
+      'the regression the naive fix would have caused: the fourth refusal must end the ladder');
+  });
+
+  test('two codes taking turns stop at the total ceiling, not never', () => {
+    const run = newRun();
+    const p = people(1);
+    const phone = p[0].dialStr;
+    const contact = { name: p[0].name, dialStr: phone };
+    buildRun(run, p);
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    try {
+      // A network blip at send time, then an accepted retry Meta refuses over the
+      // webhook, then a blip again… Each code's own ladder restarts whenever the
+      // other one interrupts it, so only the total can end this.
+      let ended = null;
+      for (let step = 1; step <= 50 && !ended; step++) {
+        const row = M.nextPending(run, Date.now() + 99 * 3600000);   // the loop, once the rung is due
+        if (!M.scheduleRetry(contact, row, { errorCode: -1, error: 'blip' }, '[t]', run)) { ended = 'send'; break; }
+        accepted(run, p[0], `w.alt${step}`);
+        const r = webhook(`w.alt${step}`, 131049);
+        if (r !== 'retrying') ended = r;
+      }
+      assert.ok(ended, 'alternating two retryable codes must end — nothing else stops it');
+      assert.equal(M.MAX_RETRIES_TOTAL, 8, 'the default five plus 131049\'s three');
+      assert.equal(M.recipientFor(run, phone).attempts, M.MAX_RETRIES_TOTAL,
+        'every retry either ladder grants counts against one ceiling, and the run then closes');
+    } finally { S.phase = savedPhase; }
   });
 
   // A campaign finishes, the operator uploads a new CSV — which opens a new run

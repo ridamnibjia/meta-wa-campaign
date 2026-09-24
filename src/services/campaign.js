@@ -262,6 +262,27 @@ const RETRY_LADDERS = {
 // the send response and the failure webhook — so they cannot walk two ladders.
 const backoffFor = code => RETRY_LADDERS[Number(code)] || RETRY_BACKOFF_MS;
 
+// The ceiling over every ladder a contact climbs in one run: the default five
+// plus 131049's three. Each code's rung count restarts when a different code
+// interrupts it, so a contact whose sends alternate between a network blip and
+// a 131049 refusal never finishes either ladder — without a cap on the TOTAL
+// they would be retried, and billed, forever.
+const MAX_RETRIES_TOTAL = 8;
+
+// A contact's position on the ladder for THIS code, asked by both entrances so
+// they cannot disagree about which rung someone is on. `attempts` is the total —
+// what the report shows as "tried N×" — and never resets; `ladder_attempts` is
+// the rung of `ladder_code`'s ladder, so a contact who burned three network
+// blips still gets all three of 131049's day-spaced rungs. Number() on both
+// sides because a code can come back from SQL or a webhook as text; the null
+// check because Number(null) is 0, and a fresh row must not match code 0.
+function ladderPosition(row, code) {
+  const ladder = backoffFor(code);
+  const made = row.ladder_code != null && Number(row.ladder_code) === Number(code)
+    ? (row.ladder_attempts || 0) : 0;
+  return { ladder, made, exhausted: made >= ladder.length || (row.attempts || 0) >= MAX_RETRIES_TOTAL };
+}
+
 // Below this, a wait for the next retry deadline is spent silently — see the
 // long note at the `waiting` branch in campaignLoop. One minute rather than a
 // few seconds because the deadlines inside one rung are smeared across however
@@ -299,18 +320,18 @@ const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
 const deferIfQuiet = t => (QUIET_HOURS ? deferPastQuietHours(t) : t);
 
 // True when the contact was put back in the queue; false when the caller should
-// record a terminal skip. `row.attempts` is how many retries this contact has
-// already had — the SQL increments it, so it cannot drift.
+// record a terminal skip. Which rung this contact is on is ladderPosition's
+// answer, read off the row — the SQL increments both counts, so neither can
+// drift.
 // `runId` is passed in rather than read from S here, and for the same reason the
 // loop captures it before the await: this runs after sendTemplate() has resolved,
 // and a /api/reset landing in that window would otherwise park the contact on a
 // null run — a row that matches nothing, so the retry is simply lost.
 function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
   if (skipDisposition(result.errorCode) !== 'retry') return false;
-  const ladder = backoffFor(result.errorCode);
-  const made = row.attempts || 0;
-  if (made >= ladder.length) {
-    log('warn', `${n} ${contact.name} — still failing after ${made + 1} attempts, reporting it [${result.errorCode}]`);
+  const { ladder, made, exhausted } = ladderPosition(row, result.errorCode);
+  if (exhausted) {
+    log('warn', `${n} ${contact.name} — still failing after ${(row.attempts || 0) + 1} attempts, reporting it [${result.errorCode}]`);
     return false;
   }
   // Deferred before it is stored, not before it is read: retry_after is both
@@ -395,13 +416,13 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
   // rebuilt. Nothing to put back.
   if (!row || row.wamid !== wamid) return 'stale';
 
-  const ladder = backoffFor(code);
-  const made = row.attempts || 0;
-  if (made >= ladder.length) {
-    // This code's whole ladder is spent. The cap belongs to the recipient, not
-    // to the attempt, so there is no ladder length that zeroes it — see the
-    // note above RETRY_LADDERS. They stay in `failed` and the run closes.
-    log('warn', `+${waId} — still not delivered after ${made + 1} attempts, giving up [${code}]`);
+  const { ladder, made, exhausted } = ladderPosition(row, code);
+  if (exhausted) {
+    // This code's whole ladder is spent, or the contact has used up the total
+    // ceiling. The cap belongs to the recipient, not to the attempt, so there is
+    // no ladder length that zeroes it — see the note above RETRY_LADDERS. They
+    // stay in `failed` and the run closes.
+    log('warn', `+${waId} — still not delivered after ${(row.attempts || 0) + 1} attempts, giving up [${code}]`);
     return 'exhausted';
   }
   const at = deferIfQuiet(Date.now() + ladder[made]);
@@ -844,6 +865,6 @@ module.exports = {
   CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun, suppressIfPermanent,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
   campaignActive, campaignBlocker, scheduleRetry, handleDeliveryFailure, RETRY_BACKOFF_MS,
-  RETRY_LADDERS, backoffFor,
+  RETRY_LADDERS, backoffFor, MAX_RETRIES_TOTAL, ladderPosition,
   USER_PAUSE, RATE_LIMIT_RETRIES,
 };

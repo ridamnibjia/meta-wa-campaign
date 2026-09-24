@@ -362,20 +362,29 @@ const insertRecipient = db.prepare(`
 // adds one only for an untried row (a due retry is already inside `attempted`
 // as `retrying`), and the disabled branch preserves the ladder's last error
 // code — neither can work if the column stays behind in the table.
-const nextUntriedQ = db.prepare(`
-  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code FROM run_recipients
+// ladder_code and ladder_attempts travel for the same reason: this row is what
+// scheduleRetry is handed, and without them every contact reads as on the first
+// rung of whatever code failed them last — a ladder that never ends.
+//
+// Exported as the exact strings prepared here, because test.js asserts each
+// half's QUERY PLAN. A copy retyped into the test stays green while the shipped
+// statement drifts off its index, which is the one regression that test is for.
+const NEXT_UNTRIED_SQL = `
+  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code,
+         ladder_code, ladder_attempts FROM run_recipients
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason IS NULL
-   ORDER BY seq LIMIT 1
-`);
+   ORDER BY seq LIMIT 1`;
+const nextUntriedQ = db.prepare(NEXT_UNTRIED_SQL);
 
 // Ordered by DEADLINE, not by seq: within the ladder the honest queue is "whose
 // turn came up first", and idx_run_recipients_retry is (run_id, retry_after) so
 // this is the same seek that answers nextRetryAtQ.
-const nextDueRetryQ = db.prepare(`
-  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code FROM run_recipients
+const NEXT_DUE_RETRY_SQL = `
+  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code,
+         ladder_code, ladder_attempts FROM run_recipients
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason = 'retry' AND retry_after <= ?
-   ORDER BY retry_after LIMIT 1
-`);
+   ORDER BY retry_after LIMIT 1`;
+const nextDueRetryQ = db.prepare(NEXT_DUE_RETRY_SQL);
 
 // The soonest a row waiting on backoff becomes sendable, or null when none are.
 // This is what tells a drained-but-not-finished run to wait rather than declare
@@ -416,10 +425,25 @@ const markSkipped = db.prepare(`
 // attempts is incremented in SQL rather than read-modify-written in JS: the row
 // is the only place the count lives, and a crash between the read and the write
 // would otherwise hand the contact a free extra attempt on every restart.
+//
+// Two counts, because a contact can be on more than one ladder in a run.
+// `attempts` is the TOTAL — what "tried N×" and the report CSV render — and it
+// never resets. `ladder_attempts` is the rung on the ladder of `ladder_code`,
+// and restarts at 1 when a different code fails them: three network blips must
+// not spend 131049's three day-spaced rungs. The CASE compares against
+// ladder_code and never error_code — markSent nulls error_code on every accept,
+// and a webhook failure arrives after the accept, so a CASE on error_code would
+// restart at 1 on every rung and the ladder would never end. Every SET term
+// reads the row as it was before this UPDATE, so the CASE sees the OLD
+// ladder_code. The code is bound twice, positionally (node:sqlite cannot mix
+// ? with ?N).
+const LADDER_SET = `ladder_attempts = CASE WHEN ladder_code IS ? THEN ladder_attempts + 1 ELSE 1 END,
+         ladder_code = ?`;
 const markRetry = db.prepare(`
   UPDATE run_recipients
      SET skipped_reason = 'retry', error_code = ?, attempted_at = ?,
-         retry_after = ?, attempts = attempts + 1
+         retry_after = ?, attempts = attempts + 1,
+         ${LADDER_SET}
    WHERE run_id = ? AND phone = ?
 `);
 
@@ -435,15 +459,22 @@ const markRetry = db.prepare(`
 // a wamid the row no longer carries matches nothing. It also protects against
 // the out-of-order case — a stale failure for attempt two arriving after
 // attempt three has already gone out must not un-send attempt three.
+// The per-code count is the same two terms markRetry sets, for the same reason:
+// this is 131049's usual entrance, and the row it meets has had error_code
+// nulled by the accept.
 const requeueAfterDelivery = db.prepare(`
   UPDATE run_recipients
      SET wamid = NULL, skipped_reason = 'retry', error_code = ?,
-         attempted_at = ?, retry_after = ?, attempts = attempts + 1
+         attempted_at = ?, retry_after = ?, attempts = attempts + 1,
+         ${LADDER_SET}
    WHERE run_id = ? AND phone = ? AND wamid = ?
 `);
 
+// ladder_code / ladder_attempts: handleDeliveryFailure reads the rung off this
+// row, exactly as scheduleRetry reads it off nextPending's.
 const recipientQ = db.prepare(
-  'SELECT phone, name, seq, wamid, skipped_reason, error_code, attempts, retry_after '
+  'SELECT phone, name, seq, wamid, skipped_reason, error_code, attempts, retry_after, '
+  + 'ladder_code, ladder_attempts '
   + 'FROM run_recipients WHERE run_id = ? AND phone = ?');
 
 // `disabled` is broken out from `skipped` because it is the only skip that
@@ -677,18 +708,20 @@ const recordRecipientSkipped = (runId, phone, reason, errorCode = null) =>
   markSkipped.run(reason, errorCode, Date.now(), runId, phone);
 
 // Puts a contact back in the queue at a stated time instead of dropping them.
+// errorCode three times: error_code, then the two LADDER_SET terms.
 const recordRecipientRetry = (runId, phone, errorCode, retryAfter) =>
-  markRetry.run(errorCode, Date.now(), retryAfter, runId, phone);
+  markRetry.run(errorCode, Date.now(), retryAfter, errorCode, errorCode, runId, phone);
 
 // Same, for a send Meta accepted and then failed hours later. True when the row
 // was actually put back — false means the webhook was a redelivery, or was
 // about an attempt this contact has already moved past.
 const requeueFailedRecipient = (runId, phone, wamid, errorCode, retryAfter) =>
   (runId == null || !wamid ? false
-    : requeueAfterDelivery.run(errorCode, Date.now(), retryAfter, runId, phone, wamid).changes > 0);
+    : requeueAfterDelivery.run(errorCode, Date.now(), retryAfter, errorCode, errorCode,
+                               runId, phone, wamid).changes > 0);
 
-// One queue row, or null. The caller needs `attempts` to know which rung of the
-// ladder this contact is on, and `wamid` to know the webhook is not stale.
+// One queue row, or null. The caller needs the ladder columns to know which
+// rung this contact is on, and `wamid` to know the webhook is not stale.
 const recipientFor = (runId, phone) =>
   (runId == null ? null : recipientQ.get(runId, phone) || null);
 
@@ -954,5 +987,5 @@ module.exports = {
   recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
   nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
-  senderThrottleUntil, SENDER_THROTTLE_SQL,
+  senderThrottleUntil, SENDER_THROTTLE_SQL, NEXT_UNTRIED_SQL, NEXT_DUE_RETRY_SQL,
 };
