@@ -1,7 +1,8 @@
 'use strict';
 const { CFG, LIMITS, OPT_OUT_LABEL, PRICES } = require('../config');
 const { S, emit, todayKey } = require('../state');
-const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap, graduated, dailyCount } = require('./warmup');
+const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap, graduated, dailyCount,
+        capCount, capWindow } = require('./warmup');
 const { counts: contactCounts } = require('./contacts');
 const { countsForRun, progressForRun, funnelForRun, nextPending, billableForRun,
         nextRetryForRun, lastRunSummary, strandedWork } = require('./messages');
@@ -27,6 +28,7 @@ function buildState() {
   const billable = billableForRun(S.currentRunId);
   const next     = nextPending(S.currentRunId);
   const retry    = nextRetryForRun(S.currentRunId);
+  const today    = dailyCount();
   return {
     phase:          S.phase,
     // Contacts ATTEMPTED, not contacts resolved. It was `p.sent + p.skipped`,
@@ -83,7 +85,14 @@ function buildState() {
     // every broadcast — once per message sent — so re-asking was four queries
     // per send, one of them a three-table join, for numbers sitting in scope.
     lastRun:        lastRunSummary({ runId: S.currentRunId, progress: p, counts: c, funnel: f, nextRetry: retry }),
-    dailyCount:     dailyCount(),
+    dailyCount:     today,
+    // The count the cap IN FORCE is compared against, and the window it counts
+    // over (contract C1). While the warm-up rung governs that is the last 24
+    // hours — Meta's own window — and a different number from `dailyCount`,
+    // which stays the IST day and means "today" wherever it is shown. Published
+    // rather than left to the client, so the tile cannot rebuild the rule.
+    capCount:       capCount(today),
+    capWindow:      capWindow(),
     // null means no ceiling at all — the ladder is finished (or off) and no cap
     // of the operator's own is set. The UI must render that as "no cap", never
     // as 0: `num(null)` is "0", which reads as a number that blocks every send.

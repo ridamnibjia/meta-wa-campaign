@@ -4,11 +4,11 @@ const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
 const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep } = require('../state');
 const { broadcast } = require('./status');
 const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
-const { W, warmupCap, effectiveCap, markWarmupDay, dailyCount } = require('./warmup');
+const { effectiveCap, markWarmupDay, capWindow, capCount, warmupDay } = require('./warmup');
 const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
         requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
-        nextRetryForRun, progressForRun, senderThrottleUntil } = require('./messages');
+        nextRetryForRun, progressForRun, senderThrottleUntil, slotFreesAt } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition, haltsCampaign } = require('../lib/errors');
 const { deferPastQuietHours, nextIstMidnight } = require('../lib/schedule');
@@ -599,23 +599,40 @@ async function campaignLoop() {
     // null is "no cap at all": the warm-up ladder is complete (or off) and the
     // operator has set no number of their own, so how much this number may send
     // today is Meta's business and the loop does not park for it.
-    const cap   = effectiveCap();
-    const today = dailyCount();
-    if (cap !== null && today >= cap) {
-      const nextMidnight = nextIstMidnight();
-      const wait = nextMidnight - Date.now();
-      const h = Math.floor(wait / 3600000), m = Math.floor((wait % 3600000) / 60000);
-      const w = warmupCap();
-      const why = w !== null && w === cap
-        ? `Warm-up ceiling for day ${W.days.length}` : 'Daily cap';
-      log('info', `${why} ${today}/${cap} — resuming in ${h}h ${m}m`);
-      S.phase = 'paused'; S.pauseReason = `${why} reached (${cap}/day). Resumes in ${h}h ${m}m.`; broadcast();
+    //
+    // Compared against capCount(), not today's count: while the warm-up rung is
+    // the cap in force it is counted over Meta's rolling 24 hours, and your own
+    // cap over the IST day — warmup.js:capWindow says which, and why.
+    const cap = effectiveCap();
+    if (cap !== null && capCount() >= cap) {
+      // When a slot comes back depends on the window. A day frees everything at
+      // IST midnight. The rolling window frees one contact at a time, 24 hours
+      // after their latest send, so the next send is due when the earliest of
+      // those leaves — hours before midnight, or long after it. The fallback only
+      // guards the two queries disagreeing (every counted send leaving the window
+      // between them): a short silent wait, then the count is asked again.
+      const rolling = capWindow() === '24h';
+      const until = rolling ? (slotFreesAt() ?? Date.now() + ANNOUNCE_WAIT_MS) : nextIstMidnight();
+      // Yesterday's contacts leave the rolling window as far apart as they were
+      // sent — seconds, at campaign pace — so a loop at the ceiling parks once
+      // per freed slot. Announcing each of those is the slowdown described at
+      // the `waiting` branch above: a log line, a broadcast and a phase flap per
+      // send. Same rule as there: a wait this short is slept, silently.
+      if (until - Date.now() <= ANNOUNCE_WAIT_MS) { await sleepUntil(until); continue; }
+      // The sentence names the ceiling that said no and the window it counts,
+      // because "why did the campaign stop at 50" has two answers now.
+      S.phase = 'paused';
+      S.pauseReason = rolling
+        ? `Warm-up ceiling: ${cap} people in the last 24 hours (day ${warmupDay()}). Next send at ${clockIST(until)}.`
+        : `Daily cap reached (${cap}/day). Resumes at ${clockIST(until)}.`;
+      log('info', S.pauseReason);
+      broadcast();
       // sleepUntil, not sleep: this wait is up to a full day. A bare sleep here
       // meant a Stop set stopFlag that nothing read until tomorrow — and since
       // `flags.running` stays true until the loop exits, campaignBlocker()
       // refused every Start and every CSV upload for those hours with "still
       // stopping, try again in a second".
-      await sleepUntil(nextMidnight);
+      await sleepUntil(until);
       if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue;
     }
@@ -744,10 +761,11 @@ async function campaignLoop() {
                        body: renderBody(S.config.templateBody, result.params)
                              ?? `[template: ${S.config.templateName}]`,
                        runId });
-      // Re-read rather than `today + 1`: the message row is already written, and
-      // asking the queue again is what keeps this line and the cap check reading
-      // the same number even when a failure webhook landed mid-send.
-      log('success', `${n} accepted — today:${dailyCount()}/${cap ?? 'no cap'}`);
+      // Re-read rather than a count plus one: the message row is already written,
+      // and asking again is what keeps this line and the cap check reading the
+      // same number — over the same window — even when a failure webhook landed
+      // mid-send.
+      log('success', `${n} accepted — ${capWindow() === '24h' ? 'last 24h' : 'today'}:${capCount()}/${cap ?? 'no cap'}`);
     } else if (result.skip) {
       // A property of the NUMBER, not of the attempt: not on WhatsApp, or
       // blocked by Meta on quality grounds. Retrying it is never right, and left

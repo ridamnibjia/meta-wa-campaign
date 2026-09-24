@@ -214,6 +214,28 @@ const sentSinceQ = db.prepare(`
 
 const sentSince = at => sentSinceQ.get(at).n || 0;
 
+// When the next counted contact leaves the rolling 24 hours — the loop's park
+// deadline while the warm-up rung is the cap (warmup.js:capWindow). A contact
+// stays counted while ANY non-failed template send of theirs is inside the
+// window, sentSince's rule above, so they leave at their LATEST such send + 24h;
+// the earliest of those is the next free slot. The extra second lands the wake
+// strictly past the boundary, so the re-check cannot count the same contact
+// again and park for nothing. Asked at every cap park, which in a rolling window
+// is once per freed slot, so it is sentSince's range seek on idx_messages_cap —
+// never a read of the whole message history.
+const SLOT_FREES_SQL = `
+  SELECT min(last) AS at FROM (
+      SELECT max(at) AS last FROM messages
+       WHERE dir = 'out' AND type = 'template' AND at >= ? AND status IS NOT 'failed'
+       GROUP BY wa_id)`;
+const slotFreesQ = db.prepare(SLOT_FREES_SQL);
+const WINDOW_MS = 86400000;
+// `now` is a parameter for the same reason nextPending's is.
+const slotFreesAt = (now = Date.now()) => {
+  const at = slotFreesQ.get(now - WINDOW_MS).at;
+  return at == null ? null : at + WINDOW_MS + 1000;
+};
+
 // Which IST days this number actually sent on, as 'YYYY-MM-DD'. The warm-up
 // ladder counts sending days, and it used to know about them only from
 // warmup.json — a file that did not exist before the ladder was written, is not
@@ -985,7 +1007,7 @@ module.exports = {
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
   recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
-  nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
+  nextRetryForRun, lastRunSummary, sentSince, slotFreesAt, SLOT_FREES_SQL, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
   senderThrottleUntil, SENDER_THROTTLE_SQL, NEXT_UNTRIED_SQL, NEXT_DUE_RETRY_SQL,
 };

@@ -872,6 +872,79 @@ console.log("\ntoday's send count — refused sends give the slot back");
     assert.equal(applyStatus({ id: 'day-6', status: 'failed', errors: [{ code: 131049 }] }), undefined);
     assert.equal(db.prepare('SELECT status FROM messages WHERE wamid = ?').get('day-6').status, 'read');
   });
+
+  // ── Meta's window is rolling, and so is the rung's ─────────────────────────
+  // Meta counts its messaging limit over a ROLLING 24 hours. While the warm-up
+  // rung is the cap in force — a new number, the one with no track record — a
+  // calendar-day count let a batch at 23:00 and another at 00:05 put twice the
+  // rung inside one rolling window. The operator's own cap is a daily number
+  // they chose, so it keeps counting the IST day. Last in this block: the rows
+  // below are dated after BASE, and the assertions above count from BASE.
+  const DAY = 86400000;
+  const { capCount, capWindow, slotFreesAt, SLOT_FREES_SQL } = require('./server');
+  const withLadder = (fn) => {
+    const saved = { days: [...W.days], enabled: W.enabled, cap: S.config.dailyCap, quality: S.quality };
+    try { fn(); } finally {
+      Object.assign(W, { days: saved.days, enabled: saved.enabled });
+      S.config.dailyCap = saved.cap; S.quality = saved.quality;
+    }
+  };
+
+  test('the rung counts a rolling 24 hours; your own lower cap counts the IST day', () => withLadder(() => {
+    Object.assign(W, { enabled: true, days: ['2026-01-01'] }); S.quality = 'GREEN';
+    S.config.dailyCap = 0;
+    assert.equal(capWindow(), '24h', 'day 2 with no cap of your own: the warm-up rung is the cap in force');
+    assert.equal(capCount(), sentSince(Date.now() - DAY), 'so the count is asked over the last 24 hours');
+    S.config.dailyCap = 10;                       // below day 2's rung of 50
+    assert.equal(capWindow(), 'day', 'your own lower cap is a daily number you chose — it counts the IST day');
+    assert.equal(capCount(), dailyCount(), 'which is exactly today\'s count');
+    S.config.dailyCap = 0; W.enabled = false;
+    assert.equal(capWindow(), 'day', 'no ceiling of any kind has nothing rolling to count');
+  }));
+
+  test('a send 24 hours and a second old has left the rolling count; one a minute inside it has not', () => withLadder(() => {
+    Object.assign(W, { enabled: true, days: ['2026-01-01'] }); S.quality = 'GREEN'; S.config.dailyCap = 0;
+    const before = capCount();
+    out({ wamid: 'roll-old', waId: '919600000021', name: 'Asha', body: 'x', at: Date.now() - DAY - 1000, runId: run });
+    assert.equal(capCount(), before, 'a send outside Meta\'s window must not hold one of the rung\'s slots');
+    try {
+      out({ wamid: 'roll-in', waId: '919600000022', name: 'Rahul', body: 'x', at: Date.now() - DAY + 60000, runId: run });
+      assert.equal(capCount(), before + 1, 'one still inside it does, whichever IST day it fell on');
+    } finally {
+      // Gone once asserted: 'roll-in' leaves the real window a minute from now,
+      // and a slot freeing mid-suite would decide how long a later test's loop
+      // parks at the ceiling.
+      db.prepare("DELETE FROM messages WHERE wamid IN ('roll-old', 'roll-in')").run();
+      db.prepare("DELETE FROM threads WHERE wa_id IN ('919600000021', '919600000022')").run();
+    }
+  }));
+
+  // When the next counted contact leaves the window. A contact stays counted
+  // while ANY non-failed send of theirs is inside it, so they leave at their
+  // LATEST send + 24h, and the earliest of those is the next free slot. Asked
+  // at a fixed instant later than every other row in this shared database.
+  test('slotFreesAt — the earliest-leaving contact, at their latest send + 24h + 1s', () => {
+    const T = Date.parse('2035-01-01T12:00:00Z'), H = 3600000;
+    assert.equal(slotFreesAt(T), null, 'nothing inside the window, nothing to wait for');
+    out({ wamid: 'slot-a1', waId: '919600000031', name: 'Asha', body: 'x', at: T - 23 * H, runId: run });
+    out({ wamid: 'slot-a2', waId: '919600000031', name: 'Asha', body: 'x', at: T - 2 * H, runId: run });
+    assert.equal(sentSince(T - DAY), 1, 'two sends to one person are one of the rung\'s slots');
+    assert.equal(slotFreesAt(T), T - 2 * H + DAY + 1000,
+      'and it frees at their LATER send — the earlier one leaving the window frees nothing');
+    out({ wamid: 'slot-b', waId: '919600000032', name: 'Rahul', body: 'x', at: T - 10 * H, runId: run });
+    assert.equal(slotFreesAt(T), T - 10 * H + DAY + 1000, 'the earliest of the contacts\' latest sends is the next free slot');
+    out({ wamid: 'slot-c', waId: '919600000033', name: 'Marco', body: 'x', at: T - 20 * H, runId: run });
+    applyStatus({ id: 'slot-c', status: 'failed', errors: [{ code: 131049, title: 'refused' }] });
+    assert.equal(slotFreesAt(T), T - 10 * H + DAY + 1000,
+      'a refused send holds no slot, so it cannot be the one that frees next');
+  });
+
+  test('the next free slot is a seek on the cap index — it is asked at every cap park', () => {
+    const d = openDb(':memory:');
+    const plan = d.prepare('EXPLAIN QUERY PLAN ' + SLOT_FREES_SQL).all(0).map(r => r.detail).join(' | ');
+    assert.match(plan, /idx_messages_cap/, 'the last 24 hours are a range on the covering cap index');
+    assert.doesNotMatch(plan, /SCAN messages/, 'never a read of the whole message history');
+  });
 }
 
 console.log('\nthe funnel — every contact in exactly one bucket');
@@ -2333,6 +2406,27 @@ test('the snapshot still carries every key the frontend reads', () => {
     assert.ok(k in st, `buildState lost the "${k}" key`);
   }
 });
+// Contract C1. The cap tile needs the count the cap IN FORCE is compared
+// against, and which window it counts over — while the warm-up rung governs that
+// is the last 24 hours, not today, and `dailyCount` (the IST day, "today" on
+// screen) is a different number. The tile must not reconstruct either.
+test('the snapshot publishes the count the cap in force is compared against, and its window', () => {
+  const { capCount } = require('./server');
+  const saved = { days: [...W.days], enabled: W.enabled, cap: S.config.dailyCap, quality: S.quality };
+  try {
+    Object.assign(W, { enabled: true, days: ['2026-01-01'] }); S.config.dailyCap = 0; S.quality = 'GREEN';
+    let st = buildState();
+    assert.equal(st.capWindow, '24h', 'the rung is the cap, so the tile has to say "in the last 24 hours"');
+    assert.equal(st.capCount, capCount(), 'the number the loop compares against, not a second derivation');
+    S.config.dailyCap = 10;
+    st = buildState();
+    assert.equal(st.capWindow, 'day');
+    assert.equal(st.capCount, st.dailyCount, 'under your own cap the count IS today\'s');
+  } finally {
+    Object.assign(W, { days: saved.days, enabled: saved.enabled });
+    S.config.dailyCap = saved.cap; S.quality = saved.quality;
+  }
+});
 
 const fsx   = require('node:fs');
 const pathx = require('node:path');
@@ -3093,6 +3187,81 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       if (hadFile) fsc.writeFileSync(cfile, fileWas);
       else if (fsc.existsSync(cfile)) fsc.unlinkSync(cfile);
     }
+  });
+
+  // ── The warm-up ceiling, as the loop meets it ───────────────────────────────
+  // capCount and slotFreesAt are pinned in "today's send count"; these drive the
+  // real loop into the cap branch, because the sentence it parks with and the
+  // moment it wakes are the loop's own — a loop still comparing today's count
+  // would pass every one of those unit tests.
+  //
+  // atTheRung puts the ladder on a fresh day at the smallest rung above what this
+  // shared database has already sent inside the last 24 hours, then fills the
+  // window to exactly that rung: every seat an hour old except the last, which
+  // is sent at `lastAt` — so the test decides when the next slot frees. The rows
+  // are removed afterwards; later tests count this window too.
+  const ROLL_DAY = 86400000;
+  const atTheRung = (lastAt) => {
+    const already = M.sentSince(Date.now() - ROLL_DAY);
+    const k = M.WARMUP_PLAN.findIndex(r => r > already);
+    W.enabled = true; S.quality = 'GREEN'; S.config.dailyCap = 0;
+    W.days = Array.from({ length: k }, (_, i) => `2001-01-${String(i + 1).padStart(2, '0')}`);
+    const ins = db.prepare("INSERT INTO messages (wamid, wa_id, dir, type, body, at, status) VALUES (?, ?, 'out', 'template', 'x', ?, 'accepted')");
+    const wamids = [];
+    for (let i = 0; i < M.WARMUP_PLAN[k] - already; i++) {
+      const wamid = `rung-seat.${Date.now()}.${i}`;
+      ins.run(wamid, `9190001${String(i).padStart(5, '0')}`, i === 0 ? lastAt : Date.now() - 3600000);
+      wamids.push(wamid);
+    }
+    return { rung: M.WARMUP_PLAN[k], day: k + 1,
+             remove: () => wamids.forEach(w => db.prepare('DELETE FROM messages WHERE wamid = ?').run(w)) };
+  };
+  const istClock = ms => new Date(ms).toLocaleTimeString('en-IN',
+    { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+
+  testAsync('at the warm-up ceiling the loop parks until a contact leaves the last 24 hours, and says so', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.rung.${++sends}`), async h => {
+      const seats = atTheRung(Date.now() - 3600000);
+      try {
+        assert.equal(M.capWindow(), '24h', 'precondition: the rung is the cap in force');
+        h.stage([{ dialStr: '919000034101', name: 'Asha' }], 'rung-park');
+        h.start();
+        await h.until(() => S.phase === 'paused');
+        assert.equal(S.pauseReason,
+          `Warm-up ceiling: ${seats.rung} people in the last 24 hours (day ${seats.day}). Next send at ${istClock(M.slotFreesAt())}.`,
+          'the sentence names the ceiling, the window it counts, and when the earliest counted contact leaves it — '
+          + 'not IST midnight, which is when a calendar day would have freed the slots');
+        assert.equal(sends, 0, 'nobody is messaged while Meta\'s window is full');
+      } finally { seats.remove(); }
+    });
+  });
+
+  // A rolling window frees yesterday's contacts as far apart as they were sent —
+  // seconds, at campaign pace. The loop parks once per freed slot, and announcing
+  // each of those is the slowdown CLAUDE.md records for the retry ladder: 340
+  // announcements for 549 sends, each a log line, a phase flap and a broadcast.
+  testAsync('a slot that frees within the minute is waited for silently, then used', async () => {
+    let sends = 0, sentAt = null;
+    await withLoop(async () => { sentAt = Date.now(); return graphOk(`wamid.rungq.${++sends}`); }, async h => {
+      const seats = atTheRung(Date.now() - ROLL_DAY + 50);     // the last seat leaves in a second
+      const savedLogs = S.logs;
+      S.logs = [];
+      try {
+        const frees = M.slotFreesAt();
+        assert.ok(frees - Date.now() < 2000, 'precondition: the next slot frees within the minute');
+        h.stage([{ dialStr: '919000034111', name: 'Rahul' }], 'rung-quiet');
+        const phases = new Set();
+        h.start();
+        // Sampled only while the wait lasts: once the send goes out the run is
+        // over and the phase moves on to 'done', as it should.
+        await h.until(() => { if (sends === 0) phases.add(S.phase); return sends > 0; }, 4000);
+        assert.equal(sends, 1, 'once a contact has left the window, the slot is used');
+        assert.ok(sentAt >= frees, 'and not before — the ceiling held until then');
+        assert.deepEqual([...phases], ['running'], 'a wait this short is slept silently — no pause flashed on screen');
+        assert.equal(S.logs.filter(l => /Warm-up ceiling/.test(l.msg)).length, 0, 'and nothing announced in the log');
+      } finally { seats.remove(); S.logs = savedLogs; }
+    });
   });
 
   test('the last campaign is still readable after a reset drops the current run', () => {

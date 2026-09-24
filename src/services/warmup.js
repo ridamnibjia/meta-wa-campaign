@@ -89,6 +89,41 @@ function effectiveCap() {
 // sentSince in services/messages.js for why that is not an incremented integer.
 const dailyCount = () => sentSince(startOfIstDay());
 
+// ── Which window the cap in force is counted over ──────────────────────────────
+// Meta counts its messaging limit over a ROLLING 24 hours. While the warm-up rung
+// is the cap in force — a new number, the one with no track record — counting
+// the IST calendar day let the evening's batch and the next morning's both fit
+// inside one of Meta's windows, putting two days' rungs on exactly the number
+// the ladder exists to protect. So while the rung governs, the loop counts the
+// last 24 hours, and a slot comes back when a contact's latest send leaves them
+// (messages.js:slotFreesAt).
+//
+// The operator's own cap is a daily number they chose, so it keeps counting the
+// IST day, and so does "today" on screen — dailyCount() above keeps its meaning.
+// An own cap EQUAL to the rung counts rolling: the two ceilings are the same
+// number, the last 24 hours always contain today, and the stricter reading is
+// the one that protects a new number.
+const DAY_MS = 24 * 60 * 60 * 1000;
+function capWindow() {
+  const w = warmupCap();
+  return w !== null && effectiveCap() === w ? '24h' : 'day';
+}
+
+// The count the cap in force is compared against. The loop's check, the line it
+// logs after each send and the published snapshot all read this, so none of them
+// can mean a different window from the others. `today` is for a caller that has
+// just asked dailyCount(): under the day window it is the same query, and
+// buildState runs on every send — handed in rather than asked twice.
+const capCount = (today) => (capWindow() === '24h'
+  ? sentSince(Date.now() - DAY_MS)
+  : (today ?? dailyCount()));
+
+// Which sending day today is, counting today before its first send has gone out
+// — under a rolling window the cap can be reached on yesterday's sends alone.
+// Not the rung: a slipping quality rating holds the rung back while the days
+// keep counting.
+const warmupDay = () => W.days.length + (W.days.includes(todayKey()) ? 0 : 1);
+
 // ── Reconciling the ladder with what this number actually did ──────────────────
 // warmup.json is a small file that records which days had a send. The message
 // rows record the same fact and are the thing a self-hoster actually backs up,
@@ -122,8 +157,9 @@ function markWarmupDay() {
   const cap = warmupCap();
   log('info', cap === null
     ? `Warm-up complete after ${W.days.length} sending days — the ceiling is now your own cap and Meta's tier`
-    : `Warm-up — day ${W.days.length}, today's ceiling is ${cap}`);
+    : `Warm-up — day ${W.days.length}: at most ${cap} people in any 24 hours`);
 }
 
 module.exports = { W, WARMUP_PLAN, saveWarmup, warmupStep, warmupCap, effectiveCap,
-                   markWarmupDay, graduated, dailyCount, reconcileWarmupDays };
+                   markWarmupDay, graduated, dailyCount, capWindow, capCount, warmupDay,
+                   reconcileWarmupDays };

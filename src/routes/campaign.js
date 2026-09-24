@@ -1,10 +1,10 @@
 'use strict';
 const express = require('express');
 const { CFG } = require('../config');
-const { S, flags, log, todayKey } = require('../state');
+const { S, flags, log } = require('../state');
 const { broadcast } = require('../services/status');
 const { isDisabled, markMessaged, getRow } = require('../services/contacts');
-const { W, effectiveCap, graduated, markWarmupDay } = require('../services/warmup');
+const { W, effectiveCap, graduated, markWarmupDay, capWindow, warmupDay } = require('../services/warmup');
 const { recordOutbound, progressForRun, skippedForRun,
         listRuns, runDetail } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
@@ -172,7 +172,12 @@ router.post('/start', async (req, res) => {
   S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast();
   const cap = effectiveCap();
   if (W.enabled && !graduated()) {
-    log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${cap} today`);
+    // "In any 24 hours", because that is how the loop counts the rung: Meta's
+    // window is rolling, and a count that reset at midnight let two days' rungs
+    // into one of them. A lower cap of your own is a daily number and says so.
+    log('info', capWindow() === '24h'
+      ? `Warm-up on — day ${warmupDay()}: at most ${cap} people in any 24 hours`
+      : `Warm-up on — day ${warmupDay()}, but your own cap of ${cap} a day is lower, so it applies instead`);
   } else {
     log('info', cap === null
       ? `No daily cap — this number has ${W.enabled ? 'finished its warm-up' : 'warm-up switched off'} and no cap of your own is set, so Meta's messaging tier is the only limit`
