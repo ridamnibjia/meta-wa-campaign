@@ -3264,6 +3264,82 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     });
   });
 
+  // ── Quality is re-read when a cap park ends ──────────────────────────────────
+  // The rung climbs only while quality holds, and the rating the loop had was
+  // read at /start — or whenever someone last opened Settings. A campaign parked
+  // overnight on the cap woke into a new day and climbed on a rating that could
+  // have turned RED hours earlier. The status webhook is the primary source; this
+  // is the loop asking for itself before it re-derives the cap.
+  const qualityIs = rating => async url => (String(url).includes('quality_rating')
+    ? { ok: true, json: async () => ({ quality_rating: rating, messaging_limit_tier: 'TIER_1K' }) }
+    : graphOk('wamid.quality.unused'));
+
+  testAsync('refreshQuality takes the rating Meta reports now', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'GREEN';
+    global.fetch = qualityIs('RED');
+    try {
+      await M.refreshQuality();
+      assert.equal(S.quality, 'RED', 'a RED rating holds the rung back, so it has to reach the ladder before the next send');
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  testAsync('a re-read that fails keeps the last rating, and says so', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'YELLOW';
+    try {
+      const failures = [
+        async () => { throw new Error('ECONNRESET'); },
+        async () => ({ ok: false, json: async () => ({ error: { message: 'Invalid OAuth access token' } }) }),
+      ];
+      for (const failing of failures) {
+        global.fetch = failing;
+        const before = S.logs[S.logs.length - 1];
+        await M.refreshQuality();                     // must not throw: the loop awaits it
+        assert.equal(S.quality, 'YELLOW', 'no answer is not a GREEN answer — the rating the ladder last saw stands');
+        const said = S.logs[S.logs.length - 1];
+        assert.notEqual(said, before, 'the failure is logged');
+        assert.match(said.msg, /quality rating/, 'and the line says what could not be checked');
+      }
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  // The wake itself, through the real loop: parked on your own cap until IST
+  // midnight, the clock is moved past the deadline, and the loop asks Meta for
+  // the rating as it wakes. One seat is dated two days ahead so the count stays
+  // at the cap on the moved clock too — the loop parks again rather than
+  // sending anything dated tomorrow into this shared database.
+  testAsync('the loop re-reads quality when a cap park ends', async () => {
+    const realNow = Date.now;
+    let sends = 0;
+    await withLoop(async url => {
+      if (String(url).endsWith('/messages')) sends++;
+      return qualityIs('RED')(url);
+    }, async h => {
+      const seat = `quality-seat.${realNow()}`;
+      db.prepare("INSERT INTO messages (wamid, wa_id, dir, type, body, at, status) VALUES (?, '919000036001', 'out', 'template', 'x', ?, 'accepted')")
+        .run(seat, realNow() + 2 * ROLL_DAY);
+      try {
+        S.quality = 'GREEN';
+        S.config.dailyCap = 1;                        // your own cap: the IST-day window, parked until midnight
+        h.stage([{ dialStr: '919000036002', name: 'Marco' }], 'quality-wake');
+        h.start();
+        await h.until(() => S.phase === 'paused');
+        assert.match(S.pauseReason || '', /^Daily cap reached \(1\/day\)\. Resumes at .+\.$/, 'parked on the day cap');
+        assert.equal(S.quality, 'GREEN', 'nothing asked yet — the park has not ended');
+
+        const jump = M.nextIstMidnight(realNow()) - realNow() + 1000;
+        Date.now = () => realNow() + jump;            // past the deadline the loop is sleeping to
+        await h.until(() => S.quality === 'RED', 4000);
+        assert.equal(S.quality, 'RED', 'the rating Meta reports at the wake is the one the next rung is decided on');
+        assert.equal(sends, 0, 'and nothing was sent on the moved clock');
+      } finally {
+        Date.now = realNow;
+        db.prepare('DELETE FROM messages WHERE wamid = ?').run(seat);
+      }
+    });
+  });
+
   test('the last campaign is still readable after a reset drops the current run', () => {
     const run = newRun();
     const p = people(2);

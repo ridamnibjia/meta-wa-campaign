@@ -12,7 +12,7 @@ const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
 const { sanitizeParam, renderBody } = require('./templates');
 const { explainError, skipDisposition, haltsCampaign } = require('../lib/errors');
 const { deferPastQuietHours, nextIstMidnight } = require('../lib/schedule');
-const { graphHeaders } = require('./graph');
+const { graphHeaders, fetchAccountInfo } = require('./graph');
 const { headerComponent } = require('./media');
 
 // ── Campaign persistence ───────────────────────────────────────────────────────
@@ -508,6 +508,27 @@ async function sleepUntil(at) {
   }
 }
 
+// Quality gates the warm-up climb (warmup.js:rawStep), and the rating the loop
+// holds was read at /start — or whenever someone last opened Settings. A
+// campaign parked overnight on the cap woke into a new day and climbed a rung
+// on a rating that could have turned RED hours before. So the cap park asks
+// again as it ends, before the cap is re-derived — belt and braces beside
+// Meta's phone_number_quality_update webhook, which can be unsubscribed or lost.
+//
+// Never throws — the loop awaits it — and a failure keeps the last rating: no
+// answer is not a GREEN answer. fetchAccountInfo resolves { error } for a Graph
+// refusal and rejects on a network one (or its timeout); both are said.
+async function refreshQuality() {
+  const keep = () => `Keeping the last rating (${S.quality ?? 'none yet'}).`;
+  try {
+    const info = await fetchAccountInfo();
+    if (info?.qualityRating) S.quality = info.qualityRating;
+    else log('warn', `Could not re-read the quality rating — ${info?.error || 'no rating in the answer'}. ${keep()}`);
+  } catch (e) {
+    log('warn', `Could not re-read the quality rating — ${e?.message ?? e}. ${keep()}`);
+  }
+}
+
 // ── One campaign at a time ─────────────────────────────────────────────────────
 // stageRun REPLACES run_recipients for the run it is given and /upload-csv opens
 // a new run, so a CSV uploaded mid-flight would abandon a queue that is still
@@ -662,6 +683,10 @@ async function campaignLoop() {
       // refused every Start and every CSV upload for those hours with "still
       // stopping, try again in a second".
       await sleepUntil(until);
+      // The rating before the rung: the next capCount() check is asked of it.
+      // The flags are read again after the await — a Stop or a Pause that lands
+      // while Meta is answering must not be painted over with 'running'.
+      if (!flags.stopFlag && !flags.pauseFlag) await refreshQuality();
       if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue;
     }
@@ -931,5 +956,5 @@ module.exports = {
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
   campaignActive, campaignBlocker, scheduleRetry, handleDeliveryFailure, RETRY_BACKOFF_MS,
   RETRY_LADDERS, backoffFor, MAX_RETRIES_TOTAL, ladderPosition,
-  USER_PAUSE, RATE_LIMIT_RETRIES,
+  USER_PAUSE, RATE_LIMIT_RETRIES, refreshQuality,
 };
