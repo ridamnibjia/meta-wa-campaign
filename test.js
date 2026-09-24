@@ -5361,6 +5361,27 @@ console.log('\ninbound media — save, serve, expire');
       } finally { MEDIA_LIMITS.minFreeBytes = saved; }
     });
 
+    testAsync('the free-space check is size-aware — an enormous claimed size is refused even though bavail alone looks fine', async () => {
+      const savedFree = MEDIA_LIMITS.minFreeBytes, savedMax = MEDIA_LIMITS.maxBytes;
+      // minFreeBytes at 0 means `free < 0` is never true, so only a check that
+      // SUBTRACTS the incoming size can catch this. maxBytes is raised out of
+      // the way so it is this check, not the separate size cap, under test.
+      MEDIA_LIMITS.minFreeBytes = 0;
+      MEDIA_LIMITS.maxBytes = Number.MAX_SAFE_INTEGER;
+      const bytes = Buffer.from(`huge${Date.now()}`);
+      const id = seedInbound({ bytes });
+      const hugeMeta = url => url.includes('lookaside')
+        ? { ok: true, status: 200, arrayBuffer: async () => bytes, headers: new Headers() }
+        : { ok: true, status: 200, headers: new Headers(),
+            json: async () => ({ url: 'https://lookaside.fbsbx.com/whatsapp/1', mime_type: 'image/jpeg',
+                                  file_size: Number.MAX_SAFE_INTEGER }) };
+      try {
+        const r = await withoutScanner(() => withToken(() => withMeta(hugeMeta, () => saveInbound(id))));
+        assert.equal(r.ok, false, 'no real disk has this much free space once the claimed size is subtracted');
+        assert.match(r.error, /disk space/i);
+      } finally { MEDIA_LIMITS.minFreeBytes = savedFree; MEDIA_LIMITS.maxBytes = savedMax; }
+    });
+
     testAsync('with no scanner configured a save succeeds and says so', async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`n${Date.now()}`)]);
       const id = seedInbound({ bytes });

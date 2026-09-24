@@ -158,9 +158,9 @@ function saveUpload(file) {
   //
   // Checked after the dedupe, because a byte-identical re-upload writes nothing
   // and refusing it on space grounds would be a lie.
-  // `free - size`, not `free`: this is the only space check in the app that
-  // knows how big the incoming file is, and a 90 MB video landing on a disk
-  // exactly at the floor should be refused before it is written, not after.
+  // `free - size`, not `free`: a 90 MB video landing on a disk exactly at the
+  // floor should be refused before it is written, not after. saveInbound's own
+  // check subtracts the claimed size the same way, for the same reason.
   // freeBytes answers Infinity when statfs cannot, which passes by design.
   const free = freeBytes(UPLOAD_DIR);
   if (free - size < MEDIA_LIMITS.minFreeBytes) {
@@ -690,8 +690,11 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
       return { ok: false, error: `That file is ${mb(claimed)} — over this server's ${mb(MEDIA_LIMITS.maxBytes)} limit, so it was not downloaded.` };
     }
 
+    // `free - claimed`, not `free`: a file whose declared size would land the
+    // disk under the floor should be refused before its bytes are pulled over
+    // the wire, not after — the same reasoning saveUpload applies below.
     const free = freeBytes(MEDIA_DIR);
-    if (free < MEDIA_LIMITS.minFreeBytes) {
+    if (free - claimed < MEDIA_LIMITS.minFreeBytes) {
       return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Nothing was saved.` };
     }
 
