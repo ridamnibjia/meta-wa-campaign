@@ -4717,6 +4717,45 @@ console.log('\nmedia — Meta identifiers');
     } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
   });
 
+  testAsync('a handle less than 23h old is reused without any fetch', async () => {
+    const id = seed();
+    db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?')
+      .run('h:FRESH', Date.now() - 60 * 60 * 1000, id);
+    await withFetch(() => { throw new Error('must not fetch for a handle inside its 23h window'); },
+      async () => {
+        const r = await ensureHandle(id);
+        assert.equal(r.ok, true, r.error);
+        assert.equal(r.handle, 'h:FRESH');
+      });
+  });
+
+  testAsync('a handle 24h old (or with no recorded age) is re-minted, not reused forever', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const upload = url => url.includes('/uploads?') ? json({ id: 'upload:SESSION2' }) : json({ h: 'h:FRESH2' });
+    try {
+      const stale = seed();
+      db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?')
+        .run('h:STALE', Date.now() - 24 * 60 * 60 * 1000, stale);
+      await withFetch(upload, async calls => {
+        const r = await ensureHandle(stale);
+        assert.equal(r.handle, 'h:FRESH2', 'a 24h-old handle must not be trusted');
+        assert.equal(calls.length, 2, 'the full two-step upload runs again');
+      });
+      const row = getAsset(stale);
+      assert.equal(row.meta_handle, 'h:FRESH2');
+      assert.ok(row.meta_handle_at > Date.now() - 5000, 'meta_handle_at is re-stamped on a fresh mint');
+
+      const unstamped = seed();
+      db.prepare('UPDATE media_assets SET meta_handle = ? WHERE id = ?').run('h:NOAGE', unstamped);
+      await withFetch(upload, async calls => {
+        const r = await ensureHandle(unstamped);
+        assert.equal(r.handle, 'h:FRESH2', 'a handle with no recorded age must not be trusted as fresh either');
+        assert.equal(calls.length, 2);
+      });
+    } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
   testAsync('ensureHandle refuses clearly when APP_ID is not configured', async () => {
     const savedApp = CFG.appId;
     CFG.appId = '';

@@ -62,7 +62,7 @@ const byId     = db.prepare('SELECT * FROM media_assets WHERE id = ?');
 const allRows  = db.prepare('SELECT * FROM media_assets WHERE deleted_at IS NULL ORDER BY uploaded_at DESC, id DESC');
 const reviveRow = db.prepare('UPDATE media_assets SET deleted_at = NULL, last_used_at = ? WHERE id = ?');
 const touchRow = db.prepare('UPDATE media_assets SET last_used_at = ? WHERE id = ?');
-const setHandle  = db.prepare('UPDATE media_assets SET meta_handle = ? WHERE id = ?');
+const setHandle  = db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?');
 const setMediaId = db.prepare('UPDATE media_assets SET media_id = ?, media_id_at = ? WHERE id = ?');
 
 const getAsset   = id => byId.get(Number(id));
@@ -345,6 +345,13 @@ function deleteAsset(id, { force = false } = {}) {
 // of failing the whole run.
 const MEDIA_ID_TTL_MS = 29 * 24 * 60 * 60 * 1000;
 
+// Mirrors MEDIA_ID_TTL_MS: the h:… handle is short-lived by design (Meta
+// documents it as single-use per submission, but re-submitting the same
+// template with the same file is the common case, so caching it briefly is
+// still right). 23h rather than 24 leaves margin against clock skew between
+// this server and Meta's.
+const HANDLE_TTL_MS = 23 * 60 * 60 * 1000;
+
 const readBytes = row => fs.readFileSync(assetPath(row));
 
 // A tombstoned row reaches every send path — a template still names it, an
@@ -364,7 +371,12 @@ async function ensureHandle(id) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: `Media asset ${id} not found` };
   if (asset.deleted_at) return { ok: false, error: deletedMsg(asset) };
-  if (asset.meta_handle) return { ok: true, handle: asset.meta_handle, asset };
+  // Stale when unstamped (a row from before meta_handle_at existed, or one
+  // that never recorded an age) as well as when it is simply old — either way
+  // there is no evidence the handle is still inside its window.
+  const freshHandle = asset.meta_handle && asset.meta_handle_at
+    && (Date.now() - asset.meta_handle_at) < HANDLE_TTL_MS;
+  if (freshHandle) return { ok: true, handle: asset.meta_handle, asset };
   if (!CFG.accessToken) return { ok: false, error: 'Access Token not configured' };
   if (!CFG.appId) {
     return { ok: false, error: 'APP_ID is not set. A media header needs Meta\'s Resumable Upload API, which keys on the app id — copy it from Meta for Developers → your app → Settings → Basic, put it in .env as APP_ID, and restart.' };
@@ -400,7 +412,7 @@ async function ensureHandle(id) {
       return { ok: false, error: done.error?.message || 'Upload session did not return a handle' };
     }
 
-    setHandle.run(done.h, asset.id);
+    setHandle.run(done.h, Date.now(), asset.id);
     log('info', `Uploaded "${asset.filename}" for template approval`);
     return { ok: true, handle: done.h, asset: getAsset(asset.id) };
   } catch (e) {
