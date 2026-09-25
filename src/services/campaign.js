@@ -1,18 +1,19 @@
 'use strict';
-const { CFG, FILES, QUIET_HOURS } = require('../config');
+const { CFG, FILES, QUIET_HOURS, TIMEOUTS } = require('../config');
 const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
 const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep } = require('../state');
 const { broadcast } = require('./status');
 const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
-const { W, warmupCap, effectiveCap, markWarmupDay, dailyCount } = require('./warmup');
+const { effectiveCap, markWarmupDay, capWindow, capCount, warmupDay,
+        QUALITY_RATINGS, adoptQuality } = require('./warmup');
 const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
         requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
-        nextRetryForRun, progressForRun } = require('./messages');
+        nextRetryForRun, progressForRun, senderThrottleUntil, slotFreesAt } = require('./messages');
 const { sanitizeParam, renderBody } = require('./templates');
-const { explainError, skipDisposition, haltsCampaign } = require('../lib/errors');
+const { explainError, skipDisposition, haltsCampaign, disableReasonFor } = require('../lib/errors');
 const { deferPastQuietHours, nextIstMidnight } = require('../lib/schedule');
-const { graphHeaders } = require('./graph');
+const { graphHeaders, fetchAccountInfo } = require('./graph');
 const { headerComponent } = require('./media');
 
 // ── Campaign persistence ───────────────────────────────────────────────────────
@@ -114,6 +115,13 @@ function missingParams() {
     .filter(Boolean);
 }
 
+// The codes sendTemplate reports as a skip rather than a failure — each one is
+// about the recipient or the moment, never about the request itself. One list,
+// asked of both the code and the subcode. 131050 (marketing turned off by the
+// person, in WhatsApp) is about the recipient like 131026: a skip, not a failure
+// the operator can fix, and one Meta can signal as a subcode too.
+const SKIPPABLE = [131026, 131047, 131049, 131050, 131051];
+
 // ── Meta Cloud API — send one template message ─────────────────────────────────
 async function sendTemplate(contact) {
   if (!CFG.accessToken || !CFG.phoneNumberId) {
@@ -160,9 +168,14 @@ async function sendTemplate(contact) {
     if (params.length) components.push({ type: 'body', parameters: params });
     if (components.length) body.template.components = components;
 
+    // A timeout of its own, read per call: the loop is single, and with no
+    // signal a wedged connection held it — and Stop — on undici's five-minute
+    // timers, once per contact. An abort throws into the catch below, which is
+    // already the transient -1 path: back off seconds, retry this contact.
     const res = await fetch(
       `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/${endpoint}`,
-      { method: 'POST', headers: graphHeaders(), body: JSON.stringify(body) }
+      { method: 'POST', headers: graphHeaders(), body: JSON.stringify(body),
+        signal: AbortSignal.timeout(TIMEOUTS.graphMs) }
     );
     return { res, data: await res.json() };
   };
@@ -191,11 +204,19 @@ async function sendTemplate(contact) {
     const code    = err.code        || 0;
     const subcode = err.error_subcode || 0;
     const msg     = err.message     || JSON.stringify(data);
-    // Skippable: opted out, ecosystem health, re-engagement window
-    const hint = explainError(code) || explainError(subcode);
-    if ([131026, 131047, 131049, 131051].includes(code) ||
-        [131026, 131047, 131049, 131051].includes(subcode)) {
-      return { ok: false, skip: true, error: msg, errorCode: code, hint };
+    // Skippable: undeliverable, ecosystem health, re-engagement window. Meta
+    // can signal one in error_subcode under a generic code (100 carrying
+    // 131026), and the code that MATCHED is the one everything downstream must
+    // act on: reporting the generic 100 made skipDisposition call a dead number
+    // 'fix' — never switched off, re-tried by every later run, and explained to
+    // the operator as a template problem. Resolved once, so the hint and the
+    // code cannot describe two different failures.
+    const eff  = SKIPPABLE.includes(code) ? code
+               : SKIPPABLE.includes(subcode) ? subcode
+               : code;
+    const hint = explainError(eff) || explainError(code) || explainError(subcode);
+    if (SKIPPABLE.includes(eff)) {
+      return { ok: false, skip: true, error: msg, errorCode: eff, hint };
     }
     // Rate limit: back off and retry same contact
     if ([130429, 80007, 4].includes(code)) {
@@ -250,7 +271,9 @@ const RETRY_BACKOFF_MS = [3, 3, 3, 3, 3].map(h => h * 3600000);
 // what services/inbox.js sendMedia exists for.
 //
 // 131048 is the sender-level spam throttle: it lifts on its own, on a scale of
-// hours, and hammering it feeds the very signal that raised it.
+// hours, and hammering it feeds the very signal that raised it. Because it is
+// about the NUMBER, the loop also parks on these rungs (senderThrottleUntil in
+// campaignLoop) — so they are how long the whole run waits, not just one row.
 const RETRY_LADDERS = {
   131049: [24, 24, 24].map(h => h * 3600000),
   131048: [4, 12, 24].map(h => h * 3600000),
@@ -259,6 +282,27 @@ const RETRY_LADDERS = {
 // One place answers "how long until this code's next go" for BOTH entrances —
 // the send response and the failure webhook — so they cannot walk two ladders.
 const backoffFor = code => RETRY_LADDERS[Number(code)] || RETRY_BACKOFF_MS;
+
+// The ceiling over every ladder a contact climbs in one run: the default five
+// plus 131049's three. Each code's rung count restarts when a different code
+// interrupts it, so a contact whose sends alternate between a network blip and
+// a 131049 refusal never finishes either ladder — without a cap on the TOTAL
+// they would be retried, and billed, forever.
+const MAX_RETRIES_TOTAL = 8;
+
+// A contact's position on the ladder for THIS code, asked by both entrances so
+// they cannot disagree about which rung someone is on. `attempts` is the total —
+// what the report shows as "tried N×" — and never resets; `ladder_attempts` is
+// the rung of `ladder_code`'s ladder, so a contact who burned three network
+// blips still gets all three of 131049's day-spaced rungs. Number() on both
+// sides because a code can come back from SQL or a webhook as text; the null
+// check because Number(null) is 0, and a fresh row must not match code 0.
+function ladderPosition(row, code) {
+  const ladder = backoffFor(code);
+  const made = row.ladder_code != null && Number(row.ladder_code) === Number(code)
+    ? (row.ladder_attempts || 0) : 0;
+  return { ladder, made, exhausted: made >= ladder.length || (row.attempts || 0) >= MAX_RETRIES_TOTAL };
+}
 
 // Below this, a wait for the next retry deadline is spent silently — see the
 // long note at the `waiting` branch in campaignLoop. One minute rather than a
@@ -297,18 +341,18 @@ const clockIST = ms => new Date(ms).toLocaleTimeString('en-IN',
 const deferIfQuiet = t => (QUIET_HOURS ? deferPastQuietHours(t) : t);
 
 // True when the contact was put back in the queue; false when the caller should
-// record a terminal skip. `row.attempts` is how many retries this contact has
-// already had — the SQL increments it, so it cannot drift.
+// record a terminal skip. Which rung this contact is on is ladderPosition's
+// answer, read off the row — the SQL increments both counts, so neither can
+// drift.
 // `runId` is passed in rather than read from S here, and for the same reason the
 // loop captures it before the await: this runs after sendTemplate() has resolved,
 // and a /api/reset landing in that window would otherwise park the contact on a
 // null run — a row that matches nothing, so the retry is simply lost.
 function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
   if (skipDisposition(result.errorCode) !== 'retry') return false;
-  const ladder = backoffFor(result.errorCode);
-  const made = row.attempts || 0;
-  if (made >= ladder.length) {
-    log('warn', `${n} ${contact.name} — still failing after ${made + 1} attempts, reporting it [${result.errorCode}]`);
+  const { ladder, made, exhausted } = ladderPosition(row, result.errorCode);
+  if (exhausted) {
+    log('warn', `${n} ${contact.name} — still failing after ${(row.attempts || 0) + 1} attempts, reporting it [${result.errorCode}]`);
     return false;
   }
   // Deferred before it is stored, not before it is read: retry_after is both
@@ -331,6 +375,12 @@ function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
 // different idea of which codes count. Which ones do is
 // lib/errors.js:skipDisposition; `permanent` is its name for exactly this.
 //
+// Not every permanent code is about the number. 131050 is the person turning
+// marketing from this business off inside WhatsApp: switched off just the same,
+// but as an opt-out (lib/errors.js:disableReasonFor), so the report files them
+// with the people who asked us to stop rather than calling them "not on
+// WhatsApp" — and the log line says which of the two it was.
+//
 // disable() writes both the contacts row and the suppressed row, and it is a
 // no-op when the contact is already off for the same reason — so a redelivered
 // webhook, a replayed envelope and a second run all cost nothing. The
@@ -340,8 +390,11 @@ function scheduleRetry(contact, row, result, n, runId = S.currentRunId) {
 // Returns true only on the transition, so the caller logs once.
 function suppressIfPermanent(dialStr, code, name = null, prefix = '') {
   if (skipDisposition(code) !== 'permanent') return false;
-  if (!disable(dialStr, 'failed_hard', name)) return false;
-  log('warn', `${prefix} ${name || '+' + dialStr} switched off — Meta reports this number as undeliverable (usually: not on WhatsApp), so no later run will try it`.trim());
+  const reason = disableReasonFor(code);
+  if (!disable(dialStr, reason, name)) return false;
+  log('warn', `${prefix} ${name || '+' + dialStr} switched off — ${reason === 'opt_out'
+    ? 'they turned off marketing from you in WhatsApp, so no later run will message them unless they opt back in'
+    : 'Meta reports this number as undeliverable (usually: not on WhatsApp), so no later run will try it'}`.trim());
   return true;
 }
 
@@ -353,17 +406,56 @@ function suppressIfPermanent(dialStr, code, name = null, prefix = '') {
 // the per-user marketing cap the ladder was lengthened to five rungs FOR, almost
 // always arrives this way rather than in the send response.
 //
-// This runs on the webhook thread, never inside the loop, and it deliberately
-// does not interrupt anything: it only edits the queue row. A campaign still
-// sending walks past the row and picks it up when the deadline comes due; a
-// campaign that already finished is restarted below. Either way the contacts
-// still un-messaged are reached first, and the parked failures come after.
+// This runs on the webhook thread, never inside the loop, and a retry does not
+// interrupt anything: it only edits the queue row. A campaign still sending
+// walks past the row and picks it up when the deadline comes due; a campaign
+// that already finished is restarted below. Either way the contacts still
+// un-messaged are reached first, and the parked failures come after. The one
+// interruption is a fault that fails every send (the halt at the top), which
+// stops the loop through the same pauseFlag an operator's Pause sets.
 //
 // Which codes get a second attempt is lib/errors.js:skipDisposition, the same
 // whitelist the send-time path uses — a wrong number or a number not on
 // WhatsApp is 'permanent' and is switched off rather than retried, because no
 // number of attempts changes the answer and each one costs a send slot.
 function handleDeliveryFailure({ waId, runId, wamid, code }) {
+  // ── A fault that fails EVERY send, arriving after the accept ──────────────────
+  // Billing holds, paused templates and account restrictions mostly arrive here
+  // rather than in the send response — Meta accepts, then refuses. The loop's
+  // halt only saw the send-time half, so a campaign walked on into the fault and
+  // every accepted send came back refused: the whole list spent on one fact.
+  // Same park the loop uses (lib/errors.js:haltsCampaign), minus the skip: the
+  // row already carries its failure, and the contacts still pending stay
+  // pending, so Resume after the fix loses nobody.
+  //
+  // Only the live campaign, and only the current run. A stale run has nothing
+  // walking it; an idle or finished one has no loop to stop, and a flag left set
+  // there would greet the next Start as a pause. Parks once: a second halt, or
+  // one landing on a pause already under the flag — the operator's own included
+  // — adds a log line and changes nothing else. (A redelivery or a replay never
+  // gets here: applyStatus only hands over the transition into failed.) And a Stop in flight
+  // is final: /stop has cleared the flag and said idle, but campaignActive()
+  // stays true until the loop notices, and a pause repainted in that window is
+  // what used to let a stopped run come back.
+  if (haltsCampaign(code) && runId === S.currentRunId && campaignActive() && !flags.stopFlag) {
+    if (!flags.pauseFlag) {
+      const hint = explainError(code);
+      flags.pauseFlag = true;
+      S.phase = 'paused';
+      S.pauseReason = `Campaign paused — ${hint || 'Meta refused a delivery for a reason that fails every send'} [${code}]`;
+      log('error', `+${waId} — Meta refused a delivery [${code}] for a reason that fails every send — campaign paused. Fix the cause, then press Resume.`);
+      if (hint) log('error', `   ↳ ${hint}`);
+      saveCampaignNow(); broadcast();
+    } else {
+      // Already parked — by an earlier halt or by the operator. Not re-parked:
+      // the first reason stays on screen, and the operator's Pause stays
+      // theirs. But not swallowed either: each refusal is one more contact the
+      // fault reached, and the log is where the operator counts them.
+      log('warn', `+${waId} — Meta refused a delivery [${code}] for a reason that fails every send; the campaign is already paused, so nothing else changes.`);
+    }
+    return 'halted';
+  }
+
   const disp = skipDisposition(code);
 
   // About the NUMBER, not about the moment. The send-time path disables these
@@ -393,13 +485,13 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
   // rebuilt. Nothing to put back.
   if (!row || row.wamid !== wamid) return 'stale';
 
-  const ladder = backoffFor(code);
-  const made = row.attempts || 0;
-  if (made >= ladder.length) {
-    // This code's whole ladder is spent. The cap belongs to the recipient, not
-    // to the attempt, so there is no ladder length that zeroes it — see the
-    // note above RETRY_LADDERS. They stay in `failed` and the run closes.
-    log('warn', `+${waId} — still not delivered after ${made + 1} attempts, giving up [${code}]`);
+  const { ladder, made, exhausted } = ladderPosition(row, code);
+  if (exhausted) {
+    // This code's whole ladder is spent, or the contact has used up the total
+    // ceiling. The cap belongs to the recipient, not to the attempt, so there is
+    // no ladder length that zeroes it — see the note above RETRY_LADDERS. They
+    // stay in `failed` and the run closes.
+    log('warn', `+${waId} — still not delivered after ${(row.attempts || 0) + 1} attempts, giving up [${code}]`);
     return 'exhausted';
   }
   const at = deferIfQuiet(Date.now() + ladder[made]);
@@ -436,6 +528,45 @@ async function sleepUntil(at) {
     if (flags.stopFlag || flags.pauseFlag) return;
     await sleep(Math.min(1000, at - Date.now()));
   }
+}
+
+// Quality gates the warm-up climb (warmup.js:rawStep), and the rating the loop
+// holds was read at /start — or whenever someone last opened Settings. A
+// campaign parked overnight on the cap woke into a new day and climbed a rung
+// on a rating that could have turned RED hours before. So the cap park asks
+// again as it ends, before the cap is re-derived — belt and braces beside
+// Meta's phone_number_quality_update webhook, which can be unsubscribed or lost.
+//
+// Never throws — the loop awaits it — and a failure keeps the last rating: no
+// answer is not a GREEN answer, and neither is an answer with no rating in it
+// (adoptQuality). fetchAccountInfo resolves { error } for a Graph refusal and
+// rejects on a network one (or its timeout); both are said.
+//
+// Raced against the loop's own flags, in slices like sleepUntil: the Graph call
+// can take up to TIMEOUTS.graphMs to give up, flags.running stays true while it
+// does, and campaignBlocker() refuses every Start and upload for that long — so
+// a Stop or a Pause pressed while Meta is slow is answered within the slice,
+// not after the timeout. The abandoned request ends on its own timeout, and its
+// answer is not used.
+async function refreshQuality() {
+  const keep = () => `Keeping the last rating (${S.quality ?? 'none yet'}).`;
+  let settled = false;
+  const interrupted = (async () => {
+    while (!settled && !flags.stopFlag && !flags.pauseFlag) await sleep(100);
+    return { interrupted: true };
+  })();
+  try {
+    const info = await Promise.race([fetchAccountInfo(), interrupted]);
+    if (info?.interrupted) return;
+    const rating = info?.qualityRating;
+    if (!QUALITY_RATINGS.includes(rating)) {
+      log('warn', `Could not re-read the quality rating — ${info?.error || `Meta's answer had no rating (${rating ?? 'none'})`}. ${keep()}`);
+    } else if (adoptQuality(rating)) {
+      log('info', `Quality rating is now ${rating}`);
+    }
+  } catch (e) {
+    log('warn', `Could not re-read the quality rating — ${e?.message ?? e}. ${keep()}`);
+  } finally { settled = true; }
 }
 
 // ── One campaign at a time ─────────────────────────────────────────────────────
@@ -478,7 +609,36 @@ function campaignBlocker() {
 function startLoop() {
   if (flags.running) return;
   flags.pauseFlag = false; flags.stopFlag = false; flags.running = true;
-  campaignLoop().catch(e => { log("error", "Loop: " + e.message); flags.running = false; });
+  campaignLoop().catch(e => {
+    flags.running = false;
+    // Park honestly. Left as it was, the phase went on saying 'running' with no
+    // loop behind it: the dashboard showed a campaign in progress that would
+    // never move, and campaignBlocker() answered every Start and upload with
+    // "still sending". pauseFlag is what makes /api/resume treat this as the
+    // operator's pause to lift — Resume restarts the loop at the same row,
+    // because the queue is on disk — and the reason is not USER_PAUSE, so a
+    // reboot resumes it on its own like every other pause the loop gave itself.
+    log('error', 'Loop: ' + (e?.message ?? e));
+    if (flags.stopFlag) {
+      // A Stop or Reset already in flight is the operator's last word: both
+      // mean idle, exactly as the loop's own stop exit leaves it. Parking it as
+      // a resumable pause would bring back a campaign they stopped, one Resume
+      // or one reboot later.
+      S.phase = 'idle'; S.pauseReason = null; flags.pauseFlag = false;
+    } else {
+      flags.pauseFlag = true;
+      S.phase = 'paused';
+      // The operator's own Pause stays theirs. Any other reason makes the next
+      // boot resume it on its own (resumeIfInterrupted), which is right for the
+      // crash and wrong for a pause somebody chose; the error is in the log.
+      if (S.pauseReason !== USER_PAUSE) {
+        S.pauseReason = `The send loop stopped on an error — ${e?.message ?? e}. Press Resume to carry on from the same contact.`;
+      }
+    }
+    // Its own try: the crash may have BEEN the disk or the database, and a throw
+    // from here would be an unhandled rejection that takes the process down.
+    try { saveCampaignNow(); broadcast(); } catch { /* the park above is what matters */ }
+  });
 }
 
 async function campaignLoop() {
@@ -489,10 +649,18 @@ async function campaignLoop() {
   // — the ladder — is a column on the row.
   let rateLimited = { phone: null, n: 0 };
   while (true) {
-    // The phase is only set here if nobody has already set it. /stop and /reset
-    // say 'idle' the moment they are called, and overwriting that with 'done' a
-    // second later told the operator "Finished" about a run they stopped.
-    if (flags.stopFlag)  { log('info', 'Stopped'); if (S.phase !== 'idle') S.phase = 'done'; saveCampaignNow(); broadcast(); break; }
+    // Only /stop and /reset set stopFlag, and both mean idle — so a Stop leaves
+    // the campaign idle, whatever was painted since. It used to keep any phase
+    // but idle and promote it to 'done', and 'done' is the one phase a failure
+    // webhook reopens: a halt that repainted a pause between the Stop and this
+    // exit let a later 131049 restart a campaign the operator had stopped. Never
+    // 'done' either for the plain case — that told the operator "Finished" about
+    // a run they stopped.
+    if (flags.stopFlag) {
+      log('info', 'Stopped');
+      S.phase = 'idle'; S.pauseReason = null; flags.pauseFlag = false;
+      saveCampaignNow(); broadcast(); break;
+    }
     if (flags.pauseFlag) { await sleep(500); continue; }
     // The queue is asked, never counted. Nothing in this loop holds a cursor
     // that a crash could leave ahead of what was actually sent.
@@ -542,23 +710,53 @@ async function campaignLoop() {
     // null is "no cap at all": the warm-up ladder is complete (or off) and the
     // operator has set no number of their own, so how much this number may send
     // today is Meta's business and the loop does not park for it.
-    const cap   = effectiveCap();
-    const today = dailyCount();
-    if (cap !== null && today >= cap) {
-      const nextMidnight = nextIstMidnight();
-      const wait = nextMidnight - Date.now();
-      const h = Math.floor(wait / 3600000), m = Math.floor((wait % 3600000) / 60000);
-      const w = warmupCap();
-      const why = w !== null && w === cap
-        ? `Warm-up ceiling for day ${W.days.length}` : 'Daily cap';
-      log('info', `${why} ${today}/${cap} — resuming in ${h}h ${m}m`);
-      S.phase = 'paused'; S.pauseReason = `${why} reached (${cap}/day). Resumes in ${h}h ${m}m.`; broadcast();
+    //
+    // Compared against capCount(), not today's count: while the warm-up rung is
+    // the cap in force it is counted over Meta's rolling 24 hours, and your own
+    // cap over the IST day — warmup.js:capWindow says which, and why.
+    const cap = effectiveCap();
+    if (cap !== null && capCount() >= cap) {
+      // When a slot comes back depends on the window. A day frees everything at
+      // IST midnight. The rolling window frees one contact at a time, 24 hours
+      // after their latest send, so the next send is due when the earliest of
+      // those leaves — hours before midnight, or long after it. The fallback only
+      // guards the two queries disagreeing (every counted send leaving the window
+      // between them): a short silent wait, then the count is asked again.
+      //
+      // The rung itself moves at IST midnight — a new sending day climbs one,
+      // and graduation lifts it after the top rung — so a rolling park wakes at
+      // whichever comes first and lets the wake re-derive the cap. Sleeping to
+      // the seat alone slept through the climb: a window filled at 20:00 waited
+      // until 20:00 the next day while the new rung had room from midnight.
+      const rolling = capWindow() === '24h';
+      const midnight = nextIstMidnight();
+      const slot = rolling ? (slotFreesAt() ?? Date.now() + ANNOUNCE_WAIT_MS) : null;
+      const until = rolling ? Math.min(slot, midnight) : midnight;
+      // Yesterday's contacts leave the rolling window as far apart as they were
+      // sent — seconds, at campaign pace — so a loop at the ceiling parks once
+      // per freed slot. Announcing each of those is the slowdown described at
+      // the `waiting` branch above: a log line, a broadcast and a phase flap per
+      // send. Same rule as there: a wait this short is slept, silently.
+      if (until - Date.now() <= ANNOUNCE_WAIT_MS) { await sleepUntil(until); continue; }
+      // The sentence names the ceiling that said no and the window it counts,
+      // because "why did the campaign stop at 50" has two answers now.
+      S.phase = 'paused';
+      S.pauseReason = rolling
+        ? `Warm-up ceiling: ${cap} people in the last 24 hours (day ${warmupDay()}). Next send at ${clockIST(slot)}`
+          + `${midnight < slot ? ' — sooner if the new day\'s rung is higher' : ''}.`
+        : `Daily cap reached (${cap}/day). Resumes at ${clockIST(until)}.`;
+      log('info', S.pauseReason);
+      broadcast();
       // sleepUntil, not sleep: this wait is up to a full day. A bare sleep here
       // meant a Stop set stopFlag that nothing read until tomorrow — and since
       // `flags.running` stays true until the loop exits, campaignBlocker()
       // refused every Start and every CSV upload for those hours with "still
       // stopping, try again in a second".
-      await sleepUntil(nextMidnight);
+      await sleepUntil(until);
+      // The rating before the rung: the next capCount() check is asked of it.
+      // The flags are read again after the await — a Stop or a Pause that lands
+      // while Meta is answering must not be painted over with 'running'.
+      if (!flags.stopFlag && !flags.pauseFlag) await refreshQuality();
       if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue;
     }
@@ -622,6 +820,28 @@ async function campaignLoop() {
       if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
       continue;
     }
+    // ── A throttle on the NUMBER, not on this contact ─────────────────────────
+    // 131048 fails every send while it is in force. The loop used to park only
+    // the contact who met it and walk straight on to the next — on a long list,
+    // hundreds of guaranteed failures at full tempo, each burning a rung and
+    // feeding the spam signal that raised the throttle. The deadline is the
+    // latest live 131048 rung on this run's queue, written by either ladder
+    // entrance; when it passes, the next contact is the probe, and a probe that
+    // fails again gets its own rung and parks the loop again. One probe per rung,
+    // never a walk. No pauseFlag: like the cap, this is the loop's own pause, so
+    // /resume refuses with the sentence and a crash resumes it on the next boot.
+    // ponytail: the sentence names 131048 because it is the only SENDER_LEVEL
+    // code; a second one would need the query to return which code it found.
+    const throttle = senderThrottleUntil(runId);
+    if (throttle) {
+      S.phase = 'paused';
+      S.pauseReason = `Meta is limiting this number over spam signals [131048] — sending pauses until ${clockIST(throttle)}. Contacts already reached are unaffected.`;
+      log('warn', S.pauseReason);
+      saveCampaignNow(); broadcast();
+      await sleepUntil(throttle);
+      if (!flags.stopFlag && !flags.pauseFlag) { S.phase = 'running'; S.pauseReason = null; broadcast(); }
+      continue;
+    }
     // `attempt` is on the line because the index in front of it moves BACKWARDS
     // when the webhook ladder un-stamps a wamid, and a reader with no other
     // signal reads that as the loop starting over.
@@ -666,15 +886,18 @@ async function campaignLoop() {
                              ?? `[template: ${S.config.templateName}]`,
                        runId });
       if (early) handleDeliveryFailure(early);   // its failure webhook beat this send's response
-      // Re-read rather than `today + 1`: the message row is already written, and
-      // asking the queue again is what keeps this line and the cap check reading
-      // the same number even when a failure webhook landed mid-send.
-      log('success', `${n} accepted — today:${dailyCount()}/${cap ?? 'no cap'}`);
+      // Re-read rather than a count plus one: the message row is already written,
+      // and asking again is what keeps this line and the cap check reading the
+      // same number — over the same window — even when a failure webhook landed
+      // mid-send.
+      log('success', `${n} accepted — ${capWindow() === '24h' ? 'last 24h' : 'today'}:${capCount()}/${cap ?? 'no cap'}`);
     } else if (result.skip) {
       // A property of the NUMBER, not of the attempt: not on WhatsApp, or
-      // blocked by Meta on quality grounds. Retrying it is never right, and left
-      // enabled it burns a send slot on every run, forever. The other skippable
-      // codes are about the moment, so they change nothing.
+      // blocked by Meta on quality grounds — or the person's own choice, having
+      // turned our marketing off in WhatsApp (131050, switched off as an
+      // opt-out). Retrying is never right, and left enabled it burns a send
+      // slot on every run, forever. The other skippable codes are about the
+      // moment, so they change nothing.
       suppressIfPermanent(contact.dialStr, result.errorCode, contact.name, n);
       // 131049 lands here: the per-person marketing cap is about the moment, so
       // it goes back on the queue rather than out of the run.
@@ -693,6 +916,12 @@ async function campaignLoop() {
       rateLimited = { phone: contact.dialStr, n: rateLimited.n + 1 };
       const what = result.rateLimit ? 'Rate limit' : 'Network problem';
       log('warn', `${what} — backing off ${Math.round(result.retryAfter / 1000)}s (${rateLimited.n} of ${RATE_LIMIT_RETRIES}). ${result.hint || result.error} [${result.errorCode}]`);
+      // A Pause, a halt or a Stop that landed while this send was in flight
+      // wins: painting "auto-resuming" over it promised a resume that never
+      // comes — and over the operator's Pause, a reason other than USER_PAUSE
+      // made the next boot resume it. The contact is still pending, so the
+      // Resume that lifts the pause retries them first.
+      if (flags.pauseFlag || flags.stopFlag) continue;
       S.phase = 'paused'; S.pauseReason = `${what} — auto-resuming`; broadcast();
       // Same reason as the daily cap above: Meta's retry-after is minutes, not
       // seconds, and a Stop must not wait it out.
@@ -732,9 +961,11 @@ async function campaignLoop() {
 // nothing downstream could tell.
 //
 // The grace period gives the network and Meta's API time to come back first.
+// It is a parameter below only so test.js can drive the timer without waiting
+// ten real seconds; server.js always takes the default.
 const RESUME_GRACE_MS = 10000;
 
-function resumeIfInterrupted() {
+function resumeIfInterrupted({ graceMs = RESUME_GRACE_MS } = {}) {
   const saved = loadCampaign();
   if (!saved) return;
   const p = progressForRun(S.currentRunId);
@@ -761,15 +992,27 @@ function resumeIfInterrupted() {
     log('info', `Campaign restored — ${p.sent + p.skipped}/${p.total} done, phase ${S.phase}`);
     return;
   }
+  // The exact sentence, kept: it is how the timer below knows nobody has acted
+  // on the announcement since.
+  const graceReason = `Server restarted — resuming ${p.pending} remaining contacts in ${graceMs / 1000}s`;
   S.phase       = 'paused';
-  S.pauseReason = `Server restarted — resuming ${p.pending} remaining contacts in ${RESUME_GRACE_MS / 1000}s`;
-  log('warn', `Campaign was interrupted at ${p.sent + p.skipped}/${p.total} — auto-resuming in ${RESUME_GRACE_MS / 1000}s`);
+  S.pauseReason = graceReason;
+  log('warn', `Campaign was interrupted at ${p.sent + p.skipped}/${p.total} — auto-resuming in ${graceMs / 1000}s`);
   setTimeout(() => {
+    // Stop, Pause and Reset each change the phase or the reason, and an operator
+    // who answers the "resuming in 10s" banner with one of them meant it.
+    // Resuming anyway erased the command — startLoop() clears both flags — and
+    // sent a campaign the operator had just ended. Nothing resurrects a
+    // campaign the operator ended: that rule binds this timer exactly as it
+    // binds the webhook ladder. `flags.running` covers anything that already
+    // started a loop in the window, so this can never put a second one on the
+    // queue.
+    if (S.phase !== 'paused' || S.pauseReason !== graceReason || flags.running) return;
     S.phase = 'running'; S.pauseReason = null;
     log('info', `Auto-resumed — ${progressForRun(S.currentRunId).pending} contacts left`);
     broadcast();
     startLoop();
-  }, RESUME_GRACE_MS).unref();
+  }, graceMs).unref();
 }
 
 // Open a run and stage its queue in one step, so no caller can create one
@@ -791,6 +1034,6 @@ module.exports = {
   CONTACT_FIELDS, buildParams, missingParams, sendTemplate, stageRun, suppressIfPermanent,
   startLoop, saveCampaign, saveCampaignNow, clearCampaignFile, loadCampaign, resumeIfInterrupted,
   campaignActive, campaignBlocker, scheduleRetry, handleDeliveryFailure, RETRY_BACKOFF_MS,
-  RETRY_LADDERS, backoffFor,
-  USER_PAUSE, RATE_LIMIT_RETRIES,
+  RETRY_LADDERS, backoffFor, MAX_RETRIES_TOTAL, ladderPosition,
+  USER_PAUSE, RATE_LIMIT_RETRIES, refreshQuality,
 };

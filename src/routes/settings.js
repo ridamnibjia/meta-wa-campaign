@@ -5,7 +5,7 @@ const { S, log } = require('../state');
 const { buildState, broadcast } = require('../services/status');
 const { fetchAccountInfo } = require('../services/graph');
 const { CONTACT_FIELDS } = require('../services/campaign');
-const { W, saveWarmup, warmupCap, warmupStep, graduated } = require('../services/warmup');
+const { W, saveWarmup, warmupCap, warmupStep, graduated, adoptQuality } = require('../services/warmup');
 const { missingParams } = require('../services/campaign');
 const diagnostics = require('../services/diagnostics');
 const { replayUnprocessed } = require('../services/ingest');
@@ -105,7 +105,7 @@ router.post('/params', (req, res) => {
 router.get('/account-info', async (req, res) => {
   try {
     const info = await fetchAccountInfo();
-    if (info.qualityRating) S.quality = info.qualityRating;
+    adoptQuality(info.qualityRating);   // 'UNKNOWN' is shown, never adopted — it would lift a held rung
     res.json(info);
   } catch (e) { res.json({ error: e.message }); }
 });
