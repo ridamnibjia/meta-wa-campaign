@@ -32,7 +32,13 @@ const upsertContact = db.prepare(`
   INSERT INTO contacts (phone, name, fields_json, first_seen)
   VALUES (?, ?, ?, ?)
   ON CONFLICT(phone) DO UPDATE SET
-    name        = excluded.name,
+    -- 'Contact' is the placeholder parseCSV stamps on a name-less row — a
+    -- numbers-only export, or a header nothing named. Letting that literal win
+    -- unconditionally meant every re-upload of such a file reset the name back
+    -- to the placeholder, erasing a rename the operator typed by hand or a real
+    -- name an earlier, better upload had carried. A genuine name always wins; a
+    -- placeholder never overwrites what is already on the row.
+    name        = COALESCE(NULLIF(excluded.name, 'Contact'), contacts.name),
     -- COALESCE, because the two-column CSV the export route produces carries no
     -- extra fields, and the round trip it advertises ("re-upload when the
     -- original file is gone") must not be the thing that wipes the fields the

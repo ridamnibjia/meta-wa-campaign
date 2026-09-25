@@ -3157,6 +3157,20 @@ console.log('\ncontacts — enable / disable');
     assert.equal(C.getRow(p).first_seen, first, 'but the contact is not newly seen');
   });
 
+  test('a manual rename survives a numbers-only re-upload; a brand-new row still gets "Contact"', () => {
+    const p1 = phone(), p2 = phone();
+    C.upsertFromCsv(parseCSV(Buffer.from(`${p1}\n`)).contacts, {});
+    assert.equal(C.rename(p1, 'Asha Rao').ok, true);
+
+    // Re-upload the same headerless, numbers-only file — which parses p1's
+    // name back to the 'Contact' placeholder — alongside a number never seen
+    // before.
+    C.upsertFromCsv(parseCSV(Buffer.from(`${p1}\n${p2}\n`)).contacts, {});
+    assert.equal(C.getRow(p1).name, 'Asha Rao',
+      'the placeholder from a numbers-only re-upload must not overwrite a real name');
+    assert.equal(C.getRow(p2).name, 'Contact', 'a genuinely new row with no name is still the placeholder');
+  });
+
   test('extra CSV columns are stored verbatim for a later phase to read', () => {
     const p = phone();
     const file = Buffer.from(`Name,Mobile Phone,City\nAsha,${p},Pune\n`);
