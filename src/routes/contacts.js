@@ -37,7 +37,7 @@ router.post('/upload-csv', (req, res, next) => {
     // list out from under a running send is not.
     const blocked = campaignBlocker();
     if (blocked) return res.json({ ok: false, error: blocked });
-    const { contacts: parsed, skipped, duplicates, headers, guessedPhone } = parseCSV(req.file.buffer);
+    const { contacts: parsed, skipped, duplicates, headers, guessedPhone, guessedCountry } = parseCSV(req.file.buffer);
     // Refused BEFORE stageRun: staging replaces the queue and opens a new run,
     // and an empty file must not swap a real campaign's queue for nothing.
     if (!parsed.length) {
@@ -67,6 +67,12 @@ router.post('/upload-csv', (req, res, next) => {
     if (guessedPhone) {
       log('warn', `CSV — no column header names a phone, so the numbers were read by ${guessedPhone}. Check the parsed list before starting.`);
     }
+    // A second, independent guess: the phone COLUMN can be perfectly named and
+    // still hold bare 10-digit numbers with no country code. Said out loud for
+    // the same reason as guessedPhone — this list may not even be Indian.
+    if (guessedCountry) {
+      log('warn', `CSV — ${guessedCountry} of ${parsed.length} numbers had no country code and were assumed Indian (+91) — check the preview if this list is not Indian`);
+    }
     // Loudly, and at warn level. A row the parser could not read is a customer
     // who will not be messaged, and the operator is the only one who can tell
     // whether that is a blank line at the end of the file or a broken export.
@@ -90,6 +96,9 @@ router.post('/upload-csv', (req, res, next) => {
       skipped: skipped.length, skippedRows: skipped.slice(0, 20),
       duplicates: duplicates.length, duplicateRows: duplicates.slice(0, 20),
       newCount: upload.newCount,
+      // Contract C3 (B5 → B7): both guesses, on the response itself, not just
+      // in the server log — the frontend preview has no other way to ask.
+      guessedCountry, guessedPhone,
       billable, estimate: estimateCost(billable, rate), rate,
     });
   } catch (e) { res.json({ ok: false, error: e.message }); }

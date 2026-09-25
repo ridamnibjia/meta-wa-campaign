@@ -32,7 +32,13 @@ const upsertContact = db.prepare(`
   INSERT INTO contacts (phone, name, fields_json, first_seen)
   VALUES (?, ?, ?, ?)
   ON CONFLICT(phone) DO UPDATE SET
-    name        = excluded.name,
+    -- 'Contact' is the placeholder parseCSV stamps on a name-less row — a
+    -- numbers-only export, or a header nothing named. Letting that literal win
+    -- unconditionally meant every re-upload of such a file reset the name back
+    -- to the placeholder, erasing a rename the operator typed by hand or a real
+    -- name an earlier, better upload had carried. A genuine name always wins; a
+    -- placeholder never overwrites what is already on the row.
+    name        = COALESCE(NULLIF(excluded.name, 'Contact'), contacts.name),
     -- COALESCE, because the two-column CSV the export route produces carries no
     -- extra fields, and the round trip it advertises ("re-upload when the
     -- original file is gone") must not be the thing that wipes the fields the
@@ -197,9 +203,13 @@ const WHERE = `
    WHERE (? = '' OR phone LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')
      AND (? = 'all' OR (? = 'enabled' AND enabled = 1) OR (? = 'disabled' AND enabled = 0))`;
 
+// enabled DESC, same rationale as allRows above: page 1 of the directory is
+// what an operator sees first, and it should lead with who a campaign will
+// actually reach, not who it will skip. This used to sort ASC, so opening the
+// directory led with exactly the contacts a campaign leaves out.
 const pageQ = db.prepare(`
   SELECT * FROM contacts ${WHERE}
-   ORDER BY enabled ASC, name COLLATE NOCASE ASC, phone ASC
+   ORDER BY enabled DESC, name COLLATE NOCASE ASC, phone ASC
    LIMIT ? OFFSET ?`);
 const pageCountQ = db.prepare(`SELECT count(*) AS n FROM contacts ${WHERE}`);
 
@@ -280,6 +290,11 @@ function migrateOptOuts(files = FILES) {
   }
 
   let imported = 0;
+  // disable() already fails closed on a bad number — it just returns false and
+  // says nothing. That is fine for the count, but an operator staring at
+  // "imported 41 of 43" has no way to learn which two did not carry over, so
+  // the entries themselves are collected and named below.
+  const unreadable = numbers.filter(n => normalizePhone(n) === null);
   db.exec('BEGIN');
   try {
     for (const n of numbers) if (disable(n, 'opt_out')) imported++;
@@ -291,6 +306,13 @@ function migrateOptOuts(files = FILES) {
 
   fs.renameSync(files.optOuts, `${files.optOuts}.migrated`);
   log('info', `Imported ${imported} opt-out(s) from opt-outs.json into contacts`);
+  if (unreadable.length) {
+    // Capped the same way routes/contacts.js reports skipped/duplicate CSV
+    // rows: the count in the sentence is always the true total, but a file
+    // with a hundred bad entries must not turn one log line into a hundred.
+    log('warn', `${unreadable.length} entries could not be read and are NOT suppressed: `
+      + `${unreadable.slice(0, 10).join(', ')}${unreadable.length > 10 ? '…' : ''}`);
+  }
   return { imported, skipped: false };
 }
 

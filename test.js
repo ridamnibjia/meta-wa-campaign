@@ -245,10 +245,10 @@ test('a blank sample slot is caught positionally, not by counting non-blanks els
     "['', 'Asha'] passed the old count-based check and Meta reviewed the 'there' fallback instead of the operator's word");
 });
 
-test('an empty CSV still answers with all three keys', () => {
+test('an empty CSV still answers with every key the route destructures', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
-  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null });
+  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0 });
 });
 
 test('csvField — defuses formulas, strips control chars, quotes, and round-trips', () => {
@@ -784,6 +784,28 @@ test('normalizePhone — prefixes 91, strips zero and formatting, rejects toll-f
   assert.equal(normalizePhone('12345'), null, 'rejects numbers that are too short');
   assert.equal(normalizePhone(''), null, 'rejects empty input');
 });
+test('normalizePhone reads the 00 international prefix', () => {
+  assert.equal(normalizePhone('0044 20 7946 0958'), '442079460958', 'no country code starts with 0 — sending 0044… always fails');
+  assert.equal(normalizePhone('00971 50 123 4567'), '971501234567');
+});
+test('toll-free rules: explicit + is trusted, Indian service lines are not', () => {
+  assert.equal(normalizePhone('+1 860 555 1234'), '18605551234', 'Hartford, Connecticut is a real area code');
+  assert.equal(normalizePhone('1860 123 4567'), null, 'a bare 1860 line is an Indian service number');
+  assert.equal(normalizePhone('+91 1800 123 4567'), null, 'the Indian toll-free the rule exists for, written the way CSV-FORMAT.md asks');
+  assert.equal(normalizePhone('91 1800 123 4567'), null);
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'an ordinary Indian mobile is untouched');
+});
+test('the Indian toll-free rule is checked against the number AFTER the +91 guess, not the bare digits', () => {
+  // Checking the pre-guess digits misread this bare 10-digit mobile as the
+  // +91 1800 line, because the raw string "9118001234" starts with "91" +
+  // "1800" by coincidence — a country code that did not exist yet, since
+  // nothing had prefixed one. The same person written with a leading zero
+  // took the OTHER branch (strip the 0, prefix 91) and was untouched by the
+  // rule either way, so one person got two different answers depending on
+  // which spelling they used.
+  assert.equal(normalizePhone('9118001234'), '919118001234', 'a bare mobile, not the toll-free line it coincidentally starts with');
+  assert.equal(normalizePhone('09118001234'), '919118001234', 'the same person, written with a leading zero, must agree with the bare form');
+});
 
 console.log('\nparseCSV');
 test('reads name and mobile, and dedupes', () => {
@@ -908,6 +930,30 @@ test('the value sniff never runs when a real phone header exists', () => {
   assert.equal(contacts.length, 1);
   assert.equal(contacts[0].dialStr, '919000000001', 'the account id stays an account id');
   assert.equal(guessedPhone, null);
+});
+test('parseCSV counts how many numbers were assumed Indian for lacking a country code', () => {
+  const csv = 'name,phone\nAsha,9000000001\nRahul,+91 90000 00002\n';
+  assert.equal(parseCSV(Buffer.from(csv)).guessedCountry, 1,
+    'one of the two rows carried no country code and was assumed +91 — the operator needs the count, not just a loaded file');
+});
+test('a fully +-written file guesses no country at all', () => {
+  const csv = 'name,phone\nAsha,+919000000001\nRahul,+919000000002\n';
+  assert.equal(parseCSV(Buffer.from(csv)).guessedCountry, 0);
+});
+test('guessedCountry never exceeds the contacts it describes, even when a guessed duplicate collapses away', () => {
+  // Two different spellings of the same number — one bare 10-digit, one with a
+  // leading zero — both need the +91 guess, and both normalize to one contact.
+  const csv = 'name,phone\nAsha,9000000001\nRahul,09000000001\n';
+  const { contacts, guessedCountry } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1, 'the two rows collapse to one contact');
+  assert.equal(guessedCountry, 1,
+    'a guessed row that turns out to be a duplicate must not inflate the count past what "N of TOTAL numbers" can mean');
+});
+test('guessedCountry still counts a bare 10-digit number that collides with the toll-free digit pattern', () => {
+  const csv = 'name,phone\nAsha,9118001234\n';
+  const { contacts, guessedCountry } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts[0].dialStr, '919118001234');
+  assert.equal(guessedCountry, 1, 'still a guess — the toll-free rule only rejects it once a 91 country code is actually in the number');
 });
 
 console.log('\nverifySignature');
@@ -3156,6 +3202,20 @@ console.log('\ncontacts — enable / disable');
     assert.equal(C.getRow(p).first_seen, first, 'but the contact is not newly seen');
   });
 
+  test('a manual rename survives a numbers-only re-upload; a brand-new row still gets "Contact"', () => {
+    const p1 = phone(), p2 = phone();
+    C.upsertFromCsv(parseCSV(Buffer.from(`${p1}\n`)).contacts, {});
+    assert.equal(C.rename(p1, 'Asha Rao').ok, true);
+
+    // Re-upload the same headerless, numbers-only file — which parses p1's
+    // name back to the 'Contact' placeholder — alongside a number never seen
+    // before.
+    C.upsertFromCsv(parseCSV(Buffer.from(`${p1}\n${p2}\n`)).contacts, {});
+    assert.equal(C.getRow(p1).name, 'Asha Rao',
+      'the placeholder from a numbers-only re-upload must not overwrite a real name');
+    assert.equal(C.getRow(p2).name, 'Contact', 'a genuinely new row with no name is still the placeholder');
+  });
+
   test('extra CSV columns are stored verbatim for a later phase to read', () => {
     const p = phone();
     const file = Buffer.from(`Name,Mobile Phone,City\nAsha,${p},Pune\n`);
@@ -3214,6 +3274,66 @@ console.log('\ncontacts — enable / disable');
   });
 }
 
+console.log('\ncontacts routes — /upload-csv reports the country guess (contract C3)');
+{
+  // Mirrors startMediaServer: the router mounted bare, so the JSON shape and
+  // the log line are exercised without the auth gate or the rest of the app.
+  function startContactsServer() {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/contacts'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  }
+
+  let seq = 0;
+  // Bare 10 digits, no country code — same shape as this suite's other
+  // fixtures (9000000001+), but counter-based like the other contacts test
+  // sections' phone()/nextPhone() generators, so a hard-coded literal here
+  // can never collide with a number some other test already seeded into the
+  // shared in-memory database.
+  const bareNum = () => `900000${String(++seq).padStart(4, '0')}`;
+
+  testAsync('the response and the log both name how many numbers were assumed Indian', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';                     // campaignBlocker must see no run in the way
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = `name,phone\nAsha,${bareNum()}\nRahul,+91 ${bareNum()}\n`;
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+      const before = S.logs.length;
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.guessedCountry, 1, 'contract C3 — B7 reads this straight off the response, not out of a log line');
+
+      const warned = S.logs.slice(before).some(l => l.level === 'warn' && /assumed Indian/.test(l.msg));
+      assert.ok(warned, 'a guess this large must be said out loud, the same way the guessed-column warning already is');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+
+  testAsync('a fully +-written upload guesses nothing, and the response says so', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = `Name,Mobile Phone\nAsha,+91 ${bareNum()}\n`;
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.guessedCountry, 0);
+      assert.equal(res.guessedPhone, null, 'a named header column is not a guess — contract C3 keeps both fields on every response');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+}
+
 console.log('\ncontacts — opt-outs.json import');
 {
   const C = require('./server').contacts;
@@ -3227,6 +3347,32 @@ console.log('\ncontacts — opt-outs.json import');
     assert.equal(C.getRow('919777700001').disabled_reason, 'opt_out');
     assert.ok(!fsx.existsSync(f), 'the source is renamed so a later boot has nothing to find');
     assert.ok(fsx.existsSync(`${f}.migrated`));
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
+  test('an entry the parser could not read is named in the warn log, not just missing from the count', () => {
+    const f = tmp();
+    fsx.writeFileSync(f, JSON.stringify(['919777700003', 'not-a-number']));
+    const before = S.logs.length;
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 1, 'the one parseable entry still imports');
+    const warned = S.logs.slice(before).some(l => l.level === 'warn' && /not-a-number/.test(l.msg));
+    assert.ok(warned, 'the count alone cannot say WHICH opt-out did not carry over — the entry has to be named');
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
+  test('a long list of unreadable entries is capped in the log, not printed in full', () => {
+    const f = tmp();
+    const bad = Array.from({ length: 12 }, (_, i) => `bad-entry-${i}`);
+    fsx.writeFileSync(f, JSON.stringify(['919777700005', ...bad]));
+    const before = S.logs.length;
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 1);
+    const warned = S.logs.slice(before).find(l => l.level === 'warn' && /could not be read/.test(l.msg));
+    assert.ok(warned, 'still warns even when the list is long');
+    assert.match(warned.msg, /^12 entries/, 'the count in the sentence is the true total, matching routes/contacts.js\'s skipped/duplicates reporting');
+    assert.ok(warned.msg.includes('…'), 'the list itself is capped at 10, same as skipped/duplicates rows');
+    assert.ok(!warned.msg.includes('bad-entry-11'), 'only the first 10 are named — a hundred-entry file must not become a hundred-name log line');
     fsx.rmSync(`${f}.migrated`, { force: true });
   });
 
@@ -7887,6 +8033,17 @@ console.log('\ncontacts — directory paging, rename, delete, suppression');
     assert.equal(last.rows.length, 1, 'the final page is short, not empty');
     assert.equal(contacts.page({ q: marker, limit: 2, offset: 99 }).rows.length, 0,
       'and paging past the end is empty rather than an error');
+  });
+
+  test('page 1 of "all" leads with enabled rows, the same rationale as the CSV export', () => {
+    const marker = `Order${Date.now()}`;
+    const pDisabled = nextPhone(), pEnabled = nextPhone();
+    seed(pDisabled, `${marker} disabled`);
+    contacts.disable(pDisabled, 'manual');
+    seed(pEnabled, `${marker} enabled`);
+    const first = contacts.page({ q: marker, limit: 10, offset: 0 });
+    assert.equal(first.rows[0].enabled, 1,
+      'an operator opening the directory should see who a campaign will reach first, not who it will skip');
   });
 
   test('a hand-edited limit cannot ask for the whole table', () => {
