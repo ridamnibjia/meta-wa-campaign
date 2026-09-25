@@ -248,7 +248,7 @@ test('a blank sample slot is caught positionally, not by counting non-blanks els
 test('an empty CSV still answers with all three keys', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
-  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null });
+  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0 });
 });
 
 test('csvField — defuses formulas, strips control chars, quotes, and round-trips', () => {
@@ -919,6 +919,15 @@ test('the value sniff never runs when a real phone header exists', () => {
   assert.equal(contacts.length, 1);
   assert.equal(contacts[0].dialStr, '919000000001', 'the account id stays an account id');
   assert.equal(guessedPhone, null);
+});
+test('parseCSV counts how many numbers were assumed Indian for lacking a country code', () => {
+  const csv = 'name,phone\nAsha,9000000001\nRahul,+91 90000 00002\n';
+  assert.equal(parseCSV(Buffer.from(csv)).guessedCountry, 1,
+    'one of the two rows carried no country code and was assumed +91 — the operator needs the count, not just a loaded file');
+});
+test('a fully +-written file guesses no country at all', () => {
+  const csv = 'name,phone\nAsha,+919000000001\nRahul,+919000000002\n';
+  assert.equal(parseCSV(Buffer.from(csv)).guessedCountry, 0);
 });
 
 console.log('\nverifySignature');
@@ -3203,6 +3212,58 @@ console.log('\ncontacts — enable / disable');
     const src = fsx.readFileSync('./src/services/inbox.js', 'utf8');
     assert.ok(!/services\/contacts|isDisabled|isEnabled/.test(src),
       'a disabled contact who writes in still deserves an answer');
+  });
+}
+
+console.log('\ncontacts routes — /upload-csv reports the country guess (contract C3)');
+{
+  // Mirrors startMediaServer: the router mounted bare, so the JSON shape and
+  // the log line are exercised without the auth gate or the rest of the app.
+  function startContactsServer() {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/contacts'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  }
+
+  testAsync('the response and the log both name how many numbers were assumed Indian', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';                     // campaignBlocker must see no run in the way
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = 'name,phone\nAsha,9000000001\nRahul,+91 90000 00002\n';
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+      const before = S.logs.length;
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.guessedCountry, 1, 'contract C3 — B7 reads this straight off the response, not out of a log line');
+
+      const warned = S.logs.slice(before).some(l => l.level === 'warn' && /assumed Indian/.test(l.msg));
+      assert.ok(warned, 'a guess this large must be said out loud, the same way the guessed-column warning already is');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+
+  testAsync('a fully +-written upload guesses nothing, and the response says so', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = 'Name,Mobile Phone\nAsha,+919000000001\n';
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.guessedCountry, 0);
+      assert.equal(res.guessedPhone, null, 'a named header column is not a guess — contract C3 keeps both fields on every response');
+    } finally { server.close(); S.phase = savedPhase; }
   });
 }
 

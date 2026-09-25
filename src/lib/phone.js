@@ -128,16 +128,19 @@ const isPhoneHeader = h => /phone|mobile|whatsapp/i.test(h) || /contact\s*(no\b|
 // broken export goes unnoticed for a whole campaign.
 //
 // Also returned: `headers` (what the file actually called its columns, so a
-// refusal can name them instead of shrugging) and `guessedPhone` (non-null when
+// refusal can name them instead of shrugging), `guessedPhone` (non-null when
 // no header named a phone and the numbers were found by their VALUES — a guess
-// the operator is told about, because the preview is where they can check it).
+// the operator is told about, because the preview is where they can check it),
+// and `guessedCountry` (how many numbers carried no country code and were
+// assumed +91 — a second, independent guess: a file can have a perfectly named
+// phone column and still be full of bare 10-digit numbers).
 function parseCSV(buffer) {
   const text = decodeCsv(buffer);
   const rows = tokenizeCsv(text, sniffDelimiter(text));
   // The same keys as the normal return: the route destructures all of them, and
   // an empty file that omits `duplicates` threw a TypeError AFTER a fresh empty
   // run had already been staged and made current.
-  if (!rows.length) return { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null };
+  if (!rows.length) return { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0 };
 
   let hdr = rows[0];
   let start = 1;
@@ -196,6 +199,7 @@ function parseCSV(buffer) {
   // file that lost 25 rows to a broken export and one that lists 25 dealers
   // twice look identical from the outside, and only one of them is fine.
   const contacts = [], skipped = [], duplicates = [], seen = new Map();
+  let guessedCountry = 0;
   for (let i = start; i < rows.length; i++) {
     const p = rows[i];
     // A modern Google export splits the name across two columns; an older one
@@ -211,8 +215,12 @@ function parseCSV(buffer) {
     for (const col of phoneCols) {
       const raw = p[col] || '';
       if (!raw) continue;
-      const d = normalizePhone(raw);
-      if (!d) continue;
+      // normalize() rather than normalizePhone() here, because this loop is the
+      // one place that can say WHICH rows the +91 guess actually fired for.
+      const norm = normalize(raw);
+      if (!norm) continue;
+      const { d, guessed } = norm;
+      if (guessed) guessedCountry++;
       usable = true;                       // the row had a number; a duplicate
       if (seen.has(d)) {                   // is not a row that failed to parse
         duplicates.push({ row: i + 1, name, dialStr: d, firstRow: seen.get(d) });
@@ -223,7 +231,7 @@ function parseCSV(buffer) {
     }
     if (!usable) skipped.push({ row: i + 1, name, reason: 'no usable phone number in this row' });
   }
-  return { contacts, skipped, duplicates, headers: hdr, guessedPhone };
+  return { contacts, skipped, duplicates, headers: hdr, guessedPhone, guessedCountry };
 }
 
 // One CSV field on the way OUT, for the directory export. The name column is a
