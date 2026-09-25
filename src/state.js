@@ -41,6 +41,11 @@ const S = {
     templateLanguage: CFG.templateLanguage,
     templateCategory: CFG.templateCategory,
     templateStatus:   null,   // APPROVED | PENDING | REJECTED — gates /api/start
+    // Set by adoptTemplate when the body or header carries a named variable
+    // ({{first_name}}) — this app only fills positional {{1}}, {{2}}…, and
+    // /api/start reads this to refuse with a sentence instead of sending the
+    // placeholder text verbatim. null otherwise.
+    templateUnsupported: null,
     paramCount:       0,      // number of {{n}} in the active template body
     paramValues:      [],     // one per {{n}}: { source: 'name' | 'fixed', value }
     templateBody:     null,   // the approved, UNRENDERED body — snapshotted onto each run

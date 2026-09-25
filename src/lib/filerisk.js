@@ -131,15 +131,23 @@ const MAGIC = [
 ];
 
 // Markup is the reason this whole module exists, so it gets a looser test than
-// a fixed signature: leading whitespace, a BOM, or an XML declaration before
-// <svg is still markup, and a browser asked to render it will find the script
-// tag either way.
-const MARKUP = /^[\s﻿]*<\s*(!doctype|\?xml|html|svg|body|script|meta|iframe)\b/i;
+// a fixed signature: leading whitespace or an XML declaration before <svg is
+// still markup, and a browser asked to render it will find the script tag
+// either way. No U+FEFF in the class: decoded as latin1 (below), the BOM's
+// three raw bytes (EF BB BF) become three unrelated Latin-1 characters, never
+// U+FEFF — a class that tried to match it here matched nothing.
+const MARKUP = /^\s*<\s*(!doctype|\?xml|html|svg|body|script|meta|iframe)\b/i;
 
 function sniff(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length === 0) return null;
   for (const [name, off, sig] of MAGIC) if (at(bytes, off, sig)) return name;
-  if (MARKUP.test(bytes.subarray(0, 256).toString('latin1'))) return 'html';
+  // Google Docs and Notepad both export HTML/SVG with a UTF-8 BOM prefix.
+  // Strip the three raw bytes before the MARKUP test, which is the only way
+  // to actually skip them — see the comment on MARKUP above for why the
+  // regex itself cannot.
+  const head = (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
+    ? bytes.subarray(3) : bytes;
+  if (MARKUP.test(head.subarray(0, 256).toString('latin1'))) return 'html';
   return null;
 }
 

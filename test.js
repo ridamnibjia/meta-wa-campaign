@@ -207,11 +207,26 @@ test('validateTemplateInput buttons — accepts a legal mix, enforces per-type c
   assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: false, buttons: [...qr(2), ...url(2), ...tel(1)] }), [], 'accepts a legal mix');
   assert.match(validateTemplateInput({ ...okBase, buttons: url(3) }).join(), /at most 2 URL/i, 'rejects 3 URL buttons');
   assert.match(validateTemplateInput({ ...okBase, buttons: tel(2) }).join(), /at most 1 (phone|call)/i, 'rejects 2 phone buttons');
-  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(3) }).join(), /at most 3 quick/i, 'the opt-out button counts toward the 3 quick-reply ceiling');
+  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(10) }).join(), /at most 10 quick/i, 'the opt-out button counts toward the 10 quick-reply ceiling');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop' }] }).join(), /needs a URL/i, 'rejects a URL button with no url');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop', url: 'javascript:alert(1)' }] }).join(), /https?:/i, 'rejects a non-http URL');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', url: 'https://example.com' }] }).join(), /label/i, 'rejects a button with no label');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'COPY_CODE', text: 'x' }] }).join(), /button type/i, 'rejects an unknown button type');
+});
+
+test('validateTemplateInput buttons — 10 quick replies are current Meta policy, not the old 3', () => {
+  assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(9) }), [],
+    '10 total (the opt-out plus 9 more) must be accepted, not just 3');
+});
+
+test('validateTemplateInput buttons — quick replies must sit together, opt-out included', () => {
+  const mixed = validateTemplateInput({ ...okBase, addOptOut: true, buttons: [url(1)[0], qr(1)[0]] }).join();
+  assert.match(mixed, /sit together/i,
+    'the opt-out (index 0) and the operator\'s own QUICK_REPLY (index 2) are split by a URL button — Meta rejects that order');
+
+  assert.deepEqual(
+    validateTemplateInput({ ...okBase, addOptOut: true, buttons: [...qr(2), ...url(1)] }),
+    [], 'both quick replies are contiguous with the opt-out — grouped, so this is fine');
 });
 
 test('the opt-out button is emitted first, before the operator\'s own', () => {
@@ -260,6 +275,68 @@ testAsync('an empty template name never matches the whole WABA', async () => {
   assert.deepEqual(await validateTemplate(''),   { found: false, name: '' });
   assert.deepEqual(await validateTemplate('  '), { found: false, name: '  ' });
 });
+
+console.log('\nfetchTemplates — pagination');
+{
+  const { fetchTemplates } = require('./server');
+  testAsync('follows paging.next so a large WABA is not silently truncated', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-paging';
+    const real = global.fetch;
+    const urls = [];
+    global.fetch = async url => {
+      urls.push(String(url));
+      return urls.length === 1
+        ? { ok: true, status: 200, json: async () => ({
+            data: [{ name: 'a', status: 'APPROVED', category: 'MARKETING', language: 'en' }],
+            paging: { next: 'https://graph.facebook.com/v23.0/test-waba-paging/message_templates?after=CURSOR' },
+          }) }
+        : { ok: true, status: 200, json: async () => ({
+            data: [{ name: 'b', status: 'APPROVED', category: 'MARKETING', language: 'en' }],
+          }) };
+    };
+    try {
+      const r = await fetchTemplates();
+      assert.equal(urls.length, 2, 'a second page must be fetched');
+      assert.equal(urls[1], 'https://graph.facebook.com/v23.0/test-waba-paging/message_templates?after=CURSOR',
+        'the second call must follow paging.next, not repeat the first page');
+      assert.deepEqual(r.templates.map(t => t.name), ['a', 'b'], "both pages' templates must be returned, not just the first");
+    } finally { global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers — a wedged
+  // connection here would hold up the templates picker or a delete for minutes.
+  testAsync('fetchTemplates carries graphMs on every page', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-timeout';
+    const { TIMEOUTS } = require('./src/config');
+    const realTimeout = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return realTimeout(ms); };
+    const real = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    try {
+      await fetchTemplates();
+      assert.deepEqual(seen, [TIMEOUTS.graphMs]);
+    } finally { AbortSignal.timeout = realTimeout; global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+
+  testAsync('deleteTemplate carries graphMs', async () => {
+    const { deleteTemplate } = require('./server');
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-del-timeout';
+    const { TIMEOUTS } = require('./src/config');
+    const realTimeout = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return realTimeout(ms); };
+    const real = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ success: true }) });
+    try {
+      await deleteTemplate('some_template');
+      assert.deepEqual(seen, [TIMEOUTS.graphMs]);
+    } finally { AbortSignal.timeout = realTimeout; global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+}
 
 console.log('\ntemplate row memory');
 test('a saved template row round-trips its header asset link', () => {
@@ -322,7 +399,299 @@ console.log('\nadopting a template — the attachment picked this session surviv
       'a session pick belongs to the template it was picked for');
   });
 
+  test('adoptTemplate refuses to switch template while a campaign is active', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.phase = 'waiting';
+    try {
+      const r = adoptTemplate('promo_b', shapedFor('promo_b'));
+      assert.deepEqual(r, { ok: false, error: 'A campaign is sending “promo_a” right now — stop it before switching templates.' },
+        'the remaining contacts of a live run must get the message the operator started');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { S.phase = savedPhase; }
+  });
+
+  test('adoptTemplate still allows re-validating the SAME template mid-campaign', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.phase = 'waiting';
+    try {
+      const r = adoptTemplate('promo_a', shapedFor('promo_a'));
+      assert.equal(r, undefined, 'a status refresh of the template already sending must not be refused');
+      assert.equal(S.config.templateStatus, 'APPROVED');
+    } finally { S.phase = savedPhase; }
+  });
+
+  // The name half of the lock is covered above by a different-name switch,
+  // which leaves `language` undefined on both calls and so is vacuously true
+  // for sameLang regardless of what that clause does — deleting `sameLang`
+  // entirely from templateLocked would not fail that test. This one holds
+  // the name fixed and only changes the language, which only a real sameLang
+  // check can catch.
+  test('adoptTemplate refuses a language switch even when the name stays the same', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.config.templateLanguage = 'en';
+    S.phase = 'waiting';
+    const variants = { found: true, templates: [
+      { name: 'promo_a', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}', headerFormat: null, headerText: null, buttons: [] },
+      { name: 'promo_a', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy', headerFormat: null, headerText: null, buttons: [] },
+    ] };
+    try {
+      const r = adoptTemplate('promo_a', variants, 'hi');
+      assert.deepEqual(r, { ok: false, error: 'A campaign is sending “promo_a” right now — stop it before switching templates.' },
+        'the same name under a different language is still a different outbound message');
+      assert.equal(S.config.templateLanguage, 'en', 'nothing is mutated by a refused language switch');
+    } finally { S.phase = savedPhase; }
+  });
+
+  test('Meta header shape wins over a stale row — no header on Meta clears both fields', () => {
+    saveTemplateRow({ name: 'adopt_stale_header', displayName: 'Stale', headerFormat: 'DOCUMENT',
+                      headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
+    S.config.templateName = '';
+    adoptTemplate('adopt_stale_header', { found: true, templates: [{
+      name: 'adopt_stale_header', status: 'APPROVED', category: 'MARKETING', language: 'en',
+      bodyText: 'Hi {{1}}', headerFormat: null, headerText: null, buttons: [],
+    }] });
+    assert.equal(S.config.headerFormat, null,
+      'Meta\'s current copy has no header — the row remembering DOCUMENT must not resurrect one');
+    assert.equal(S.config.headerAssetId, null, 'nothing to send a file for once there is no header');
+  });
+
+  test('Meta DOCUMENT header with a row still supplies which file', () => {
+    saveTemplateRow({ name: 'adopt_doc_header', displayName: 'Doc', headerFormat: 'DOCUMENT',
+                      headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
+    S.config.templateName = '';
+    adoptTemplate('adopt_doc_header', { found: true, templates: [{
+      name: 'adopt_doc_header', status: 'APPROVED', category: 'MARKETING', language: 'en',
+      bodyText: 'Hi {{1}}', headerFormat: 'DOCUMENT', headerText: null, buttons: [],
+    }] });
+    assert.equal(S.config.headerFormat, 'DOCUMENT', 'Meta decides the shape');
+    assert.equal(S.config.headerAssetId, approvedAsset, 'and the row still says which file for that shape');
+  });
+
   Object.assign(S.config, before);   // adoptTemplate writes broadly; leave S as found
+}
+
+console.log('\nadoptTemplate — language variants');
+{
+  const { adoptTemplate } = require('./server');
+  const before = JSON.parse(JSON.stringify(S.config));
+  const variants = { found: true, templates: [
+    { name: 'promo', language: 'en', status: 'REJECTED', category: 'MARKETING', bodyText: 'Hi {{1}}, en copy.', headerFormat: null, headerText: null },
+    { name: 'promo', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy.', headerFormat: null, headerText: null },
+  ] };
+
+  test('an explicit language adopts that variant, not whichever came first', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants, 'hi');
+    assert.equal(S.config.templateLanguage, 'hi');
+    assert.equal(S.config.templateStatus, 'APPROVED');
+    assert.equal(S.config.templateBody, 'Hi {{1}}, hi copy.');
+  });
+
+  test('no language given prefers the APPROVED variant over whichever Graph listed first', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants);
+    assert.equal(S.config.templateLanguage, 'hi', 'hi is APPROVED and en (listed first) is REJECTED');
+    assert.equal(S.config.templateStatus, 'APPROVED');
+  });
+
+  test('an explicit language Meta has no variant for is NOT_FOUND, not a silent fallback to another', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants, 'fr');
+    assert.equal(S.config.templateStatus, 'NOT_FOUND',
+      'sending under "fr" when only en/hi exist would be worse than silently sending a different language');
+  });
+
+  test('exact name beats a fuzzy match — a differently-named entry is never selected', () => {
+    const withDecoy = { found: true, templates: [
+      ...variants.templates,
+      // Graph's own &name= filter would never return this for name=promo;
+      // kept to prove the local selection does not trust an unfiltered
+      // result either. APPROVED, so a filter that forgot the name check
+      // would wrongly prefer it over BOTH real "promo" variants.
+      { name: 'promo_2', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'decoy', headerFormat: null, headerText: null },
+    ] };
+    S.config.templateName = '';
+    adoptTemplate('promo', withDecoy);
+    assert.equal(S.config.templateLanguage, 'hi', 'still the APPROVED promo variant, never promo_2');
+    assert.notEqual(S.config.templateBody, 'decoy');
+  });
+
+  Object.assign(S.config, before);
+}
+
+console.log('\nadoptTemplate — named-variable templates are refused, not sent empty');
+{
+  const { adoptTemplate } = require('./server');
+  const before = JSON.parse(JSON.stringify(S.config));
+  const shapedBody = (name, bodyText, headerText = null) => ({ found: true, templates: [{
+    name, status: 'APPROVED', category: 'MARKETING', language: 'en',
+    bodyText, headerFormat: headerText ? 'TEXT' : null, headerText, buttons: [],
+  }] });
+
+  test('a body with a named variable sets templateUnsupported, naming the fix', () => {
+    S.config.templateName = '';
+    adoptTemplate('named_body', shapedBody('named_body', 'Hi {{first_name}}, welcome.'));
+    assert.match(S.config.templateUnsupported, /named variables/,
+      'the sentence must say why /start has to refuse this template rather than sending it empty');
+  });
+
+  test('a header with a named variable also sets templateUnsupported', () => {
+    S.config.templateName = '';
+    adoptTemplate('named_header', shapedBody('named_header', 'Hi {{1}}, welcome.', 'Sale {{promo_code}}'));
+    assert.match(S.config.templateUnsupported, /named variables/, 'a named header variable is just as unfillable as a named body one');
+  });
+
+  test('a positional-only body clears a stale templateUnsupported', () => {
+    S.config.templateName = '';
+    S.config.templateUnsupported = 'stale from a previous template';
+    adoptTemplate('positional', shapedBody('positional', 'Hi {{1}}, welcome.'));
+    assert.equal(S.config.templateUnsupported, null,
+      'switching to a {{1}}, {{2}}… template must clear the sentence left by the last one');
+  });
+
+  Object.assign(S.config, before);
+}
+
+console.log('\ntemplate routes — identity locked mid-campaign');
+{
+  // http/express are required locally: the module-level const of the same name
+  // further down the file is in the temporal dead zone at this point in the
+  // file's own top-to-bottom execution.
+  const http    = require('http');
+  const express = require('express');
+
+  const startTemplateServer = () => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/templates'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  };
+  const startSettingsServer = () => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/settings'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  };
+
+  testAsync('/validate-template refuses a different template mid-campaign, and adopts nothing', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/validate-template?name=promo_b`)).json();
+      assert.equal(r.ok, false, 'the remaining contacts of a live run must get the message the operator started');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; }
+  });
+
+  testAsync('/validate-template still lets the same template re-validate mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName, savedToken = CFG.accessToken;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    // No token: fetchTemplates answers 'Access Token not set' rather than hitting
+    // the network. Getting THAT sentence back (not the lock's) is what proves the
+    // request reached the Graph call instead of being refused up front.
+    CFG.accessToken = '';
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/validate-template?name=promo_a`)).json();
+      assert.equal(r.error, 'Access Token not set', 'a same-template refresh reaches the Graph call rather than being refused by the lock');
+      assert.notEqual(r.ok, false, 'a same-template refresh must not read as a lock refusal');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; CFG.accessToken = savedToken; }
+  });
+
+  testAsync('POST /api/config refuses a templateName change mid-campaign, unchanged', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ templateName: 'promo_b' }),
+      })).json();
+      assert.equal(r.ok, false, '/config {templateName} must be refused while a campaign is sending promo_a');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; }
+  });
+
+  testAsync('POST /api/config refuses a templateLanguage change even with the same templateName, mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName, savedLang = S.config.templateLanguage;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a'; S.config.templateLanguage = 'en';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ templateName: 'promo_a', templateLanguage: 'hi' }),
+      })).json();
+      assert.equal(r.ok, false, 'the same template under a different language is still a different outbound message');
+      assert.equal(S.config.templateLanguage, 'en', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; S.config.templateLanguage = savedLang; }
+  });
+
+  testAsync('POST /api/template/create still submits to Meta but does not adopt, mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-id';
+    const real = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).startsWith('http://127.0.0.1')) return real(url, opts);
+      return { ok: true, status: 200, json: async () => ({ id: 'meta-tpl-1', status: 'PENDING' }) };
+    };
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/template/create`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: 'Promo B Lock', bodyText: 'Hi {{1}}, our range is live.', sampleValues: ['Asha'] }),
+      })).json();
+      assert.equal(r.ok, false, 'C4: create still submits but does not adopt mid-campaign');
+      assert.equal(r.adopted, false);
+      assert.equal(S.config.templateName, 'promo_a', 'the live run keeps sending what it started with');
+      assert.ok(getTemplateRow('promo_b_lock'), 'Meta accepted the submission, so the local row still remembers it');
+    } finally {
+      global.fetch = real; s.close();
+      S.phase = savedPhase; S.config.templateName = savedName;
+      CFG.accessToken = savedToken; CFG.wabaId = savedWaba;
+    }
+  });
+
+  // /template/create adopts a successful submission by writing S.config
+  // directly rather than calling adoptTemplate (its row is Meta's own reply,
+  // not a fetched list to select from) — so the named-variable check has to
+  // be asked here too, or a template composed with {{first_name}} would read
+  // as sendable until the next unrelated re-validation happened to catch it.
+  testAsync('POST /api/template/create sets templateUnsupported for a named-variable body it still adopts', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId, savedUnsupported = S.config.templateUnsupported;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-named';
+    const real = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).startsWith('http://127.0.0.1')) return real(url, opts);
+      return { ok: true, status: 200, json: async () => ({ id: 'meta-tpl-named', status: 'PENDING' }) };
+    };
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/template/create`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: 'Named Var', bodyText: 'Hi {{first_name}}, welcome.' }),
+      })).json();
+      assert.equal(r.ok, true, 'Meta accepts named variables — this app only cannot fill them later');
+      assert.match(S.config.templateUnsupported, /named variables/,
+        'adopting outside adoptTemplate must not skip the same unsupported check');
+    } finally {
+      global.fetch = real; s.close();
+      CFG.accessToken = savedToken; CFG.wabaId = savedWaba; S.config.templateUnsupported = savedUnsupported;
+    }
+  });
 }
 
 console.log('\nbuildParams');
@@ -2142,6 +2511,66 @@ console.log('\nmedia — saveUpload');
     const d = deleteAsset(r.asset.id);
     assert.equal(d.ok, false, 'the guard is the whole reason this delete is safe to expose');
     assert.match(d.error, /outside the uploads directory/);
+  });
+
+  test('saveUpload refuses to dedupe through a stored path that escapes UPLOAD_DIR', () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const bytes = Buffer.from(`%PDF-1.7 escape-dedupe ${Math.random()}`);
+    const first = saveUpload(file(bytes, 'legit.pdf', 'application/pdf'));
+    assert.equal(first.ok, true, first.error);
+
+    // A real file outside UPLOAD_DIR — if the dedupe/restore write went
+    // through, this is exactly what a crafted `path` column would let it
+    // overwrite.
+    const name = `wa-escape-dedupe-${process.pid}-${Date.now()}.txt`;
+    const outside = pathx.join(UPLOAD_DIR, '..', name);
+    fsx.writeFileSync(outside, 'sentinel-untouched');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', name), first.asset.id);
+
+    try {
+      // Same bytes → same sha256 → the dedupe branch, not a fresh insert.
+      const again = saveUpload(file(bytes, 'legit-copy.pdf', 'application/pdf'));
+      assert.equal(again.ok, false, 'a corrupted row must refuse, not write through it');
+      assert.match(again.error, /outside the uploads directory/);
+      assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched',
+        'nothing may be written to whatever the escaped path points at');
+    } finally { fsx.unlinkSync(outside); }
+  });
+
+  test('saveUpload refuses to revive a tombstoned row through a stored path that escapes UPLOAD_DIR', () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const bytes = Buffer.from(`%PDF-1.7 escape-revive ${Math.random()}`);
+    const first = saveUpload(file(bytes, 'legit2.pdf', 'application/pdf'));
+    assert.equal(first.ok, true, first.error);
+
+    const name = `wa-escape-revive-${process.pid}-${Date.now()}.txt`;
+    const outside = pathx.join(UPLOAD_DIR, '..', name);
+    fsx.writeFileSync(outside, 'sentinel-untouched-2');
+    // Tombstoned AND escaping in one update — the revive branch is reached
+    // only once existing.deleted_at is set, and it writes unconditionally,
+    // with no existsSync gate, making it the more dangerous of the two.
+    db.prepare('UPDATE media_assets SET path = ?, deleted_at = ? WHERE id = ?')
+      .run(pathx.join('..', name), Date.now(), first.asset.id);
+
+    try {
+      const again = saveUpload(file(bytes, 'legit2-copy.pdf', 'application/pdf'));
+      assert.equal(again.ok, false, 'reviving through a corrupted row must refuse, not write through it');
+      assert.match(again.error, /outside the uploads directory/);
+      assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched-2',
+        'the revive write must never reach a path the row does not legitimately own');
+    } finally { fsx.unlinkSync(outside); }
+  });
+
+  test('an originalname with a NUL byte in its extension never throws', () => {
+    // path.extname does not validate characters — a NUL byte survives into the
+    // filename fs.writeFileSync is given, and Node refuses any path containing
+    // one. extOf drops anything outside [a-z0-9] from the extension instead.
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 nul-ext ${Math.random()}`), 'x.a\u0000b', 'application/pdf'));
+    assert.equal(typeof r, 'object');
+    assert.equal(r.ok, true, r.error);
   });
 
   test('kindFor maps each accepted type to its kind', () => {
@@ -5368,6 +5797,7 @@ console.log('\nmedia routes');
 
 console.log('\nmedia — Meta identifiers');
 {
+  const fsx = require('fs');
   const seed = () => {
     const r = saveUpload({ buffer: Buffer.from(`bytes-${Math.random()}`),
                            originalname: 'sheet.pdf', mimetype: 'application/pdf' });
@@ -5407,6 +5837,45 @@ console.log('\nmedia — Meta identifiers');
     } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
   });
 
+  testAsync('a handle less than 23h old is reused without any fetch', async () => {
+    const id = seed();
+    db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?')
+      .run('h:FRESH', Date.now() - 60 * 60 * 1000, id);
+    await withFetch(() => { throw new Error('must not fetch for a handle inside its 23h window'); },
+      async () => {
+        const r = await ensureHandle(id);
+        assert.equal(r.ok, true, r.error);
+        assert.equal(r.handle, 'h:FRESH');
+      });
+  });
+
+  testAsync('a handle 24h old (or with no recorded age) is re-minted, not reused forever', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const upload = url => url.includes('/uploads?') ? json({ id: 'upload:SESSION2' }) : json({ h: 'h:FRESH2' });
+    try {
+      const stale = seed();
+      db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?')
+        .run('h:STALE', Date.now() - 24 * 60 * 60 * 1000, stale);
+      await withFetch(upload, async calls => {
+        const r = await ensureHandle(stale);
+        assert.equal(r.handle, 'h:FRESH2', 'a 24h-old handle must not be trusted');
+        assert.equal(calls.length, 2, 'the full two-step upload runs again');
+      });
+      const row = getAsset(stale);
+      assert.equal(row.meta_handle, 'h:FRESH2');
+      assert.ok(row.meta_handle_at > Date.now() - 5000, 'meta_handle_at is re-stamped on a fresh mint');
+
+      const unstamped = seed();
+      db.prepare('UPDATE media_assets SET meta_handle = ? WHERE id = ?').run('h:NOAGE', unstamped);
+      await withFetch(upload, async calls => {
+        const r = await ensureHandle(unstamped);
+        assert.equal(r.handle, 'h:FRESH2', 'a handle with no recorded age must not be trusted as fresh either');
+        assert.equal(calls.length, 2);
+      });
+    } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
   testAsync('ensureHandle refuses clearly when APP_ID is not configured', async () => {
     const savedApp = CFG.appId;
     CFG.appId = '';
@@ -5416,6 +5885,19 @@ console.log('\nmedia — Meta identifiers');
       assert.equal(r.ok, false);
       assert.match(r.error, /APP_ID/, 'the error must name the missing setting');
     } finally { CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureHandle refuses a missing file before any fetch, not with a network error', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    fsx.unlinkSync(assetPath(getAsset(id)));   // e.g. wa.db restored without the uploads directory
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch for a file that is not on disk'); },
+        () => ensureHandle(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i, 'not "Could not reach graph.facebook.com" — there was nothing to send it');
+    } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
   });
 
   testAsync('ensureMediaId uploads once and caches', async () => {
@@ -5464,6 +5946,65 @@ console.log('\nmedia — Meta identifiers');
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
 
+  testAsync('ensureMediaId refuses a missing file before any fetch, not with a network error', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    fsx.unlinkSync(assetPath(getAsset(id)));
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch for a file that is not on disk'); },
+        () => ensureMediaId(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i);
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  // readBytes() turns `media_assets.path` into a filesystem path with no
+  // containment check of its own — the same class of bug 6.11 closed for
+  // dropBytes/deleteAsset/rescanIfNeeded, just reached from these two instead.
+  // A tampered row must not get its target read and handed to Meta as though
+  // it were the operator's own file.
+  testAsync('ensureHandle refuses an asset whose path escapes UPLOAD_DIR, never reading it', async () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    const outside = pathx.join(UPLOAD_DIR, '..', `wa-outside-${process.pid}-${Date.now()}.txt`);
+    fsx.writeFileSync(outside, 'not actually an uploaded asset');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', pathx.basename(outside)), id);
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
+        () => ensureHandle(id));
+      assert.equal(r.ok, false);
+      // Its own sentence, not missingMsg: re-uploading repairs a genuinely
+      // missing file, but an escaped path means the ROW looks corrupted,
+      // which "upload it again" alone does not explain how to fix.
+      assert.match(r.error, /outside the uploads directory/i);
+      assert.match(r.error, /corrupted/i);
+    } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureMediaId refuses an asset whose path escapes UPLOAD_DIR, never reading it', async () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    const outside = pathx.join(UPLOAD_DIR, '..', `wa-outside-${process.pid}-${Date.now()}-2.txt`);
+    fsx.writeFileSync(outside, 'not actually an uploaded asset');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', pathx.basename(outside)), id);
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
+        () => ensureMediaId(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /outside the uploads directory/i);
+      assert.match(r.error, /corrupted/i);
+    } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
   testAsync('a Graph error is returned as a message, not thrown', async () => {
     const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
     CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
@@ -5475,6 +6016,43 @@ console.log('\nmedia — Meta identifiers');
         assert.match(r.error, /Upload failed/);
       });
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers, so one
+  // wedged connection would hold up a template submission or a campaign send
+  // for minutes. Verified by replacing AbortSignal.timeout with a spy — the
+  // real signal still runs underneath, so the request behaves identically.
+  const spyTimeout = () => {
+    const real = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return real(ms); };
+    return { seen, restore: () => { AbortSignal.timeout = real; } };
+  };
+
+  testAsync('ensureHandle: the session-open call carries graphMs, the byte-push carries transferMs', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    const { TIMEOUTS } = require('./src/config');
+    const spy = spyTimeout();
+    try {
+      await withFetch(url => url.includes('/uploads?') ? json({ id: 'upload:SESSION' }) : json({ h: 'h:X' }),
+        () => ensureHandle(id));
+      assert.deepEqual(spy.seen, [TIMEOUTS.graphMs, TIMEOUTS.transferMs],
+        'the session-open call is a small JSON request; the byte-push is what actually moves the file');
+    } finally { spy.restore(); CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureMediaId upload carries transferMs — it moves the file, it does not just ask about it', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    const { TIMEOUTS } = require('./src/config');
+    const spy = spyTimeout();
+    try {
+      await withFetch(() => json({ id: 'media-timeout-1' }), () => ensureMediaId(id));
+      assert.deepEqual(spy.seen, [TIMEOUTS.transferMs]);
+    } finally { spy.restore(); CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
 }
 
@@ -5689,6 +6267,23 @@ console.log('\ninbound media — save, serve, expire');
       assert.ok(row.downloaded_at > 0);
       assert.equal(fsm.readFileSync(inboundPath(row)).toString(), bytes.toString());
     }));
+  });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers — a byte
+  // transfer (this app's own 100 MB document ceiling) genuinely needs longer
+  // than a small JSON call, which is why the two hops carry different budgets.
+  testAsync('saveInbound: the metadata GET carries graphMs, the CDN download carries transferMs', async () => {
+    const bytes = Buffer.from(`timeout-${Date.now()}`);
+    const id = seedInbound({ bytes });
+    const { TIMEOUTS } = require('./src/config');
+    const real = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return real(ms); };
+    try {
+      await withToken(() => withMeta(metaOk(bytes), () => saveInbound(id)));
+      assert.deepEqual(seen, [TIMEOUTS.graphMs, TIMEOUTS.transferMs],
+        'resolving the media id is a small JSON call; the CDN fetch is what actually pulls the file');
+    } finally { AbortSignal.timeout = real; }
   });
 
   testAsync('saving twice never refetches and never rewrites', async () => {
@@ -6003,6 +6598,27 @@ console.log('\ninbound media — save, serve, expire');
       } finally { MEDIA_LIMITS.minFreeBytes = saved; }
     });
 
+    testAsync('the free-space check is size-aware — an enormous claimed size is refused even though bavail alone looks fine', async () => {
+      const savedFree = MEDIA_LIMITS.minFreeBytes, savedMax = MEDIA_LIMITS.maxBytes;
+      // minFreeBytes at 0 means `free < 0` is never true, so only a check that
+      // SUBTRACTS the incoming size can catch this. maxBytes is raised out of
+      // the way so it is this check, not the separate size cap, under test.
+      MEDIA_LIMITS.minFreeBytes = 0;
+      MEDIA_LIMITS.maxBytes = Number.MAX_SAFE_INTEGER;
+      const bytes = Buffer.from(`huge${Date.now()}`);
+      const id = seedInbound({ bytes });
+      const hugeMeta = url => url.includes('lookaside')
+        ? { ok: true, status: 200, arrayBuffer: async () => bytes, headers: new Headers() }
+        : { ok: true, status: 200, headers: new Headers(),
+            json: async () => ({ url: 'https://lookaside.fbsbx.com/whatsapp/1', mime_type: 'image/jpeg',
+                                  file_size: Number.MAX_SAFE_INTEGER }) };
+      try {
+        const r = await withoutScanner(() => withToken(() => withMeta(hugeMeta, () => saveInbound(id))));
+        assert.equal(r.ok, false, 'no real disk has this much free space once the claimed size is subtracted');
+        assert.match(r.error, /disk space/i);
+      } finally { MEDIA_LIMITS.minFreeBytes = savedFree; MEDIA_LIMITS.maxBytes = savedMax; }
+    });
+
     testAsync('with no scanner configured a save succeeds and says so', async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`n${Date.now()}`)]);
       const id = seedInbound({ bytes });
@@ -6093,6 +6709,26 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(after.scan_status, 'infected');
       assert.equal(after.path, null);
       assert.ok(!fsm.existsSync(file), 'a late signature hit must remove the bytes, not just relabel them');
+    });
+
+    testAsync('rescanIfNeeded refuses a row whose path escapes MEDIA_DIR, and never reads or unlinks it', async () => {
+      const pathx = require('path');
+      const { MEDIA_DIR } = require('./src/config');
+      // A REAL file one level above MEDIA_DIR — if the containment guard were
+      // missing, this is exactly what a crafted `path` would get read and
+      // (on an infected verdict) unlinked.
+      const name    = `wa-outside-${process.pid}-${Date.now()}.txt`;
+      const outside = pathx.join(MEDIA_DIR, '..', name);
+      fsm.mkdirSync(pathx.dirname(outside), { recursive: true });
+      fsm.writeFileSync(outside, 'not actually inbound media');
+      const id = seedInbound({ bytes: Buffer.from('irrelevant') });
+      db.prepare("UPDATE media SET path = ?, scan_status = 'skipped' WHERE media_id = ?")
+        .run(pathx.join('..', name), id);
+      try {
+        const after = await withClamd('stream: Eicar-Test-Signature FOUND\x00', () => rescanIfNeeded(getInbound(id)));
+        assert.equal(after.scan_status, 'skipped', 'the row is returned unchanged, not scanned');
+        assert.ok(fsm.existsSync(outside), 'a file outside MEDIA_DIR must never be touched, let alone unlinked');
+      } finally { fsm.unlinkSync(outside); }
     });
 
     testAsync('a transient rescan failure leaves the row retryable', async () => {
@@ -6494,6 +7130,19 @@ console.log('\ninbound media — save, serve, expire');
         'a Preview click must not put a 24-hour clock on something kept on purpose');
     });
 
+    // The mirror of the test above: Save on an already-previewed row must not
+    // re-fetch bytes already on disk, but it DOES have to drop the 24-hour
+    // preview clock — Preview and Save are the same fetch on different clocks.
+    testAsync('Save on an already-previewed row promotes it without re-fetching', async () => {
+      const id = await previewOne();
+      assert.equal(getInbound(id).provisional, 1, 'starts on the short preview clock');
+      const r = await withMeta(() => { throw new Error('Save must not re-fetch bytes already on disk'); },
+        () => saveInbound(id, { provisional: false }));
+      assert.equal(r.ok, true, r.error);
+      assert.equal(r.promoted, true, 'the route needs to know this was a promotion, not a fresh save');
+      assert.equal(getInbound(id).provisional, 0, 'Save moves it onto the 90-day clock like any other kept file');
+    });
+
     testAsync('Keep refuses a row with nothing on disk', () => {
       const id = seedInbound({ bytes: Buffer.from([0xff, 0xd8, 0xff, 0x01]) });
       const r = keepInbound(id);
@@ -6798,6 +7447,20 @@ console.log('\nfile risk classification');
     // The bytes alone are enough: a customer who declares image/png and names
     // it .png but sends markup must not slip through on two forged signals.
     assert.equal(classify({ mime: 'image/png', filename: 'logo.png', bytes: Buffer.from('  <svg onload=alert(1)>') }).tier, 'block');
+  });
+
+  // Google Docs and Notepad both export HTML/SVG with a UTF-8 BOM (EF BB BF)
+  // prefix. Decoded as latin1 — which the MARKUP test does — those three bytes
+  // become three unrelated Latin-1 characters, never U+FEFF, so a class that
+  // tried to skip the BOM there matched nothing and the whole file voted `ok`
+  // instead of `block`.
+  test('a UTF-8 BOM before markup does not hide it from the block tier', () => {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const htmlWithBom = Buffer.concat([bom, Buffer.from('<html><script>x</script>')]);
+    assert.equal(classify({ mime: 'text/plain', filename: 'a.txt', bytes: htmlWithBom }).tier, 'block');
+
+    const svgWithBom = Buffer.concat([bom, Buffer.from('<svg onload=alert(1)>')]);
+    assert.equal(classify({ mime: 'text/plain', filename: 'a.txt', bytes: svgWithBom }).tier, 'block');
   });
 
   test('zip resolves by extension because the magic bytes cannot', () => {

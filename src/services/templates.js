@@ -1,7 +1,7 @@
 'use strict';
-const { CFG, LIMITS, OPT_OUT_LABEL } = require('../config');
+const { CFG, LIMITS, OPT_OUT_LABEL, TIMEOUTS } = require('../config');
 const { db } = require('../lib/db');
-const { S, log } = require('../state');
+const { S, log, campaignActive } = require('../state');
 const { graphHeaders, graphUrl, graphSend, resolveWabaId } = require('./graph');
 const { explainError } = require('../lib/errors');
 const { broadcast } = require('./status');
@@ -20,6 +20,23 @@ function slugify(s) {
 function templateVars(text) {
   const nums = [...String(text || '').matchAll(/\{\{\s*(\d+)\s*\}\}/g)].map(m => Number(m[1]));
   return [...new Set(nums)].sort((a, b) => a - b);
+}
+
+// Meta's Manage Templates UI allows named variables ({{first_name}}); this
+// app's send path only fills positional ones ({{1}}, {{2}}…), matched by
+// buildParams reading S.config.paramValues by index. A leading letter or
+// underscore after the braces is the tell — a positional variable is only
+// ever digits.
+const NAMED_VAR = /\{\{\s*[A-Za-z_]/;
+
+// One function, so adoptTemplate and /template/create — which adopts a
+// successful submission by writing S.config directly, since its source is
+// Meta's own reply rather than a fetched list to select from — cannot drift
+// on what counts as an unsupported template.
+function namedVariableMsg(bodyText, headerText) {
+  return (NAMED_VAR.test(bodyText || '') || NAMED_VAR.test(headerText || ''))
+    ? 'This template uses named variables ({{first_name}}), which this app cannot fill yet — pick one that uses {{1}}, {{2}}…'
+    : null;
 }
 
 // Meta rejects parameter values containing newlines, tabs, or 4+ consecutive
@@ -44,7 +61,7 @@ function renderBody(bodyText, params = []) {
 
 // Meta's ceilings, per button type and overall. The opt-out quick reply counts
 // toward the quick-reply allowance like any other.
-const BUTTON_LIMITS  = { QUICK_REPLY: 3, URL: 2, PHONE_NUMBER: 1 };
+const BUTTON_LIMITS  = { QUICK_REPLY: 10, URL: 2, PHONE_NUMBER: 1 };
 const MAX_BUTTONS    = 10;
 const HEADER_FORMATS = ['TEXT', 'IMAGE', 'VIDEO', 'DOCUMENT'];
 const BUTTON_LABEL   = { QUICK_REPLY: 'quick-reply', URL: 'URL', PHONE_NUMBER: 'call' };
@@ -132,6 +149,11 @@ function validateTemplateInput({ displayName, bodyText, footerText, sampleValues
       errors.push(`Meta allows at most ${BUTTON_LIMITS[type]} ${BUTTON_LABEL[type]} button${BUTTON_LIMITS[type] > 1 ? 's' : ''} — this has ${n}`);
     }
   }
+  // Meta rejects a template whose quick replies are split by other button types.
+  const qr = all.map((b, i) => (b?.type === 'QUICK_REPLY' ? i : -1)).filter(i => i >= 0);
+  if (qr.length && qr[qr.length - 1] - qr[0] + 1 !== qr.length) {
+    errors.push('Quick-reply buttons must sit together — move them next to each other (Meta rejects mixed orders).');
+  }
 
   return errors;
 }
@@ -208,7 +230,15 @@ function shapeTemplate(t) {
   };
 }
 
-// One Graph call for message_templates. `name` filters to a single template;
+// Graph paginates message_templates at 200 a page. A WABA with a long history
+// of templates would otherwise have its later pages silently dropped, and the
+// picker would just look like it was missing templates nobody deleted.
+// Bounded at 10 pages (2,000 templates) so a paging loop on Meta's side — or a
+// WABA genuinely that large — cannot hang the request forever.
+const MAX_TEMPLATE_PAGES = 10;
+
+// One Graph call for message_templates, followed across every page.  `name`
+// filters to a single template (still possibly several language variants);
 // omitting it lists the whole WABA, which is what the UI's picker needs.
 async function fetchTemplates(name) {
   if (!CFG.accessToken) return { error: 'Access Token not set' };
@@ -216,12 +246,17 @@ async function fetchTemplates(name) {
   if (!wabaId) {
     return { error: 'WABA_ID is not set. Copy it from Meta for Developers → your app → WhatsApp → API Setup ("WhatsApp Business Account ID"), put it in .env, and restart.' };
   }
-  const url = `https://graph.facebook.com/${CFG.apiVersion}/${wabaId}/message_templates`
+  let url = `https://graph.facebook.com/${CFG.apiVersion}/${wabaId}/message_templates`
     + `?limit=200&fields=name,status,category,language,quality_score,rejected_reason,components`
     + (name ? `&name=${encodeURIComponent(name)}` : '');
-  const data = await (await fetch(url, { headers: graphHeaders() })).json();
-  if (data.error) return { error: data.error.message };
-  return { found: !!data.data?.length, templates: (data.data || []).map(shapeTemplate) };
+  const all = [];
+  for (let page = 0; page < MAX_TEMPLATE_PAGES && url; page++) {
+    const data = await (await fetch(url, { headers: graphHeaders(), signal: AbortSignal.timeout(TIMEOUTS.graphMs) })).json();
+    if (data.error) return { error: data.error.message };
+    all.push(...(data.data || []));
+    url = data.paging?.next || null;
+  }
+  return { found: !!all.length, templates: all.map(shapeTemplate) };
 }
 
 // Validate template — fetches status, category, language, body text from Meta
@@ -246,12 +281,47 @@ function resizeParamValues(count) {
     prev[i] || { source: i === 0 ? 'name' : 'fixed', value: '' });
 }
 
+// A campaign reads S.config.templateName (and templateLanguage) on every
+// send, so changing either mid-run sends the rest of the list a different
+// message. DELETE was already refused for this reason; adoption, /config and
+// create are the same identity question asked from three different doors.
+// Same-identity re-validation (a status refresh of the template already
+// sending) is allowed — sameName/sameLang are vacuously true when the caller
+// does not name a name or a language at all, which is how routes that never
+// touch identity (like the 15s status poll's bare re-adopt) pass through.
+function templateLocked(name, language) {
+  if (!campaignActive() || !S.config.templateName) return null;
+  const sameName = !name || name === S.config.templateName;
+  const sameLang = !language || language === S.config.templateLanguage;
+  return sameName && sameLang ? null
+    : `A campaign is sending “${S.config.templateName}” right now — stop it before switching templates.`;
+}
+
 // When a template lookup succeeds, make it the active one: remember its status
 // (gates Start) and how many variables its body needs (drives buildParams).
-function adoptTemplate(name, result) {
-  const t = result?.templates?.[0];
+function adoptTemplate(name, result, language) {
+  // Defence in depth: /validate-template and /config already check this
+  // before calling in, but /start (routes/campaign.js) calls straight through
+  // to here, so the guard has to hold even when nothing upstream asked first.
+  const lockMsg = templateLocked(name, language);
+  if (lockMsg) return { ok: false, error: lockMsg };
+
+  // Exact name first — Graph's own &name= filter should already guarantee
+  // this, but a caller can hand in an unfiltered list (fetchTemplates() with
+  // no name), and a fuzzy match here would adopt the wrong template's status
+  // and body under a name the operator did not pick. With no language given,
+  // prefer an APPROVED variant — the one that can actually send — over
+  // whichever Graph happened to list first.
+  const list = (result?.templates || []).filter(x => x.name === name);
+  const t = language ? list.find(x => x.language === language)
+                     : (list.find(x => x.status === 'APPROVED') || list[0]);
   if (!t) {
-    if (result && result.found === false) S.config.templateStatus = 'NOT_FOUND';
+    // NOT_FOUND either way: the name matched nothing, or it matched but not
+    // this language — an explicit language Meta has no variant for must not
+    // silently fall back to a different one and send it. A fetch error
+    // (result.error set) is the one case left alone: "could not ask Meta" is
+    // not the same fact as "Meta says this does not exist".
+    if (result && !result.error) S.config.templateStatus = 'NOT_FOUND';
     return;
   }
   // Read BEFORE templateName is overwritten: re-adopting the template that is
@@ -267,20 +337,40 @@ function adoptTemplate(name, result) {
   // reaches S.config, which is what lets startRun keep its one-argument
   // signature: the body arrives here or not at all.
   S.config.templateBody     = t.bodyText || null;
-  // Meta knows the template has a document header; only our own row knows WHICH
-  // document, because Graph never saw our disk. Fall back to Meta's shape so an
-  // externally created template is still recognisably a media template.
+  // Meta decides the shape, and ONLY Meta — components are fetched fresh on
+  // every validate, so t.headerFormat is never stale the way a locally
+  // remembered row can be. `?? row?.header_format` looks like a safer
+  // fallback and is exactly backwards: when Meta's current copy has no
+  // header, t.headerFormat is null, and `??` treats null as "ask the row
+  // instead" — resurrecting a header a re-approved template no longer has.
+  // `||` deliberately does not fall through here.
+  S.config.headerFormat     = t.headerFormat || null;
   const row = getTemplateRow(name);
-  S.config.headerFormat     = row?.header_format ?? t.headerFormat ?? null;
-  // The row is a fallback, never an override: switching templates (or a cleared
-  // selection — /api/config sets null on purpose) restores the approval-time
-  // asset, but the operator's live choice for the active template wins.
-  S.config.headerAssetId    = samePick && S.config.headerAssetId != null
-    ? S.config.headerAssetId
-    : row?.header_asset ?? null;
+  // The row's only remaining job is WHICH file, and only when Meta says there
+  // is a media header to send one for. A format that is not IMAGE/VIDEO/
+  // DOCUMENT has nothing to attach, so any remembered pick is cleared — that
+  // is what lets /start's "choose a file" check trust S.config.headerAssetId
+  // rather than re-deriving the shape itself.
+  if (!['IMAGE', 'VIDEO', 'DOCUMENT'].includes(S.config.headerFormat)) {
+    S.config.headerAssetId = null;
+  } else {
+    // The row is a fallback, never an override: switching templates (or a
+    // cleared selection — /api/config sets null on purpose) restores the
+    // approval-time asset, but the operator's live choice for the active
+    // template wins.
+    S.config.headerAssetId = samePick && S.config.headerAssetId != null
+      ? S.config.headerAssetId
+      : row?.header_asset ?? null;
+  }
   S.config.templateStatus   = t.status;
   S.config.templateCategory = t.category;
   S.config.templateLanguage = t.language;
+  // This app only fills positional {{1}}, {{2}}… — a named variable in either
+  // the body or a TEXT header must refuse at Start with a sentence, not send
+  // the literal "{{first_name}}" text to a customer. Cleared here too, so
+  // switching back to a positional template does not leave a stale refusal
+  // from the last one adopted.
+  S.config.templateUnsupported = namedVariableMsg(t.bodyText, t.headerText);
   resizeParamValues(templateVars(t.bodyText).length);
   CFG.templateName          = name;
   broadcast();
@@ -336,7 +426,8 @@ async function deleteTemplate(name) {
 
   const url = `${wabaId}/message_templates?name=${encodeURIComponent(name)}`;
   try {
-    const res  = await fetch(graphUrl(url), { method: 'DELETE', headers: graphHeaders() });
+    const res  = await fetch(graphUrl(url), { method: 'DELETE', headers: graphHeaders(),
+                                               signal: AbortSignal.timeout(TIMEOUTS.graphMs) });
     const data = await res.json();
     if (data.error) {
       const code = data.error.code || 0;
@@ -358,6 +449,6 @@ async function deleteTemplate(name) {
 module.exports = {
   slugify, templateVars, sanitizeParam, renderBody, validateTemplateInput, buildTemplatePayload,
   shapeTemplate, fetchTemplates, validateTemplate, resizeParamValues, adoptTemplate,
-  deleteTemplate, graphSend,
+  templateLocked, namedVariableMsg, deleteTemplate, graphSend,
   BUTTON_LIMITS, MAX_BUTTONS, saveTemplateRow, getTemplateRow,
 };
