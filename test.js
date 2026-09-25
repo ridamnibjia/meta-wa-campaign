@@ -3297,6 +3297,17 @@ console.log('\ncontacts — opt-outs.json import');
     fsx.rmSync(`${f}.migrated`, { force: true });
   });
 
+  test('an entry the parser could not read is named in the warn log, not just missing from the count', () => {
+    const f = tmp();
+    fsx.writeFileSync(f, JSON.stringify(['919777700003', 'not-a-number']));
+    const before = S.logs.length;
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 1, 'the one parseable entry still imports');
+    const warned = S.logs.slice(before).some(l => l.level === 'warn' && /not-a-number/.test(l.msg));
+    assert.ok(warned, 'the count alone cannot say WHICH opt-out did not carry over — the entry has to be named');
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
   test('a missing file is a no-op, not an error', () => {
     assert.deepEqual(C.migrateOptOuts({ optOuts: tmp() }), { imported: 0, skipped: true });
   });

@@ -290,6 +290,11 @@ function migrateOptOuts(files = FILES) {
   }
 
   let imported = 0;
+  // disable() already fails closed on a bad number — it just returns false and
+  // says nothing. That is fine for the count, but an operator staring at
+  // "imported 41 of 43" has no way to learn which two did not carry over, so
+  // the entries themselves are collected and named below.
+  const unreadable = numbers.filter(n => normalizePhone(n) === null);
   db.exec('BEGIN');
   try {
     for (const n of numbers) if (disable(n, 'opt_out')) imported++;
@@ -301,6 +306,9 @@ function migrateOptOuts(files = FILES) {
 
   fs.renameSync(files.optOuts, `${files.optOuts}.migrated`);
   log('info', `Imported ${imported} opt-out(s) from opt-outs.json into contacts`);
+  if (unreadable.length) {
+    log('warn', `${unreadable.length} entries could not be read and are NOT suppressed: ${unreadable.join(', ')}`);
+  }
   return { imported, skipped: false };
 }
 
