@@ -98,27 +98,31 @@ router.post('/template/create', async (req, res) => {
     const submittedStatus = data.status || 'PENDING';
 
     // Meta has already accepted the template by this point, so the row is
-    // saved either way — this app must not forget what it submitted. Only
-    // ADOPTING it into S.config (making it what the next send goes out as) is
-    // refused: a campaign mid-run reads S.config.templateName on every send,
-    // and this route is the UI's "writing a new template is fine meanwhile"
-    // path, which is exactly the advice that was wrong.
+    // saved either way — this app must not forget what it submitted, whether
+    // or not the lock below lets adoption go ahead. One call, run before the
+    // lock check, rather than the same fields written out twice for the two
+    // branches below — a second copy is a second thing to drift.
+    saveTemplateRow({
+      name:          payload.name,
+      displayName:   input.displayName,
+      language:      payload.language,
+      category:      payload.category,
+      headerFormat:  input.headerFormat,
+      headerText:    input.headerText,
+      headerAssetId: input.headerAssetId,
+      bodyText:      input.bodyText,
+      footerText:    input.footerText,
+      buttons:       input.buttons,
+      varCount:      templateVars(bodyComponent.text).length,
+      status:        submittedStatus,
+    });
+
+    // Only ADOPTING it into S.config (making it what the next send goes out
+    // as) is refused: a campaign mid-run reads S.config.templateName on
+    // every send, and this route is the UI's "writing a new template is fine
+    // meanwhile" path, which is exactly the advice that was wrong.
     const lockMsg = templateLocked(payload.name, payload.language);
     if (lockMsg) {
-      saveTemplateRow({
-        name:          payload.name,
-        displayName:   input.displayName,
-        language:      payload.language,
-        category:      payload.category,
-        headerFormat:  input.headerFormat,
-        headerText:    input.headerText,
-        headerAssetId: input.headerAssetId,
-        bodyText:      input.bodyText,
-        footerText:    input.footerText,
-        buttons:       input.buttons,
-        varCount:      templateVars(bodyComponent.text).length,
-        status:        submittedStatus,
-      });
       log('warn', `Template "${payload.name}" submitted but not adopted — ${lockMsg}`);
       return res.json({ ok: false, error: lockMsg, adopted: false,
                         name: payload.name, id: data.id, status: submittedStatus });
@@ -135,20 +139,6 @@ router.post('/template/create', async (req, res) => {
     // directly rather than calling it, so it has to ask the same question.
     S.config.templateUnsupported = namedVariableMsg(input.bodyText, input.headerText);
     resizeParamValues(templateVars(bodyComponent.text).length);
-    saveTemplateRow({
-      name:          payload.name,
-      displayName:   input.displayName,
-      language:      payload.language,
-      category:      payload.category,
-      headerFormat:  input.headerFormat,
-      headerText:    input.headerText,
-      headerAssetId: input.headerAssetId,
-      bodyText:      input.bodyText,
-      footerText:    input.footerText,
-      buttons:       input.buttons,
-      varCount:      templateVars(bodyComponent.text).length,
-      status:        S.config.templateStatus,
-    });
     CFG.templateName          = payload.name;
     broadcast();
 
