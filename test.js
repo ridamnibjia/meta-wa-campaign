@@ -5747,6 +5747,37 @@ testAsync('a signed body that is not JSON is stored for replay, not 400d — and
     CFG.appSecret = savedSecret;
   }
 });
+// Same durability boundary as "when the write fails the route answers 500,
+// never 200, and stores nothing" above, on the OTHER entrance to
+// recordEnvelope: the catch block server.js's error middleware wraps its call
+// in must hold on the unparseable-body path too, not just the normal one.
+// Same ALTER TABLE … RENAME technique, through the full app so the error
+// middleware (not the bare router) is what answers.
+testAsync('when the write fails on the unparseable-body entrance too, the route answers 500 and stores nothing', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  const before = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  testDb.exec('ALTER TABLE webhook_events RENAME TO webhook_events_hidden');
+  let res;
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const raw = Buffer.from('{ not json');
+    res = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(raw, 'test-secret') },
+    });
+  } finally {
+    testDb.exec('ALTER TABLE webhook_events_hidden RENAME TO webhook_events');
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+  assert.equal(res.status, 500,
+    'a signed-but-unstorable envelope must never be acknowledged 200 — Meta would take the 200 as proof it landed and never resend it');
+  const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  assert.equal(after, before, 'the failed write must leave no phantom row on this entrance either');
+});
 testAsync('only /webhook accepts a multi-megabyte JSON body', async () => {
   const savedSecret = CFG.appSecret;
   CFG.appSecret = 'test-secret';
