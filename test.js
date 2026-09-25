@@ -3267,13 +3267,21 @@ console.log('\ncontacts routes — /upload-csv reports the country guess (contra
     return new Promise(r => s.listen(0, () => r(s)));
   }
 
+  let seq = 0;
+  // Bare 10 digits, no country code — same shape as this suite's other
+  // fixtures (9000000001+), but counter-based like the other contacts test
+  // sections' phone()/nextPhone() generators, so a hard-coded literal here
+  // can never collide with a number some other test already seeded into the
+  // shared in-memory database.
+  const bareNum = () => `900000${String(++seq).padStart(4, '0')}`;
+
   testAsync('the response and the log both name how many numbers were assumed Indian', async () => {
     const savedPhase = S.phase;
     S.phase = 'idle';                     // campaignBlocker must see no run in the way
     const server = await startContactsServer();
     try {
       const port = server.address().port;
-      const body = 'name,phone\nAsha,9000000001\nRahul,+91 90000 00002\n';
+      const body = `name,phone\nAsha,${bareNum()}\nRahul,+91 ${bareNum()}\n`;
       const form = new FormData();
       form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
       const before = S.logs.length;
@@ -3294,7 +3302,7 @@ console.log('\ncontacts routes — /upload-csv reports the country guess (contra
     const server = await startContactsServer();
     try {
       const port = server.address().port;
-      const body = 'Name,Mobile Phone\nAsha,+919000000001\n';
+      const body = `Name,Mobile Phone\nAsha,+91 ${bareNum()}\n`;
       const form = new FormData();
       form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
 
