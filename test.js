@@ -5019,7 +5019,11 @@ console.log('\nmedia — Meta identifiers');
       const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
         () => ensureHandle(id));
       assert.equal(r.ok, false);
-      assert.match(r.error, /missing on this server/i, 'a path outside UPLOAD_DIR is refused the same way a missing file is');
+      // Its own sentence, not missingMsg: re-uploading repairs a genuinely
+      // missing file, but an escaped path means the ROW looks corrupted,
+      // which "upload it again" alone does not explain how to fix.
+      assert.match(r.error, /outside the uploads directory/i);
+      assert.match(r.error, /corrupted/i);
     } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.appId = savedApp; }
   });
 
@@ -5037,7 +5041,8 @@ console.log('\nmedia — Meta identifiers');
       const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
         () => ensureMediaId(id));
       assert.equal(r.ok, false);
-      assert.match(r.error, /missing on this server/i);
+      assert.match(r.error, /outside the uploads directory/i);
+      assert.match(r.error, /corrupted/i);
     } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
 

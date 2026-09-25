@@ -406,11 +406,12 @@ async function ensureHandle(id) {
   if (freshHandle) return { ok: true, handle: asset.meta_handle, asset };
   // Same containment guard dropBytes/deleteAsset/rescanIfNeeded hold: `path`
   // is a column, and readBytes() below turns it into a filesystem path with
-  // no check of its own. A tampered row escaping UPLOAD_DIR is treated the
-  // same as a missing file — re-uploading the same file repairs either one.
-  if (!insideDir(UPLOAD_DIR, assetPath(asset)) || !fs.existsSync(assetPath(asset))) {
-    return { ok: false, error: missingMsg(asset) };
-  }
+  // no check of its own. Two distinct sentences on purpose: an escaped path
+  // means the ROW looks corrupted (re-uploading alone may not fix it — the
+  // column itself is suspect), while a missing file is repaired exactly by
+  // re-uploading the same bytes.
+  if (!insideDir(UPLOAD_DIR, assetPath(asset))) return { ok: false, error: escapedMsg(asset) };
+  if (!fs.existsSync(assetPath(asset))) return { ok: false, error: missingMsg(asset) };
   if (!CFG.accessToken) return { ok: false, error: 'Access Token not configured' };
   if (!CFG.appId) {
     return { ok: false, error: 'APP_ID is not set. A media header needs Meta\'s Resumable Upload API, which keys on the app id — copy it from Meta for Developers → your app → Settings → Basic, put it in .env as APP_ID, and restart.' };
@@ -472,9 +473,8 @@ async function ensureMediaId(id, { force = false } = {}) {
   if (fresh && !force) return { ok: true, mediaId: asset.media_id, asset };
 
   // Same containment guard as ensureHandle above — see its comment.
-  if (!insideDir(UPLOAD_DIR, assetPath(asset)) || !fs.existsSync(assetPath(asset))) {
-    return { ok: false, error: missingMsg(asset) };
-  }
+  if (!insideDir(UPLOAD_DIR, assetPath(asset))) return { ok: false, error: escapedMsg(asset) };
+  if (!fs.existsSync(assetPath(asset))) return { ok: false, error: missingMsg(asset) };
   if (!CFG.accessToken || !CFG.phoneNumberId) {
     return { ok: false, error: 'Credentials not configured' };
   }
