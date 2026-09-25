@@ -2680,6 +2680,25 @@ testAsync('when the write fails the route answers 500, never 200, and stores not
   const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
   assert.equal(after, before, 'the failed write must leave no phantom row');
 });
+testAsync('GET /webhook echoes the challenge as text/plain, and a wrong token is refused', async () => {
+  const savedToken = CFG.webhookVerifyToken;
+  CFG.webhookVerifyToken = 'tok';
+  const server = await startWebhookServer();
+  try {
+    const port = server.address().port;
+    const r = await fetch(`http://127.0.0.1:${port}/webhook?hub.mode=subscribe&hub.verify_token=tok&hub.challenge=%3Cb%3Ex`);
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type'), /^text\/plain/,
+      'an attacker-supplied string must never come back as HTML on the origin holding the session');
+    assert.equal(await r.text(), '<b>x', 'the raw challenge is echoed, not re-encoded');
+
+    const bad = await fetch(`http://127.0.0.1:${port}/webhook?hub.mode=subscribe&hub.verify_token=tox&hub.challenge=zz`);
+    assert.equal(bad.status, 403, 'a wrong token is refused and nothing is echoed');
+  } finally {
+    server.close();
+    CFG.webhookVerifyToken = savedToken;
+  }
+});
 
 console.log('\nreply');
 const stubGraph = (impl) => {
