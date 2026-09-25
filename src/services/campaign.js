@@ -889,6 +889,12 @@ async function campaignLoop() {
       rateLimited = { phone: contact.dialStr, n: rateLimited.n + 1 };
       const what = result.rateLimit ? 'Rate limit' : 'Network problem';
       log('warn', `${what} — backing off ${Math.round(result.retryAfter / 1000)}s (${rateLimited.n} of ${RATE_LIMIT_RETRIES}). ${result.hint || result.error} [${result.errorCode}]`);
+      // A Pause, a halt or a Stop that landed while this send was in flight
+      // wins: painting "auto-resuming" over it promised a resume that never
+      // comes — and over the operator's Pause, a reason other than USER_PAUSE
+      // made the next boot resume it. The contact is still pending, so the
+      // Resume that lifts the pause retries them first.
+      if (flags.pauseFlag || flags.stopFlag) continue;
       S.phase = 'paused'; S.pauseReason = `${what} — auto-resuming`; broadcast();
       // Same reason as the daily cap above: Meta's retry-after is minutes, not
       // seconds, and a Stop must not wait it out.

@@ -7196,6 +7196,40 @@ console.log('\na Reset that lands mid-send');
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
     }
   });
+  // A rate limit answering a send that was in flight when the campaign was
+  // parked under the flag must not repaint the park. Over the operator's Pause
+  // it wrote "auto-resuming" — and a reason that is not USER_PAUSE makes the
+  // next boot resume on its own; over a halt it promised an auto-resume that
+  // never comes, and hid the code the operator has to fix.
+  testAsync('a rate limit does not repaint a pause that was set while the send was in flight', async () => {
+    let sends = 0;
+    const limited = () => ({ ok: false, headers: new Map([['retry-after', '0']]),
+      json: async () => ({ error: { code: 130429, message: 'Throughput rate limit reached' } }) });
+    await withLoop(async () => {
+      sends++;
+      if (sends === 1) { callRoute('post', '/pause'); return limited(); }        // the operator pauses mid-send
+      if (sends === 3) {                                                        // a halt lands mid-send
+        M.handleDeliveryFailure(M.applyStatus({ id: 'wamid.m2.2', status: 'failed',
+          errors: [{ code: 131042, title: 'Business eligibility payment issue' }] }));
+        return limited();
+      }
+      return graphOk(`wamid.m2.${sends}`);
+    }, async h => {
+      const { S, flags } = h.M;
+      h.stage([{ dialStr: '919000033201', name: 'Asha' }, { dialStr: '919000033202', name: 'Rahul' }], 'rate-limit-paint');
+      h.start();
+      await h.until(() => sends === 1 && S.phase === 'paused');
+      await new Promise(r => setTimeout(r, 50));
+      assert.equal(S.pauseReason, h.M.USER_PAUSE, 'the operator\'s pause stays theirs, so a reboot does not resume it');
+
+      assert.equal((await callRoute('post', '/resume')).ok, true);
+      await h.until(() => sends === 3 && flags.pauseFlag);
+      await new Promise(r => setTimeout(r, 50));
+      assert.match(S.pauseReason || '', /^Campaign paused — .+ \[131042\]$/,
+        'the halt names the code to fix — "auto-resuming" would promise a resume that never comes');
+    });
+  });
+
   // ── An account-level fault must pause the campaign, not burn the list ───────
   // Every send after an expired token / paused template / billing hold fails
   // identically. The loop used to write that identical failure once per contact
