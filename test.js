@@ -795,6 +795,17 @@ test('toll-free rules: explicit + is trusted, Indian service lines are not', () 
   assert.equal(normalizePhone('91 1800 123 4567'), null);
   assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'an ordinary Indian mobile is untouched');
 });
+test('the Indian toll-free rule is checked against the number AFTER the +91 guess, not the bare digits', () => {
+  // Checking the pre-guess digits misread this bare 10-digit mobile as the
+  // +91 1800 line, because the raw string "9118001234" starts with "91" +
+  // "1800" by coincidence — a country code that did not exist yet, since
+  // nothing had prefixed one. The same person written with a leading zero
+  // took the OTHER branch (strip the 0, prefix 91) and was untouched by the
+  // rule either way, so one person got two different answers depending on
+  // which spelling they used.
+  assert.equal(normalizePhone('9118001234'), '919118001234', 'a bare mobile, not the toll-free line it coincidentally starts with');
+  assert.equal(normalizePhone('09118001234'), '919118001234', 'the same person, written with a leading zero, must agree with the bare form');
+});
 
 console.log('\nparseCSV');
 test('reads name and mobile, and dedupes', () => {
@@ -937,6 +948,12 @@ test('guessedCountry never exceeds the contacts it describes, even when a guesse
   assert.equal(contacts.length, 1, 'the two rows collapse to one contact');
   assert.equal(guessedCountry, 1,
     'a guessed row that turns out to be a duplicate must not inflate the count past what "N of TOTAL numbers" can mean');
+});
+test('guessedCountry still counts a bare 10-digit number that collides with the toll-free digit pattern', () => {
+  const csv = 'name,phone\nAsha,9118001234\n';
+  const { contacts, guessedCountry } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts[0].dialStr, '919118001234');
+  assert.equal(guessedCountry, 1, 'still a guess — the toll-free rule only rejects it once a 91 country code is actually in the number');
 });
 
 console.log('\nverifySignature');

@@ -26,14 +26,24 @@ function normalize(raw) {
   // pattern matching and only trustworthy when the country is UNKNOWN — an
   // explicit + means it is not: +1 860 is Hartford, Connecticut, a real area
   // code that collides with the Indian 1860 service-line prefix in bare digits.
+  // Stays ahead of the guess below: a bare number shaped like this is rejected
+  // before it is ever considered for a 91 prefix.
   if (!/^\+/.test(s) && /^1(800|860|900)/.test(d)) return null;
-  // The Indian toll-free/shared-cost lines this rule actually exists for,
-  // however they are written. Country code 91 is no longer in doubt here, so
-  // a leading + does not exempt it the way it does above.
-  if (/^91(1800|1860|1900)/.test(d)) return null;
   let guessed = false;
   if (d.length === 10)                 { d = '91' + d; guessed = true; }         // 10-digit Indian
   if (d.length === 11 && d[0] === '0') { d = '91' + d.slice(1); guessed = true; } // 0xxxxxxxxxx
+  // The Indian toll-free/shared-cost lines this rule actually exists for,
+  // however they are written — checked AFTER the guess, against the number as
+  // it will actually be dialled. Checked against the pre-guess digits instead,
+  // a bare 10-digit mobile that merely STARTS with "91" + 1800/1860/1900 as raw
+  // digits (9118001234, say — no country code yet, just a coincidence of
+  // digits) was misread as the +91 1800 line, while the same person written
+  // with a leading zero (09118001234: strip the 0, prefix 91 — the OTHER guess
+  // branch) reached this same final number and was untouched — one person, two
+  // spellings, two answers. Once we are looking at the guessed/explicit
+  // result, country code 91 is no longer in doubt, so a leading + still does
+  // not exempt it.
+  if (/^91(1800|1860|1900)/.test(d)) return null;
   if (d.length < 11 || d.length > 15) return null;
   return { d, guessed };
 }
