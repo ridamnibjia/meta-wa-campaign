@@ -5822,6 +5822,10 @@ console.log('\nmedia routes');
 
       const dl = await fetch(`http://127.0.0.1:${port}/api/media/asset/${up.asset.id}`);
       assert.equal(dl.status, 200);
+      assert.equal(dl.headers.get('x-content-type-options'), 'nosniff',
+        'an operator upload is served with the inbound route\'s hardening, not a bare stream');
+      assert.match(dl.headers.get('content-security-policy'), /sandbox/,
+        'the same sandboxed CSP the inbound route sends, in case a browser is ever handed this to render');
       assert.equal(Buffer.from(await dl.arrayBuffer()).toString(), bytes.toString());
     } finally { server.close(); }
   });
