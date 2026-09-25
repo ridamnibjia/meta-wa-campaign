@@ -5919,6 +5919,92 @@ testAsync('a WebSocket/polling handshake from a foreign origin is refused', asyn
   }
 });
 
+console.log('\nHTTP wiring — route order, auth, CSRF origin, upload');
+// One boot of the real app/router table, walking every edge this batch
+// touches in the order an operator would actually hit them: locked out,
+// logged in, refused for a foreign Origin, throttled, then the two mount-order
+// traps (search-before-:waId, and the multer major B1 upgraded).
+testAsync('route order, session auth, CSRF origin, the login limiter and a multipart upload all work over real HTTP', async () => {
+  const savedPw = CFG.appPassword;
+  CFG.appPassword = 'correct horse';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+
+    // 1. Everything under /api is behind requireAuth before any router's own
+    // logic runs — settings.js never sees an unauthenticated /state request.
+    assert.equal((await fetch(`${base}/api/state`)).status, 401,
+      'route order is the security boundary: the gate must refuse before the handler does');
+
+    // 2. Exempt from the gate so the Docker healthcheck keeps working.
+    assert.equal((await fetch(`${base}/health`)).status, 200);
+
+    // 3. Meta cannot sign in, so /webhook sits above requireAuth — reachable,
+    // but its own two checks (verify token, HMAC) still refuse a bad caller.
+    assert.equal((await fetch(`${base}/webhook`)).status, 403,
+      'no hub.verify_token configured must refuse the challenge, not echo it');
+    assert.equal((await fetch(`${base}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    })).status, 401, 'an unsigned POST must never reach recordEnvelope');
+
+    // 4. The right password sets a cookie, and that cookie is what clears the
+    // gate point 1 hit — same route, now signed in.
+    const login = await fetch(`${base}/api/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'correct horse' }),
+    });
+    assert.equal(login.status, 200);
+    const cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+    assert.match(cookie, /^wa_session=/, 'a successful login must set the session cookie');
+    assert.equal((await fetch(`${base}/api/state`, { headers: { cookie } })).status, 200,
+      'the same cookie that failed at point 1 must now pass');
+
+    // 5. sameSite=strict is the primary CSRF defence, but originAllowed is the
+    // server-side backstop for a state-changing request that announces an
+    // origin this app does not serve — a valid cookie must not be enough alone.
+    assert.equal((await fetch(`${base}/api/pause`, {
+      method: 'POST', headers: { cookie, origin: 'https://evil.example' },
+    })).status, 403, 'a foreign Origin on a state-changing POST is refused even with a valid session');
+
+    // 6. A distinct source IP (trust proxy 1 honours X-Forwarded-For), so
+    // exhausting this budget cannot lock out the login at point 4 above,
+    // wherever this assertion ends up relative to it.
+    let last;
+    for (let i = 0; i < 11; i++) {
+      last = await fetch(`${base}/api/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.7' },
+        body: JSON.stringify({ password: 'wrong' }),
+      });
+    }
+    assert.equal(last.status, 429, 'the 11th attempt inside the window must be throttled');
+
+    // 7. Mounted before /inbox/:waId (src/routes/inbox.js) — unmount that
+    // order and "search" is read as a wa_id, and this 404s instead of
+    // returning a search result.
+    const search = await fetch(`${base}/api/inbox/search?q=a`, { headers: { cookie } });
+    assert.equal(search.status, 200);
+    assert.equal(typeof (await search.json()).tooShort, 'boolean',
+      'a thread-not-found body has no tooShort field — this is what proves /search matched, not /:waId');
+
+    // 8. Pins the multer 2.x upgrade (B1): a real multipart body through the
+    // real router, not a direct call to the CSV parser.
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    try {
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from('name,phone\nAsha,+91 90000 00001\n')], { type: 'text/csv' }), 'contacts.csv');
+      const up = await fetch(`${base}/api/upload-csv`, { method: 'POST', headers: { cookie }, body: form });
+      const upBody = await up.json();
+      assert.equal(upBody.ok, true, upBody.error);
+    } finally { S.phase = savedPhase; }
+  } finally {
+    s.close();
+    CFG.appPassword = savedPw;
+  }
+});
+
 console.log('\nmedia — Meta identifiers');
 {
   const fsx = require('fs');
