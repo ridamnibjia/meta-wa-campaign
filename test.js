@@ -7249,6 +7249,60 @@ console.log('\na Reset that lands mid-send');
     });
   });
 
+  // A Stop is final, and a burst of halt webhooks must not undo it. /stop clears
+  // pauseFlag and says idle, but the loop takes up to half a second to notice. A
+  // second refusal landing in that window re-parked the campaign, the loop's
+  // exit then promoted the repainted phase to 'done' — the one phase a failure
+  // webhook reopens — and a later 131049 restarted the run and sent to the next
+  // contact on a list the operator had stopped.
+  testAsync('a Stop during a burst of halt webhooks stays a Stop', async () => {
+    let sends = 0;
+    const refused = (wamid, code) => M.handleDeliveryFailure(
+      M.applyStatus({ id: wamid, status: 'failed', errors: [{ code, title: 'refused' }] }));
+    await withLoop(async () => {
+      if (++sends === 3) refused('wamid.stopburst.1', 131042);   // the first refusal lands during the third send
+      return graphOk(`wamid.stopburst.${sends}`);
+    }, async h => {
+      const { S, flags } = h.M;
+      const p = ['919000037101', '919000037102', '919000037103', '919000037104'];
+      const run = h.stage(p.map(dialStr => ({ dialStr, name: 'Sarah' })), 'stop-burst');
+      h.start();
+      await h.until(() => h.row(run, p[2]).wamid !== null && S.phase === 'paused');
+      assert.equal(flags.pauseFlag, true, 'precondition: the first refusal parked the campaign');
+
+      const stopped = callRoute('post', '/stop');     // the handler runs now; the loop is still in its idle sleep
+      assert.notEqual(refused('wamid.stopburst.2', 131042), 'halted', 'a Stop in flight is final — the next refusal must not re-park it');
+      assert.equal((await stopped).ok, true);
+      await h.until(() => !flags.running);
+      assert.equal(S.phase, 'idle', 'a Stop leaves the campaign idle, never "done" — done is what a failure webhook reopens');
+      assert.equal(flags.pauseFlag, false, 'and no pause is left behind for the next Start to trip over');
+
+      assert.equal(refused('wamid.stopburst.3', 131049), 'retrying', 'the contact is still owed a message, for whenever the operator starts again');
+      await new Promise(r => setTimeout(r, 200));
+      assert.equal(flags.running, false, 'but a webhook must not restart a campaign the operator stopped');
+      assert.equal(sends, 3, 'nobody after the Stop is sent to');
+      assert.equal(h.row(run, p[3]).attempted_at, null, 'the fourth contact is untouched');
+    });
+  });
+
+  // The loop's own half of the same rule: only /stop and /reset set stopFlag,
+  // and both mean idle, so whatever repaints the phase between the Stop and the
+  // loop's exit, the exit says idle — never 'done', which a webhook reopens.
+  testAsync('a Stop always exits idle, whatever was painted after it', async () => {
+    await withLoop(async () => graphOk('wamid.stopidle.1'), async h => {
+      const { S, flags } = h.M;
+      h.stage([{ dialStr: '919000037111', name: 'Marco' }, { dialStr: '919000037112', name: 'Asha' }], 'stop-idle');
+      h.start();
+      await callRoute('post', '/pause');               // lands during the first send; the loop then idles
+      await callRoute('post', '/stop');
+      S.phase = 'paused'; S.pauseReason = 'painted late'; // any writer landing before the loop notices
+      await h.until(() => !flags.running);
+      assert.equal(S.phase, 'idle', 'a stopped run must not end "done"');
+      assert.equal(S.pauseReason, null);
+      assert.equal(flags.pauseFlag, false);
+    });
+  });
+
   // ── A throttle on the NUMBER parks the whole loop ───────────────────────────
   // 131048 is Meta limiting the sending number over spam signals: while it is in
   // force every send fails. The loop used to park only the contact who met it and

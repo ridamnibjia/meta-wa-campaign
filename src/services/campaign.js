@@ -431,8 +431,11 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
   // walking it; an idle or finished one has no loop to stop, and a flag left set
   // there would greet the next Start as a pause. Parks once: a second halt, or
   // one landing on a pause already under the flag — the operator's own included
-  // — changes nothing, so a redelivery or a replay is free.
-  if (haltsCampaign(code) && runId === S.currentRunId && campaignActive()) {
+  // — changes nothing, so a redelivery or a replay is free. And a Stop in flight
+  // is final: /stop has cleared the flag and said idle, but campaignActive()
+  // stays true until the loop notices, and a pause repainted in that window is
+  // what used to let a stopped run come back.
+  if (haltsCampaign(code) && runId === S.currentRunId && campaignActive() && !flags.stopFlag) {
     if (!flags.pauseFlag) {
       const hint = explainError(code);
       flags.pauseFlag = true;
@@ -607,10 +610,18 @@ async function campaignLoop() {
   // — the ladder — is a column on the row.
   let rateLimited = { phone: null, n: 0 };
   while (true) {
-    // The phase is only set here if nobody has already set it. /stop and /reset
-    // say 'idle' the moment they are called, and overwriting that with 'done' a
-    // second later told the operator "Finished" about a run they stopped.
-    if (flags.stopFlag)  { log('info', 'Stopped'); if (S.phase !== 'idle') S.phase = 'done'; saveCampaignNow(); broadcast(); break; }
+    // Only /stop and /reset set stopFlag, and both mean idle — so a Stop leaves
+    // the campaign idle, whatever was painted since. It used to keep any phase
+    // but idle and promote it to 'done', and 'done' is the one phase a failure
+    // webhook reopens: a halt that repainted a pause between the Stop and this
+    // exit let a later 131049 restart a campaign the operator had stopped. Never
+    // 'done' either for the plain case — that told the operator "Finished" about
+    // a run they stopped.
+    if (flags.stopFlag) {
+      log('info', 'Stopped');
+      S.phase = 'idle'; S.pauseReason = null; flags.pauseFlag = false;
+      saveCampaignNow(); broadcast(); break;
+    }
     if (flags.pauseFlag) { await sleep(500); continue; }
     // The queue is asked, never counted. Nothing in this loop holds a cursor
     // that a crash could leave ahead of what was actually sent.
