@@ -307,7 +307,11 @@ function migrateOptOuts(files = FILES) {
   fs.renameSync(files.optOuts, `${files.optOuts}.migrated`);
   log('info', `Imported ${imported} opt-out(s) from opt-outs.json into contacts`);
   if (unreadable.length) {
-    log('warn', `${unreadable.length} entries could not be read and are NOT suppressed: ${unreadable.join(', ')}`);
+    // Capped the same way routes/contacts.js reports skipped/duplicate CSV
+    // rows: the count in the sentence is always the true total, but a file
+    // with a hundred bad entries must not turn one log line into a hundred.
+    log('warn', `${unreadable.length} entries could not be read and are NOT suppressed: `
+      + `${unreadable.slice(0, 10).join(', ')}${unreadable.length > 10 ? '…' : ''}`);
   }
   return { imported, skipped: false };
 }

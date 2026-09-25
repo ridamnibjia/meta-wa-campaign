@@ -3334,6 +3334,21 @@ console.log('\ncontacts — opt-outs.json import');
     fsx.rmSync(`${f}.migrated`, { force: true });
   });
 
+  test('a long list of unreadable entries is capped in the log, not printed in full', () => {
+    const f = tmp();
+    const bad = Array.from({ length: 12 }, (_, i) => `bad-entry-${i}`);
+    fsx.writeFileSync(f, JSON.stringify(['919777700005', ...bad]));
+    const before = S.logs.length;
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 1);
+    const warned = S.logs.slice(before).find(l => l.level === 'warn' && /could not be read/.test(l.msg));
+    assert.ok(warned, 'still warns even when the list is long');
+    assert.match(warned.msg, /^12 entries/, 'the count in the sentence is the true total, matching routes/contacts.js\'s skipped/duplicates reporting');
+    assert.ok(warned.msg.includes('…'), 'the list itself is capped at 10, same as skipped/duplicates rows');
+    assert.ok(!warned.msg.includes('bad-entry-11'), 'only the first 10 are named — a hundred-entry file must not become a hundred-name log line');
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
   test('a missing file is a no-op, not an error', () => {
     assert.deepEqual(C.migrateOptOuts({ optOuts: tmp() }), { imported: 0, skipped: true });
   });
