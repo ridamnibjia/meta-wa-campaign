@@ -7049,7 +7049,7 @@ console.log('\nstorage — a file in use is never deleted');
 // back, because a loop still inside an await when the stub comes off would
 // carry on against the real Graph API. campaign.json and warmup.json live at
 // the repo root and the loop writes both, so they are snapshotted and restored.
-async function withLoop(stubFetch, body) {
+async function withLoop(stubFetch, body, { exitMs = 5000 } = {}) {
   const M = require('./server');
   const { CFG: cfg, FILES: files } = require('./src/config');
   const fs = require('node:fs');
@@ -7082,17 +7082,53 @@ async function withLoop(stubFetch, body) {
     await body(h);
   } finally {
     M.flags.stopFlag = true;
-    await h.until(() => !M.flags.running, 5000);
-    M.flags.stopFlag = false; M.flags.pauseFlag = false;
-    global.fetch = saved.fetch;
+    const exited = await h.until(() => !M.flags.running, exitMs);
+    // Only a loop that has exited gets the real fetch back. One still inside an
+    // await would carry on against the real Graph API, and walk whichever run
+    // is current once the state below is put back — so the stub and the Stop
+    // stay in place and the test fails, rather than carrying on as if it had.
+    if (exited) { M.flags.stopFlag = false; global.fetch = saved.fetch; }
+    M.flags.pauseFlag = false;
     Object.assign(cfg, saved.cfg);
     for (const k of Object.keys(M.S.config)) if (!(k in saved.config)) delete M.S.config[k];
     Object.assign(M.S.config, saved.config);
     M.W.days = saved.days; M.W.enabled = saved.enabled; M.S.quality = saved.quality;
     Object.assign(M.S, { currentRunId: saved.run, phase: saved.phase, pauseReason: saved.reason });
     for (const [f, prev] of snap) if (prev) fs.writeFileSync(f, prev); else fs.rmSync(f, { force: true });
+    assert.ok(exited, `the loop did not exit within ${exitMs} ms of Stop — the fetch stub and the Stop are left in place`);
   }
 }
+
+// withLoop's own teardown. If the loop has not exited after its Stop, putting
+// the real fetch back would let a live loop carry on against Meta — so the
+// teardown must fail loudly, leaving the stub and the Stop in place. Here the
+// send never answers until the test releases it; afterwards the loop's own
+// writes are undone, because they land after withLoop has restored everything.
+testAsync('withLoop fails, stub still in place, when the loop outlives its Stop', async () => {
+  const M = require('./server');
+  const { FILES: files } = require('./src/config');
+  const fsw = require('node:fs');
+  const snap = [files.campaign, files.warmup].map(f => [f, fsw.existsSync(f) ? fsw.readFileSync(f) : null]);
+  const saved = { fetch: global.fetch, phase: M.S.phase, reason: M.S.pauseReason, days: [...M.W.days] };
+  let release = null;
+  const stuck = () => new Promise(r => { release = () => r(graphOk('wamid.stuck.1')); });
+  try {
+    await assert.rejects(withLoop(stuck, async h => {
+      h.stage([{ dialStr: '919000033301', name: 'Asha' }], 'stuck-loop');
+      h.start();
+    }, { exitMs: 100 }), /did not exit/);
+    assert.equal(global.fetch, stuck, 'the stub stays in place while a loop is alive');
+  } finally {
+    release?.();                                   // the send answers; the loop sees the Stop and exits
+    const end = Date.now() + 3000;
+    while (M.flags.running && Date.now() < end) await new Promise(r => setTimeout(r, 10));
+    M.flags.stopFlag = false;
+    global.fetch = saved.fetch;
+    Object.assign(M.S, { phase: saved.phase, pauseReason: saved.reason });
+    M.W.days = saved.days;
+    for (const [f, prev] of snap) if (prev) fsw.writeFileSync(f, prev); else fsw.rmSync(f, { force: true });
+  }
+});
 
 // Graph's two answers to a send, as the stubbed fetch returns them.
 function graphOk(id) {
