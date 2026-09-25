@@ -422,6 +422,29 @@ console.log('\nadopting a template — the attachment picked this session surviv
     } finally { S.phase = savedPhase; }
   });
 
+  // The name half of the lock is covered above by a different-name switch,
+  // which leaves `language` undefined on both calls and so is vacuously true
+  // for sameLang regardless of what that clause does — deleting `sameLang`
+  // entirely from templateLocked would not fail that test. This one holds
+  // the name fixed and only changes the language, which only a real sameLang
+  // check can catch.
+  test('adoptTemplate refuses a language switch even when the name stays the same', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.config.templateLanguage = 'en';
+    S.phase = 'waiting';
+    const variants = { found: true, templates: [
+      { name: 'promo_a', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}', headerFormat: null, headerText: null, buttons: [] },
+      { name: 'promo_a', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy', headerFormat: null, headerText: null, buttons: [] },
+    ] };
+    try {
+      const r = adoptTemplate('promo_a', variants, 'hi');
+      assert.deepEqual(r, { ok: false, error: 'A campaign is sending “promo_a” right now — stop it before switching templates.' },
+        'the same name under a different language is still a different outbound message');
+      assert.equal(S.config.templateLanguage, 'en', 'nothing is mutated by a refused language switch');
+    } finally { S.phase = savedPhase; }
+  });
+
   test('Meta header shape wins over a stale row — no header on Meta clears both fields', () => {
     saveTemplateRow({ name: 'adopt_stale_header', displayName: 'Stale', headerFormat: 'DOCUMENT',
                       headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
@@ -596,6 +619,21 @@ console.log('\ntemplate routes — identity locked mid-campaign');
       assert.equal(r.ok, false, '/config {templateName} must be refused while a campaign is sending promo_a');
       assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
     } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; }
+  });
+
+  testAsync('POST /api/config refuses a templateLanguage change even with the same templateName, mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName, savedLang = S.config.templateLanguage;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a'; S.config.templateLanguage = 'en';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ templateName: 'promo_a', templateLanguage: 'hi' }),
+      })).json();
+      assert.equal(r.ok, false, 'the same template under a different language is still a different outbound message');
+      assert.equal(S.config.templateLanguage, 'en', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; S.config.templateLanguage = savedLang; }
   });
 
   testAsync('POST /api/template/create still submits to Meta but does not adopt, mid-campaign', async () => {
