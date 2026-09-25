@@ -7115,11 +7115,13 @@ function callRoute(method, path, body = {}, routerPath = './src/routes/campaign'
   });
 }
 
-// ── The one thing that needs the loop itself ──────────────────────────────────
-// Every other test in this file stays out of the campaign loop on purpose. This
-// one cannot: the bug is a race between an HTTP route and an `await` inside the
-// loop, and there is no way to observe it from outside. `fetch` is stubbed so the
-// Reset lands at exactly the wrong moment, every run, rather than sometimes.
+// ── Tests that drive the real loop ─────────────────────────────────────────────
+// Most of this file tests the loop's pieces from outside it. The tests in this
+// block — and the others that call withLoop() — cannot: their bugs are races
+// between a route or a webhook and an `await` inside the loop, and there is no
+// way to observe those from outside. `fetch` is stubbed so the interruption
+// lands at exactly the wrong moment every run, rather than sometimes; the first
+// one below is the Reset that lands mid-send.
 console.log('\na Reset that lands mid-send');
 {
   const M = require('./server');
