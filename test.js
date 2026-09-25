@@ -929,6 +929,15 @@ test('a fully +-written file guesses no country at all', () => {
   const csv = 'name,phone\nAsha,+919000000001\nRahul,+919000000002\n';
   assert.equal(parseCSV(Buffer.from(csv)).guessedCountry, 0);
 });
+test('guessedCountry never exceeds the contacts it describes, even when a guessed duplicate collapses away', () => {
+  // Two different spellings of the same number — one bare 10-digit, one with a
+  // leading zero — both need the +91 guess, and both normalize to one contact.
+  const csv = 'name,phone\nAsha,9000000001\nRahul,09000000001\n';
+  const { contacts, guessedCountry } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1, 'the two rows collapse to one contact');
+  assert.equal(guessedCountry, 1,
+    'a guessed row that turns out to be a duplicate must not inflate the count past what "N of TOTAL numbers" can mean');
+});
 
 console.log('\nverifySignature');
 {

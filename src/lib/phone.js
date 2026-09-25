@@ -220,13 +220,18 @@ function parseCSV(buffer) {
       const norm = normalize(raw);
       if (!norm) continue;
       const { d, guessed } = norm;
-      if (guessed) guessedCountry++;
       usable = true;                       // the row had a number; a duplicate
       if (seen.has(d)) {                   // is not a row that failed to parse
         duplicates.push({ row: i + 1, name, dialStr: d, firstRow: seen.get(d) });
         continue;
       }
       seen.set(d, i + 1);
+      // Counted here, not above: two different spellings of the same number
+      // (a bare 10-digit and a leading-zero one, say) can both trigger the
+      // guess, and only the first becomes a contact. Counting the duplicate too
+      // would let guessedCountry exceed contacts.length, and the upload route's
+      // "N of TOTAL numbers" log line would stop making sense.
+      if (guessed) guessedCountry++;
       contacts.push({ name, phone: raw, dialStr: d, fields });
     }
     if (!usable) skipped.push({ row: i + 1, name, reason: 'no usable phone number in this row' });
