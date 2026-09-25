@@ -18,8 +18,9 @@ const { resumeIfInterrupted } = require('./src/services/campaign');
 const { startRetention } = require('./src/services/retention');
 const { migrateJsonToSql } = require('./src/services/migrate');
 const { migrateOptOuts }   = require('./src/services/contacts');
-const { unprocessedWebhookCount } = require('./src/services/messages');
+const { unprocessedWebhookCount, recordEnvelope } = require('./src/services/messages');
 const { memoryWarning } = require('./src/services/diagnostics');
+const { verifySignature } = require('./src/lib/signature');
 
 const app    = express();
 const server = http.createServer(app);
@@ -52,15 +53,19 @@ app.use((req, res, next) => {
 // rawBody is kept so the webhook can verify Meta's X-Hub-Signature-256 over the
 // exact bytes sent. Re-serialising the parsed object would change the digest.
 //
-// limit is raised well past Express's 100kb default on purpose: this is a bulk
-// sender, so a batched status webhook covering hundreds of statuses is the
-// normal shape, not an edge case. A rejected body here means a 413 BEFORE
-// router.post('/webhook') ever runs — nothing reaches webhook_events, Meta
-// retries the identical bytes, and gets an identical 413 forever. Since Meta's
-// Cloud API is webhook-push only, that is not a failed request, it is a
-// permanently lost batch — the exact loss this durability boundary exists to
-// prevent, one layer above where it was defended.
-app.use(express.json({ limit: '5mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
+// limit is raised well past Express's 100kb default on purpose, and ONLY for
+// /webhook: this is a bulk sender, so a batched status webhook covering
+// hundreds of statuses is the normal shape, not an edge case. A rejected body
+// here means a 413 BEFORE router.post('/webhook') ever runs — nothing reaches
+// webhook_events, Meta retries the identical bytes, and gets an identical 413
+// forever. Since Meta's Cloud API is webhook-push only, that is not a failed
+// request, it is a permanently lost batch — the exact loss this durability
+// boundary exists to prevent, one layer above where it was defended. Every
+// other route stays at Express's ordinary 1mb: nothing else this app serves
+// legitimately needs megabytes of JSON, and a caller who is not Meta gets no
+// reason to be handed the same allowance.
+app.use('/webhook', express.json({ limit: '5mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // The frontend is public: it is a login screen until the API says otherwise.
@@ -80,6 +85,29 @@ app.get('/health', (req, res) => res.json({
 
 auth.mount(app);      // /api/login, /api/logout, /api/session — outside the gate
 routes.mount(app);    // /webhook (signed), then everything behind requireAuth
+
+// express.json throws BEFORE router.post('/webhook') runs, so a body Meta
+// signed but we cannot parse (a batch has been seen truncated by Meta itself)
+// would 400 forever — the same permanently-lost-batch problem the 5mb limit
+// above exists to prevent, one step earlier. rawBody is already set by the
+// verify hook even though parsing failed, so store it where replay can reach
+// it, gated on the SAME signature check the route itself would have made: a
+// parse failure must not become a second way past the HMAC check, so a body
+// that is both unparseable AND badly signed still gets the route's ordinary
+// 401, not a free pass to entity.parse.failed's default 400.
+app.use((err, req, res, next) => {
+  if (!(err?.type === 'entity.parse.failed' && req.method === 'POST' && req.path === '/webhook')) {
+    return next(err);
+  }
+  if (!verifySignature(req.rawBody, req.get('x-hub-signature-256'), CFG.appSecret)) {
+    log('warn', 'webhook POST rejected — bad or missing X-Hub-Signature-256 (unparseable body)');
+    return res.sendStatus(401);
+  }
+  try { recordEnvelope(req.rawBody.toString('utf8')); }
+  catch (e) { log('error', `unparseable webhook NOT stored: ${e.message}`); return res.sendStatus(500); }
+  log('warn', 'webhook body is not valid JSON — stored unprocessed for replay');
+  res.sendStatus(200);
+});
 
 // Anything under /api that no router claimed is a 404 in JSON, not the SPA
 // shell. Without this the catch-all below answers a mistyped endpoint with a

@@ -5713,6 +5713,64 @@ testAsync('a signed envelope well over the old 100kb express default is accepted
   assert.equal(after, before + 1, 'the oversized envelope must actually be recorded, not merely accepted');
 });
 
+// These two need the REAL app, not the bare webhook router: the size-limit
+// test compares /webhook's allowance against /api/login's, and the
+// unparseable-body test exercises the error middleware server.js registers
+// after routes.mount(app) — neither exists on startWebhookServer's bare mount.
+testAsync('a signed body that is not JSON is stored for replay, not 400d — and a badly signed one is still refused', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const raw = Buffer.from('{ not json');
+    const sig = sign(raw, 'test-secret');
+    const before = testDb.prepare('SELECT count(*) n FROM webhook_events WHERE processed_at IS NULL').get().n;
+
+    const r = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sig },
+    });
+    assert.equal(r.status, 200, "Meta retries a 400 forever with identical bytes — a permanently lost batch");
+    assert.equal(testDb.prepare('SELECT count(*) n FROM webhook_events WHERE processed_at IS NULL').get().n, before + 1,
+      'the envelope must land in the replay queue ingest.js already knows how to hold');
+
+    const forged = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': 'sha256=00' },
+    });
+    assert.equal(forged.status, 401,
+      'an unparseable body with a bad signature must still be refused, exactly like a parseable one — the parse failure must not become a second way past the HMAC check');
+  } finally {
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+});
+testAsync('only /webhook accepts a multi-megabyte JSON body', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const big = JSON.stringify({ object: 'x', pad: 'a'.repeat(2 * 1024 * 1024) });
+    const w = await fetch(`${base}/webhook`, {
+      method: 'POST', body: big,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(big, 'test-secret') },
+    });
+    assert.equal(w.status, 200, 'a batched status webhook is legitimately large');
+
+    const l = await fetch(`${base}/api/login`, {
+      method: 'POST', body: big, headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(l.status, 413, 'nothing unauthenticated but the signed webhook should be allowed to parse megabytes');
+  } finally {
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+});
+
 console.log('\nmedia routes');
 {
   // Mirrors startWebhookServer: mount the real router on a bare app so the
