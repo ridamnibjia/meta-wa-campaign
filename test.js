@@ -3315,7 +3315,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   const istClock = ms => new Date(ms).toLocaleTimeString('en-IN',
     { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
 
-  testAsync('at the warm-up ceiling the loop parks until a contact leaves the last 24 hours, and says so', async () => {
+  testAsync('at the warm-up ceiling the loop parks, and says when a seat leaves the last 24 hours', async () => {
     let sends = 0;
     await withLoop(async () => graphOk(`wamid.rung.${++sends}`), async h => {
       const seats = atTheRung(Date.now() - 3600000);
@@ -3324,8 +3324,12 @@ console.log('\nrun_recipients — retrying a moment-based failure');
         h.stage([{ dialStr: '919000034101', name: 'Asha' }], 'rung-park');
         h.start();
         await h.until(() => S.phase === 'paused');
+        const slot = M.slotFreesAt();
+        // When IST midnight comes first the new day's rung may have room sooner,
+        // and the sentence says so rather than promising the later time.
+        const sooner = M.nextIstMidnight() < slot ? ' — sooner if the new day\'s rung is higher' : '';
         assert.equal(S.pauseReason,
-          `Warm-up ceiling: ${seats.rung} people in the last 24 hours (day ${seats.day}). Next send at ${istClock(M.slotFreesAt())}.`,
+          `Warm-up ceiling: ${seats.rung} people in the last 24 hours (day ${seats.day}). Next send at ${istClock(slot)}${sooner}.`,
           'the sentence names the ceiling, the window it counts, and when the earliest counted contact leaves it — '
           + 'not IST midnight, which is when a calendar day would have freed the slots');
         assert.equal(sends, 0, 'nobody is messaged while Meta\'s window is full');
@@ -3357,6 +3361,45 @@ console.log('\nrun_recipients — retrying a moment-based failure');
         assert.deepEqual([...phases], ['running'], 'a wait this short is slept silently — no pause flashed on screen');
         assert.equal(S.logs.filter(l => /Warm-up ceiling/.test(l.msg)).length, 0, 'and nothing announced in the log');
       } finally { seats.remove(); S.logs = savedLogs; }
+    });
+  });
+
+  // The rung itself moves at IST midnight — a new sending day climbs one, and
+  // graduation lifts it after the top rung — but a rolling park slept until a
+  // seat freed, up to 24 hours: a window filled at 20:00 slept to 20:00 the next
+  // day while the new rung had room from midnight. The park wakes at whichever
+  // comes first, and the wake re-derives the cap. The new day is emulated
+  // through W.days, which is what rawStep reads (todayKey() reads new Date(),
+  // which a Date.now stub does not move); the clock is moved by an offset so it
+  // keeps running, and the row the send writes, dated on that clock, is removed.
+  testAsync('a rolling park wakes at IST midnight when that comes first, and the new rung sends', async () => {
+    const realNow = Date.now;
+    let sends = 0;
+    await withLoop(async url => {
+      if (String(url).includes('quality_rating')) return qualityIs('GREEN')(url);
+      return graphOk(`wamid.rungday.${++sends}`);
+    }, async h => {
+      const seats = atTheRung(realNow() - 3600000);       // every seat an hour old: the first frees in 23 hours
+      try {
+        h.stage([{ dialStr: '919000038001', name: 'Rahul' }], 'rung-midnight');
+        h.start();
+        await h.until(() => S.phase === 'paused');
+        const slot = M.slotFreesAt(), midnight = M.nextIstMidnight();
+        assert.ok(S.pauseReason.includes(`Next send at ${istClock(slot)}`), 'the sentence still names when a seat frees');
+        assert.equal(sends, 0);
+
+        W.days.push('2001-02-01');                         // the day turned: one more sending day behind the number
+        const cap = M.effectiveCap();
+        assert.ok(cap === null || cap > seats.rung, 'precondition: the new day\'s rung has room');
+        const jump = Math.min(slot, midnight) + 1000 - realNow();
+        Date.now = () => realNow() + jump;                 // just past min(slot, midnight)
+        await h.until(() => sends === 1, 4000);
+        assert.equal(sends, 1, 'woken at the earlier of the two, the loop re-derives the cap and sends on the new rung');
+      } finally {
+        Date.now = realNow;
+        seats.remove();
+        db.prepare("DELETE FROM messages WHERE wamid LIKE 'wamid.rungday.%'").run();
+      }
     });
   });
 

@@ -683,8 +683,16 @@ async function campaignLoop() {
       // those leaves — hours before midnight, or long after it. The fallback only
       // guards the two queries disagreeing (every counted send leaving the window
       // between them): a short silent wait, then the count is asked again.
+      //
+      // The rung itself moves at IST midnight — a new sending day climbs one,
+      // and graduation lifts it after the top rung — so a rolling park wakes at
+      // whichever comes first and lets the wake re-derive the cap. Sleeping to
+      // the seat alone slept through the climb: a window filled at 20:00 waited
+      // until 20:00 the next day while the new rung had room from midnight.
       const rolling = capWindow() === '24h';
-      const until = rolling ? (slotFreesAt() ?? Date.now() + ANNOUNCE_WAIT_MS) : nextIstMidnight();
+      const midnight = nextIstMidnight();
+      const slot = rolling ? (slotFreesAt() ?? Date.now() + ANNOUNCE_WAIT_MS) : null;
+      const until = rolling ? Math.min(slot, midnight) : midnight;
       // Yesterday's contacts leave the rolling window as far apart as they were
       // sent — seconds, at campaign pace — so a loop at the ceiling parks once
       // per freed slot. Announcing each of those is the slowdown described at
@@ -695,7 +703,8 @@ async function campaignLoop() {
       // because "why did the campaign stop at 50" has two answers now.
       S.phase = 'paused';
       S.pauseReason = rolling
-        ? `Warm-up ceiling: ${cap} people in the last 24 hours (day ${warmupDay()}). Next send at ${clockIST(until)}.`
+        ? `Warm-up ceiling: ${cap} people in the last 24 hours (day ${warmupDay()}). Next send at ${clockIST(slot)}`
+          + `${midnight < slot ? ' — sooner if the new day\'s rung is higher' : ''}.`
         : `Daily cap reached (${cap}/day). Resumes at ${clockIST(until)}.`;
       log('info', S.pauseReason);
       broadcast();
