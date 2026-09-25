@@ -68,6 +68,20 @@ app.use('/webhook', express.json({ limit: '5mb', verify: (req, _res, buf) => { r
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// SAMEORIGIN / 'self', not DENY / 'none': the inbox previews PDFs in a
+// same-origin <object> (public/views/inbox.jsx), and DENY would blank it. The
+// media routes overwrite Content-Security-Policy with their own sandboxed
+// policy per response — intended, since a customer's own file needs the
+// stricter one — and setHeader there replaces rather than appends, so this
+// baseline never lingers alongside it.
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'self'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+
 // The frontend is public: it is a login screen until the API says otherwise.
 if (fs.existsSync(PUBLIC_DIR)) app.use(express.static(PUBLIC_DIR));
 

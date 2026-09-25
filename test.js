@@ -5771,6 +5771,26 @@ testAsync('only /webhook accepts a multi-megabyte JSON body', async () => {
   }
 });
 
+console.log('\nsecurity headers');
+testAsync('the SPA shell and an API response both carry the baseline hardening headers', async () => {
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    for (const path of ['/', '/api/session']) {
+      const r = await fetch(`${base}${path}`);
+      assert.equal(r.headers.get('x-frame-options'), 'SAMEORIGIN',
+        `${path}: DENY would blank the same-origin PDF <object> preview in views/inbox.jsx`);
+      assert.match(r.headers.get('content-security-policy'), /frame-ancestors 'self'/,
+        `${path}: 'none' would break that same PDF preview`);
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff',
+        `${path}: without it a browser can sniff a response into something it will render`);
+      assert.equal(r.headers.get('referrer-policy'), 'no-referrer',
+        `${path}: the URL (which can carry a session-adjacent path) must not leak to a third party via Referer`);
+    }
+  } finally { s.close(); }
+});
+
 console.log('\nmedia routes');
 {
   // Mirrors startWebhookServer: mount the real router on a bare app so the
