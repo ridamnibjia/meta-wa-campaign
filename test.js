@@ -7802,6 +7802,40 @@ console.log('\na Reset that lands mid-send');
     });
   });
 
+  // The same window lets a second Start through: another tab's Start passes the
+  // same blocker, launches the loop, and the operator pauses it — then this one
+  // resumed, wiped the log, cleared pauseFlag and painted 'running' over their
+  // pause, and the first loop walked on. Refused with the blocker's sentence.
+  testAsync('/start refuses when another Start launched the campaign during its awaits', async () => {
+    let sends = 0, raced = false;
+    await withLoop(async url => {
+      if (String(url).endsWith('/messages')) return graphOk(`wamid.secondstart.${++sends}`);
+      if (!String(url).includes('/message_templates')) return accountInfo();
+      if (!raced) {                                   // the other tab: Start, then Pause
+        raced = true;
+        M.S.phase = 'running'; M.S.pauseReason = null; M.startLoop();
+        callRoute('post', '/pause');
+      }
+      return templateList('second_start');
+    }, async h => {
+      const { S, flags } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'second_start';
+      h.stage([{ dialStr: '919000033041', name: 'Asha' }, { dialStr: '919000033042', name: 'Rahul' }], 'second-start');
+      S.phase = 'idle';
+
+      const r = await callRoute('post', '/start');
+      assert.ok(raced, 'the other Start really landed inside the await');
+      assert.equal(r.ok, false, 'a campaign already under way must not be started over');
+      assert.match(r.error || '', /paused part-way through/, 'with the sentence the blocker gives');
+      assert.equal(flags.pauseFlag, true, 'the operator\'s pause stays in force');
+      assert.equal(S.pauseReason, h.M.USER_PAUSE);
+      assert.ok(S.logs.some(l => l.msg === 'Paused'), 'and the log is not wiped');
+      await new Promise(res => setTimeout(res, 100));
+      assert.equal(sends, 1, 'the paused loop does not walk on');
+    });
+  });
+
   // A template this app cannot fill — named {{first_name}} variables — is marked
   // in S.config.templateUnsupported by adoptTemplate (contract C6), and the two
   // send doors are where that has to bite: every contact would fail at Meta on a

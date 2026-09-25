@@ -159,6 +159,13 @@ router.post('/start', async (req, res) => {
   if (S.currentRunId !== runId) {
     return res.json({ ok: false, error: 'The staged list changed while starting — check it and press Start again.' });
   }
+  // The same window lets a second Start through: another tab's Start passed the
+  // same blocker and launched the loop — which may already have parked, or been
+  // paused by the operator — and carrying on here wiped the log, cleared
+  // pauseFlag and painted 'running' over that park. Asked again, with the
+  // blocker's own sentence.
+  const busy = campaignBlocker();
+  if (busy) return res.json({ ok: false, error: busy });
 
   // The queue was staged at upload and is NOT rebuilt here. Rebuilding would
   // reset every wamid, and /start after a pause would re-send to everyone who
