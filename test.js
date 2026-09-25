@@ -7476,6 +7476,46 @@ console.log('\na Reset that lands mid-send');
     });
   });
 
+  // The crash park must not overrule what the operator already said. A Stop is
+  // final — parking it as a resumable pause would bring back a campaign they
+  // stopped, one Resume or reboot later — and their own Pause must stay theirs:
+  // any other reason makes it auto-resume on the next boot. Both land in the
+  // microtask before the crash handler runs, exactly as a click would.
+  const crashWith = (h, operatorSays) => {
+    h.M.db.exec('ALTER TABLE run_recipients RENAME TO run_recipients_away');
+    try { h.start(); } finally { h.M.db.exec('ALTER TABLE run_recipients_away RENAME TO run_recipients'); }
+    return callRoute('post', operatorSays);
+  };
+
+  testAsync('a loop that crashes after a Stop stays stopped', async () => {
+    await withLoop(async () => graphOk('wamid.crashstop.1'), async h => {
+      const { S, flags } = h.M;
+      h.stage([{ dialStr: '919000033111', name: 'Rahul' }], 'crash-after-stop');
+      await crashWith(h, '/stop');
+      await h.until(() => !flags.running);
+      assert.equal(S.phase, 'idle', 'a Stop is final — not a pause that Resume or a reboot would lift');
+      assert.equal(flags.pauseFlag, false);
+      assert.equal(S.pauseReason, null);
+    });
+  });
+
+  testAsync('a loop that crashes during the operator\'s Pause keeps it theirs', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.crashpause.${++sends}`), async h => {
+      const { S, flags } = h.M;
+      const run = h.stage([{ dialStr: '919000033121', name: 'Sarah' }], 'crash-in-user-pause');
+      await crashWith(h, '/pause');
+      await h.until(() => !flags.running);
+      assert.equal(S.pauseReason, h.M.USER_PAUSE,
+        'any other reason turns their pause into one the next boot resumes on its own');
+      assert.equal(S.phase, 'paused');
+      assert.equal(flags.pauseFlag, true, 'still set, so Resume is theirs to press');
+      assert.equal((await callRoute('post', '/resume')).ok, true);
+      await h.until(() => h.row(run, '919000033121').wamid !== null);
+      assert.equal(sends, 1, 'and Resume carries on from the same contact');
+    });
+  });
+
   // A thrown fetch (DNS, TLS, no network) is a moment, not three hours: it goes
   // through the same in-loop backoff a rate limit gets, and only lands on the
   // ladder after RATE_LIMIT_RETRIES straight misses.

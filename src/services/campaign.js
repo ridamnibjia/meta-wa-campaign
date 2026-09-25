@@ -592,10 +592,23 @@ function startLoop() {
     // operator's pause to lift — Resume restarts the loop at the same row,
     // because the queue is on disk — and the reason is not USER_PAUSE, so a
     // reboot resumes it on its own like every other pause the loop gave itself.
-    flags.pauseFlag = true;
-    S.phase = 'paused';
-    S.pauseReason = `The send loop stopped on an error — ${e?.message ?? e}. Press Resume to carry on from the same contact.`;
     log('error', 'Loop: ' + (e?.message ?? e));
+    if (flags.stopFlag) {
+      // A Stop or Reset already in flight is the operator's last word: both
+      // mean idle, exactly as the loop's own stop exit leaves it. Parking it as
+      // a resumable pause would bring back a campaign they stopped, one Resume
+      // or one reboot later.
+      S.phase = 'idle'; S.pauseReason = null; flags.pauseFlag = false;
+    } else {
+      flags.pauseFlag = true;
+      S.phase = 'paused';
+      // The operator's own Pause stays theirs. Any other reason makes the next
+      // boot resume it on its own (resumeIfInterrupted), which is right for the
+      // crash and wrong for a pause somebody chose; the error is in the log.
+      if (S.pauseReason !== USER_PAUSE) {
+        S.pauseReason = `The send loop stopped on an error — ${e?.message ?? e}. Press Resume to carry on from the same contact.`;
+      }
+    }
     // Its own try: the crash may have BEEN the disk or the database, and a throw
     // from here would be an unhandled rejection that takes the process down.
     try { saveCampaignNow(); broadcast(); } catch { /* the park above is what matters */ }
