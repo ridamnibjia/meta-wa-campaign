@@ -5732,7 +5732,7 @@ testAsync('a signed body that is not JSON is stored for replay, not 400d — and
       method: 'POST', body: raw,
       headers: { 'content-type': 'application/json', 'x-hub-signature-256': sig },
     });
-    assert.equal(r.status, 200, "Meta retries a 400 forever with identical bytes — a permanently lost batch");
+    assert.equal(r.status, 200, 'Meta retries a 400 forever with identical bytes — a permanently lost batch');
     assert.equal(testDb.prepare('SELECT count(*) n FROM webhook_events WHERE processed_at IS NULL').get().n, before + 1,
       'the envelope must land in the replay queue ingest.js already knows how to hold');
 
