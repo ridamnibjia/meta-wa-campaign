@@ -142,8 +142,12 @@ if (require.main === module) {
   require('./src/services/warmup').reconcileWarmupDays();
   resumeIfInterrupted();
   startRetention();
-  server.listen(CFG.port, () => {
-    console.log(`\n[WA-CAMPAIGN] Server running → http://localhost:${CFG.port}`);
+  // Loopback (CFG.bindHost) unless BIND_HOST says otherwise: a caller who can
+  // connect to the port directly — rather than through cloudflared — can put
+  // anything in X-Forwarded-For, which `trust proxy 1` above would then trust,
+  // and that header is exactly what the login rate limiter keys callers on.
+  server.listen(CFG.port, CFG.bindHost, () => {
+    console.log(`\n[WA-CAMPAIGN] Listening on ${CFG.bindHost}:${CFG.port}`);
     console.log(`[WA-CAMPAIGN] Phone Number ID : ${CFG.phoneNumberId || 'NOT SET'}`);
     console.log(`[WA-CAMPAIGN] Access Token    : ${CFG.accessToken ? 'SET' : 'NOT SET'}`);
     console.log(`[WA-CAMPAIGN] Password gate   : ${CFG.appPassword ? 'ON' : 'OFF — API LOCKED until APP_PASSWORD is set'}`);
