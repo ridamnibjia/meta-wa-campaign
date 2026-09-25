@@ -69,10 +69,10 @@ if (fs.existsSync(PUBLIC_DIR)) app.use(express.static(PUBLIC_DIR));
 // Exempt from the password so the Docker healthcheck keeps working. It reveals
 // nothing an unauthenticated caller could use.
 //
-// unprocessedWebhooks: nothing in this app replays webhook_events yet — this
-// count is the only signal that it needs to. Without it the only trace of a
-// parse failure is a log line in the 500-entry ring buffer that /api/start
-// wipes (F5).
+// unprocessedWebhooks: unprocessed rows are the replay queue — Diagnostics →
+// Replay (services/ingest.js) drains it; this count is the signal to press it.
+// Without it the only trace of a parse failure is a log line in the 500-entry
+// ring buffer that /api/start wipes (F5).
 app.get('/health', (req, res) => res.json({
   status: 'ok', phase: S.phase, uptime: Math.round(process.uptime()),
   unprocessedWebhooks: unprocessedWebhookCount(),
