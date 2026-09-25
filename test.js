@@ -245,7 +245,7 @@ test('a blank sample slot is caught positionally, not by counting non-blanks els
     "['', 'Asha'] passed the old count-based check and Meta reviewed the 'there' fallback instead of the operator's word");
 });
 
-test('an empty CSV still answers with all three keys', () => {
+test('an empty CSV still answers with every key the route destructures', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
   assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0 });
