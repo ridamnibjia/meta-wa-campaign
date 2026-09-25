@@ -39,28 +39,6 @@ function normalize(raw) {
 }
 const normalizePhone = raw => normalize(raw)?.d ?? null;
 
-// RFC 4180 fields. Splitting on a bare comma was wrong in a way that never
-// announced itself: a quoted name like "Doe, John" shifted every column to its
-// right, the phone index landed on a name fragment, and the row was dropped
-// with no error anywhere. A quoted field may contain commas, and a doubled
-// quote inside one is a literal quote.
-function splitCsvLine(line) {
-  const out = [];
-  let field = '', quoted = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (quoted) {
-      if (c !== '"') { field += c; continue; }
-      if (line[i + 1] === '"') { field += '"'; i++; continue; }
-      quoted = false;
-    } else if (c === '"') quoted = true;
-    else if (c === ',')   { out.push(field); field = ''; }
-    else field += c;
-  }
-  out.push(field);
-  return out.map(f => f.trim());
-}
-
 // Excel's "Unicode CSV" and several CRM exports are UTF-16 with a BOM. Decoded
 // as UTF-8 every character grows a NUL neighbour, no header check can match,
 // and a thousand-row file loads zero contacts with nothing saying why. The BOM
@@ -263,4 +241,4 @@ function csvField(v) {
   return /[",]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
-module.exports = { normalizePhone, parseCSV, splitCsvLine, csvField };
+module.exports = { normalizePhone, parseCSV, csvField };
