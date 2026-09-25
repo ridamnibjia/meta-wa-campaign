@@ -5896,6 +5896,29 @@ console.log('\nmedia routes');
   });
 }
 
+console.log('\nsocket.io origin enforcement');
+testAsync('a WebSocket/polling handshake from a foreign origin is refused', async () => {
+  // The REAL singleton server, not a second http.createServer(app): socket.io
+  // is attached to this exact instance in server.js, so only it has a
+  // /socket.io/ transport to hit. Torn down with io.close() rather than
+  // server.close() — io.close() also clears any engine.io client/timer state a
+  // handshake below leaves behind before it closes the httpServer, which is
+  // what keeps this test from being why the suite does not exit on its own.
+  const { server: realServer, io: realIo } = require('./server');
+  await new Promise(resolve => realServer.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${realServer.address().port}`;
+    const bad = await fetch(`${base}/socket.io/?EIO=4&transport=polling`, { headers: { origin: 'https://evil.example' } });
+    assert.notEqual(bad.status, 200, 'CORS never applied to the upgrade; allowRequest is what refuses it');
+
+    const ok = await fetch(`${base}/socket.io/?EIO=4&transport=polling`);
+    // No cookie → socketAuth refuses at connect, but the transport handshake itself is allowed.
+    assert.equal(ok.status, 200, 'same-origin clients (no Origin header on polling) must still connect');
+  } finally {
+    await new Promise(resolve => realIo.close(resolve));
+  }
+});
+
 console.log('\nmedia — Meta identifiers');
 {
   const fsx = require('fs');

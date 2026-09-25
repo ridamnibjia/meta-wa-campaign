@@ -139,7 +139,16 @@ app.get('*', (req, res) => {
 
 // ── Socket ─────────────────────────────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: allowedOrigins || true, methods: ['GET', 'POST'], credentials: true },
+  cors: { origin: allowedOrigins || false, methods: ['GET', 'POST'], credentials: true },
+  // cors.origin above only governs the polling transport's XHR path — a
+  // WebSocket upgrade, and a bare polling GET like a non-browser client would
+  // send, never carry CORS headers at all, so a foreign page could otherwise
+  // reach this handshake purely by not going through XHR. allowRequest runs
+  // for every transport before a Socket is created, and reuses the exact
+  // origin check requireAuth already makes for a state-changing POST. The
+  // shim gives it an Express-shaped req: the handshake object socket.io hands
+  // this callback is Node's plain IncomingMessage, which has no req.get().
+  allowRequest: (req, cb) => cb(null, auth.originAllowed({ get: h => req.headers[h.toLowerCase()] })),
 });
 // Same session check as the REST API. Without this the password would be
 // decorative — anyone could stream state, logs and customer messages.

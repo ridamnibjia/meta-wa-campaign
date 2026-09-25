@@ -194,4 +194,9 @@ function mount(app) {
 module.exports = {
   mount, requireAuth, socketAuth, checkPassword, isConfigured,
   createSession, validSession, destroySession, readCookie, SESSION_COOKIE,
+  // Exported for server.js's socket.io allowRequest (2.7): CORS headers are
+  // never consulted for a WebSocket upgrade or a bare polling GET, so the
+  // same origin check requireAuth uses for a state-changing POST has to be
+  // run again at the transport layer, not just left to cors.origin.
+  originAllowed,
 };
