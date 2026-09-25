@@ -2,7 +2,7 @@
 const express = require('express');
 const { CFG } = require('../config');
 const { log } = require('../state');
-const { verifySignature } = require('../lib/signature');
+const { verifySignature, safeEqual } = require('../lib/signature');
 const { recordEnvelope, markEnvelopeProcessed } = require('../services/messages');
 const { processEnvelope } = require('../services/ingest');
 
@@ -17,10 +17,15 @@ router.get('/webhook', (req, res) => {
   const challenge = req.query['hub.challenge'];
   // The token check must fail closed when none is configured. Without the first
   // clause an unset WEBHOOK_VERIFY_TOKEN would match `?hub.verify_token=` and
-  // hand the challenge to anyone who asked.
-  if (mode === 'subscribe' && CFG.webhookVerifyToken && token === CFG.webhookVerifyToken) {
+  // hand the challenge to anyone who asked. safeEqual so the token cannot be
+  // guessed one character at a time via response timing.
+  if (mode === 'subscribe' && CFG.webhookVerifyToken && safeEqual(token, CFG.webhookVerifyToken)) {
     log('info', 'Webhook verified by Meta');
-    return res.status(200).send(challenge);
+    // text/plain, not Express's default: challenge is an attacker-reachable
+    // query parameter (Meta's own challenge is just the common case), and
+    // echoing it as text/html on the origin that holds the session cookie
+    // would be a reflected-XSS surface.
+    return res.status(200).type('text/plain').send(String(challenge ?? ''));
   }
   if (!CFG.webhookVerifyToken) log('warn', 'webhook verification refused — WEBHOOK_VERIFY_TOKEN is not set');
   res.sendStatus(403);

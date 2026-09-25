@@ -2680,6 +2680,25 @@ testAsync('when the write fails the route answers 500, never 200, and stores not
   const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
   assert.equal(after, before, 'the failed write must leave no phantom row');
 });
+testAsync('GET /webhook echoes the challenge as text/plain, and a wrong token is refused', async () => {
+  const savedToken = CFG.webhookVerifyToken;
+  CFG.webhookVerifyToken = 'tok';
+  const server = await startWebhookServer();
+  try {
+    const port = server.address().port;
+    const r = await fetch(`http://127.0.0.1:${port}/webhook?hub.mode=subscribe&hub.verify_token=tok&hub.challenge=%3Cb%3Ex`);
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type'), /^text\/plain/,
+      'an attacker-supplied string must never come back as HTML on the origin holding the session');
+    assert.equal(await r.text(), '<b>x', 'the raw challenge is echoed, not re-encoded');
+
+    const bad = await fetch(`http://127.0.0.1:${port}/webhook?hub.mode=subscribe&hub.verify_token=tox&hub.challenge=zz`);
+    assert.equal(bad.status, 403, 'a wrong token is refused and nothing is echoed');
+  } finally {
+    server.close();
+    CFG.webhookVerifyToken = savedToken;
+  }
+});
 
 console.log('\nreply');
 const stubGraph = (impl) => {
@@ -5694,6 +5713,115 @@ testAsync('a signed envelope well over the old 100kb express default is accepted
   assert.equal(after, before + 1, 'the oversized envelope must actually be recorded, not merely accepted');
 });
 
+// These two need the REAL app, not the bare webhook router: the size-limit
+// test compares /webhook's allowance against /api/login's, and the
+// unparseable-body test exercises the error middleware server.js registers
+// after routes.mount(app) — neither exists on startWebhookServer's bare mount.
+testAsync('a signed body that is not JSON is stored for replay, not 400d — and a badly signed one is still refused', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const raw = Buffer.from('{ not json');
+    const sig = sign(raw, 'test-secret');
+    const before = testDb.prepare('SELECT count(*) n FROM webhook_events WHERE processed_at IS NULL').get().n;
+
+    const r = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sig },
+    });
+    assert.equal(r.status, 200, 'Meta retries a 400 forever with identical bytes — a permanently lost batch');
+    assert.equal(testDb.prepare('SELECT count(*) n FROM webhook_events WHERE processed_at IS NULL').get().n, before + 1,
+      'the envelope must land in the replay queue ingest.js already knows how to hold');
+
+    const forged = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': 'sha256=00' },
+    });
+    assert.equal(forged.status, 401,
+      'an unparseable body with a bad signature must still be refused, exactly like a parseable one — the parse failure must not become a second way past the HMAC check');
+  } finally {
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+});
+// Same durability boundary as "when the write fails the route answers 500,
+// never 200, and stores nothing" above, on the OTHER entrance to
+// recordEnvelope: the catch block server.js's error middleware wraps its call
+// in must hold on the unparseable-body path too, not just the normal one.
+// Same ALTER TABLE … RENAME technique, through the full app so the error
+// middleware (not the bare router) is what answers.
+testAsync('when the write fails on the unparseable-body entrance too, the route answers 500 and stores nothing', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  const before = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  testDb.exec('ALTER TABLE webhook_events RENAME TO webhook_events_hidden');
+  let res;
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const raw = Buffer.from('{ not json');
+    res = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(raw, 'test-secret') },
+    });
+  } finally {
+    testDb.exec('ALTER TABLE webhook_events_hidden RENAME TO webhook_events');
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+  assert.equal(res.status, 500,
+    'a signed-but-unstorable envelope must never be acknowledged 200 — Meta would take the 200 as proof it landed and never resend it');
+  const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  assert.equal(after, before, 'the failed write must leave no phantom row on this entrance either');
+});
+testAsync('only /webhook accepts a multi-megabyte JSON body', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const big = JSON.stringify({ object: 'x', pad: 'a'.repeat(2 * 1024 * 1024) });
+    const w = await fetch(`${base}/webhook`, {
+      method: 'POST', body: big,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(big, 'test-secret') },
+    });
+    assert.equal(w.status, 200, 'a batched status webhook is legitimately large');
+
+    const l = await fetch(`${base}/api/login`, {
+      method: 'POST', body: big, headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(l.status, 413, 'nothing unauthenticated but the signed webhook should be allowed to parse megabytes');
+  } finally {
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+});
+
+console.log('\nsecurity headers');
+testAsync('the SPA shell and an API response both carry the baseline hardening headers', async () => {
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    for (const path of ['/', '/api/session']) {
+      const r = await fetch(`${base}${path}`);
+      assert.equal(r.headers.get('x-frame-options'), 'SAMEORIGIN',
+        `${path}: DENY would blank the same-origin PDF <object> preview in views/inbox.jsx`);
+      assert.match(r.headers.get('content-security-policy'), /frame-ancestors 'self'/,
+        `${path}: 'none' would break that same PDF preview`);
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff',
+        `${path}: without it a browser can sniff a response into something it will render`);
+      assert.equal(r.headers.get('referrer-policy'), 'no-referrer',
+        `${path}: the URL (which can carry a session-adjacent path) must not leak to a third party via Referer`);
+    }
+  } finally { s.close(); }
+});
+
 console.log('\nmedia routes');
 {
   // Mirrors startWebhookServer: mount the real router on a bare app so the
@@ -5725,6 +5853,10 @@ console.log('\nmedia routes');
 
       const dl = await fetch(`http://127.0.0.1:${port}/api/media/asset/${up.asset.id}`);
       assert.equal(dl.status, 200);
+      assert.equal(dl.headers.get('x-content-type-options'), 'nosniff',
+        'an operator upload is served with the inbound route\'s hardening, not a bare stream');
+      assert.match(dl.headers.get('content-security-policy'), /sandbox/,
+        'the same sandboxed CSP the inbound route sends, in case a browser is ever handed this to render');
       assert.equal(Buffer.from(await dl.arrayBuffer()).toString(), bytes.toString());
     } finally { server.close(); }
   });
@@ -5794,6 +5926,115 @@ console.log('\nmedia routes');
     } finally { s.close(); CFG.appPassword = savedPw; }
   });
 }
+
+console.log('\nsocket.io origin enforcement');
+testAsync('a WebSocket/polling handshake from a foreign origin is refused', async () => {
+  // The REAL singleton server, not a second http.createServer(app): socket.io
+  // is attached to this exact instance in server.js, so only it has a
+  // /socket.io/ transport to hit. Torn down with io.close() rather than
+  // server.close() — io.close() also clears any engine.io client/timer state a
+  // handshake below leaves behind before it closes the httpServer, which is
+  // what keeps this test from being why the suite does not exit on its own.
+  const { server: realServer, io: realIo } = require('./server');
+  await new Promise(resolve => realServer.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${realServer.address().port}`;
+    const bad = await fetch(`${base}/socket.io/?EIO=4&transport=polling`, { headers: { origin: 'https://evil.example' } });
+    assert.notEqual(bad.status, 200, 'CORS never applied to the upgrade; allowRequest is what refuses it');
+
+    const ok = await fetch(`${base}/socket.io/?EIO=4&transport=polling`);
+    // No cookie → socketAuth refuses at connect, but the transport handshake itself is allowed.
+    assert.equal(ok.status, 200, 'same-origin clients (no Origin header on polling) must still connect');
+  } finally {
+    await new Promise(resolve => realIo.close(resolve));
+  }
+});
+
+console.log('\nHTTP wiring — route order, auth, CSRF origin, upload');
+// One boot of the real app/router table, walking every edge this batch
+// touches in the order an operator would actually hit them: locked out,
+// logged in, refused for a foreign Origin, throttled, then the two mount-order
+// traps (search-before-:waId, and the multer major B1 upgraded).
+testAsync('route order, session auth, CSRF origin, the login limiter and a multipart upload all work over real HTTP', async () => {
+  const savedPw = CFG.appPassword;
+  CFG.appPassword = 'correct horse';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+
+    // 1. Everything under /api is behind requireAuth before any router's own
+    // logic runs — settings.js never sees an unauthenticated /state request.
+    assert.equal((await fetch(`${base}/api/state`)).status, 401,
+      'route order is the security boundary: the gate must refuse before the handler does');
+
+    // 2. Exempt from the gate so the Docker healthcheck keeps working.
+    assert.equal((await fetch(`${base}/health`)).status, 200);
+
+    // 3. Meta cannot sign in, so /webhook sits above requireAuth — reachable,
+    // but its own two checks (verify token, HMAC) still refuse a bad caller.
+    assert.equal((await fetch(`${base}/webhook`)).status, 403,
+      'no hub.verify_token configured must refuse the challenge, not echo it');
+    assert.equal((await fetch(`${base}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    })).status, 401, 'an unsigned POST must never reach recordEnvelope');
+
+    // 4. The right password sets a cookie, and that cookie is what clears the
+    // gate point 1 hit — same route, now signed in.
+    const login = await fetch(`${base}/api/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'correct horse' }),
+    });
+    assert.equal(login.status, 200);
+    const cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+    assert.match(cookie, /^wa_session=/, 'a successful login must set the session cookie');
+    assert.equal((await fetch(`${base}/api/state`, { headers: { cookie } })).status, 200,
+      'the same cookie that failed at point 1 must now pass');
+
+    // 5. sameSite=strict is the primary CSRF defence, but originAllowed is the
+    // server-side backstop for a state-changing request that announces an
+    // origin this app does not serve — a valid cookie must not be enough alone.
+    assert.equal((await fetch(`${base}/api/pause`, {
+      method: 'POST', headers: { cookie, origin: 'https://evil.example' },
+    })).status, 403, 'a foreign Origin on a state-changing POST is refused even with a valid session');
+
+    // 6. A distinct source IP (trust proxy 1 honours X-Forwarded-For), so
+    // exhausting this budget cannot lock out the login at point 4 above,
+    // wherever this assertion ends up relative to it.
+    let last;
+    for (let i = 0; i < 11; i++) {
+      last = await fetch(`${base}/api/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.7' },
+        body: JSON.stringify({ password: 'wrong' }),
+      });
+    }
+    assert.equal(last.status, 429, 'the 11th attempt inside the window must be throttled');
+
+    // 7. Mounted before /inbox/:waId (src/routes/inbox.js) — unmount that
+    // order and "search" is read as a wa_id, and this 404s instead of
+    // returning a search result.
+    const search = await fetch(`${base}/api/inbox/search?q=a`, { headers: { cookie } });
+    assert.equal(search.status, 200);
+    assert.equal(typeof (await search.json()).tooShort, 'boolean',
+      'a thread-not-found body has no tooShort field — this is what proves /search matched, not /:waId');
+
+    // 8. Pins the multer 2.x upgrade (B1): a real multipart body through the
+    // real router, not a direct call to the CSV parser.
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    try {
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from('name,phone\nAsha,+91 90000 00001\n')], { type: 'text/csv' }), 'contacts.csv');
+      const up = await fetch(`${base}/api/upload-csv`, { method: 'POST', headers: { cookie }, body: form });
+      const upBody = await up.json();
+      assert.equal(upBody.ok, true, upBody.error);
+    } finally { S.phase = savedPhase; }
+  } finally {
+    s.close();
+    CFG.appPassword = savedPw;
+  }
+});
 
 console.log('\nmedia — Meta identifiers');
 {

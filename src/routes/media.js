@@ -91,6 +91,14 @@ router.get('/media/asset/:id', (req, res) => {
   const file = assetPath(asset);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'The file for this asset is missing from disk' });
   res.type(asset.mime_type);
+  // Same two headers as the inbound route below: nosniff so a browser cannot
+  // reinterpret the bytes as something more renderable than the declared type,
+  // and a sandboxed CSP so even a hostile operator upload — this is a person
+  // who can be handed a file and asked to forward it, not necessarily one who
+  // vetted it — cannot script against this origin's cookies if it is ever
+  // rendered inline.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
   // inline, not attachment: the composer previews images in an <img>.
   res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(asset.filename)}"`);
   fs.createReadStream(file).pipe(res);

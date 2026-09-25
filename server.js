@@ -18,8 +18,9 @@ const { resumeIfInterrupted } = require('./src/services/campaign');
 const { startRetention } = require('./src/services/retention');
 const { migrateJsonToSql } = require('./src/services/migrate');
 const { migrateOptOuts }   = require('./src/services/contacts');
-const { unprocessedWebhookCount } = require('./src/services/messages');
+const { unprocessedWebhookCount, recordEnvelope } = require('./src/services/messages');
 const { memoryWarning } = require('./src/services/diagnostics');
+const { verifySignature } = require('./src/lib/signature');
 
 const app    = express();
 const server = http.createServer(app);
@@ -52,16 +53,34 @@ app.use((req, res, next) => {
 // rawBody is kept so the webhook can verify Meta's X-Hub-Signature-256 over the
 // exact bytes sent. Re-serialising the parsed object would change the digest.
 //
-// limit is raised well past Express's 100kb default on purpose: this is a bulk
-// sender, so a batched status webhook covering hundreds of statuses is the
-// normal shape, not an edge case. A rejected body here means a 413 BEFORE
-// router.post('/webhook') ever runs — nothing reaches webhook_events, Meta
-// retries the identical bytes, and gets an identical 413 forever. Since Meta's
-// Cloud API is webhook-push only, that is not a failed request, it is a
-// permanently lost batch — the exact loss this durability boundary exists to
-// prevent, one layer above where it was defended.
-app.use(express.json({ limit: '5mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
+// limit is raised well past Express's 100kb default on purpose, and ONLY for
+// /webhook: this is a bulk sender, so a batched status webhook covering
+// hundreds of statuses is the normal shape, not an edge case. A rejected body
+// here means a 413 BEFORE router.post('/webhook') ever runs — nothing reaches
+// webhook_events, Meta retries the identical bytes, and gets an identical 413
+// forever. Since Meta's Cloud API is webhook-push only, that is not a failed
+// request, it is a permanently lost batch — the exact loss this durability
+// boundary exists to prevent, one layer above where it was defended. Every
+// other route stays at Express's ordinary 1mb: nothing else this app serves
+// legitimately needs megabytes of JSON, and a caller who is not Meta gets no
+// reason to be handed the same allowance.
+app.use('/webhook', express.json({ limit: '5mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// SAMEORIGIN / 'self', not DENY / 'none': the inbox previews PDFs in a
+// same-origin <object> (public/views/inbox.jsx), and DENY would blank it. The
+// media routes overwrite Content-Security-Policy with their own sandboxed
+// policy per response — intended, since a customer's own file needs the
+// stricter one — and setHeader there replaces rather than appends, so this
+// baseline never lingers alongside it.
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'self'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
 
 // The frontend is public: it is a login screen until the API says otherwise.
 if (fs.existsSync(PUBLIC_DIR)) app.use(express.static(PUBLIC_DIR));
@@ -69,10 +88,10 @@ if (fs.existsSync(PUBLIC_DIR)) app.use(express.static(PUBLIC_DIR));
 // Exempt from the password so the Docker healthcheck keeps working. It reveals
 // nothing an unauthenticated caller could use.
 //
-// unprocessedWebhooks: nothing in this app replays webhook_events yet — this
-// count is the only signal that it needs to. Without it the only trace of a
-// parse failure is a log line in the 500-entry ring buffer that /api/start
-// wipes (F5).
+// unprocessedWebhooks: unprocessed rows are the replay queue — Diagnostics →
+// Replay (services/ingest.js) drains it; this count is the signal to press it.
+// Without it the only trace of a parse failure is a log line in the 500-entry
+// ring buffer that /api/start wipes (F5).
 app.get('/health', (req, res) => res.json({
   status: 'ok', phase: S.phase, uptime: Math.round(process.uptime()),
   unprocessedWebhooks: unprocessedWebhookCount(),
@@ -80,6 +99,29 @@ app.get('/health', (req, res) => res.json({
 
 auth.mount(app);      // /api/login, /api/logout, /api/session — outside the gate
 routes.mount(app);    // /webhook (signed), then everything behind requireAuth
+
+// express.json throws BEFORE router.post('/webhook') runs, so a body Meta
+// signed but we cannot parse (a batch has been seen truncated by Meta itself)
+// would 400 forever — the same permanently-lost-batch problem the 5mb limit
+// above exists to prevent, one step earlier. rawBody is already set by the
+// verify hook even though parsing failed, so store it where replay can reach
+// it, gated on the SAME signature check the route itself would have made: a
+// parse failure must not become a second way past the HMAC check, so a body
+// that is both unparseable AND badly signed still gets the route's ordinary
+// 401, not a free pass to entity.parse.failed's default 400.
+app.use((err, req, res, next) => {
+  if (!(err?.type === 'entity.parse.failed' && req.method === 'POST' && req.path === '/webhook')) {
+    return next(err);
+  }
+  if (!verifySignature(req.rawBody, req.get('x-hub-signature-256'), CFG.appSecret)) {
+    log('warn', 'webhook POST rejected — bad or missing X-Hub-Signature-256 (unparseable body)');
+    return res.sendStatus(401);
+  }
+  try { recordEnvelope(req.rawBody.toString('utf8')); }
+  catch (e) { log('error', `unparseable webhook NOT stored: ${e.message}`); return res.sendStatus(500); }
+  log('warn', 'webhook body is not valid JSON — stored unprocessed for replay');
+  res.sendStatus(200);
+});
 
 // Anything under /api that no router claimed is a 404 in JSON, not the SPA
 // shell. Without this the catch-all below answers a mistyped endpoint with a
@@ -97,7 +139,16 @@ app.get('*', (req, res) => {
 
 // ── Socket ─────────────────────────────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: allowedOrigins || true, methods: ['GET', 'POST'], credentials: true },
+  cors: { origin: allowedOrigins || false, methods: ['GET', 'POST'], credentials: true },
+  // cors.origin above only governs the polling transport's XHR path — a
+  // WebSocket upgrade, and a bare polling GET like a non-browser client would
+  // send, never carry CORS headers at all, so a foreign page could otherwise
+  // reach this handshake purely by not going through XHR. allowRequest runs
+  // for every transport before a Socket is created, and reuses the exact
+  // origin check requireAuth already makes for a state-changing POST. The
+  // shim gives it an Express-shaped req: the handshake object socket.io hands
+  // this callback is Node's plain IncomingMessage, which has no req.get().
+  allowRequest: (req, cb) => cb(null, auth.originAllowed({ get: h => req.headers[h.toLowerCase()] })),
 });
 // Same session check as the REST API. Without this the password would be
 // decorative — anyone could stream state, logs and customer messages.
@@ -142,8 +193,12 @@ if (require.main === module) {
   require('./src/services/warmup').reconcileWarmupDays();
   resumeIfInterrupted();
   startRetention();
-  server.listen(CFG.port, () => {
-    console.log(`\n[WA-CAMPAIGN] Server running → http://localhost:${CFG.port}`);
+  // Loopback (CFG.bindHost) unless BIND_HOST says otherwise: a caller who can
+  // connect to the port directly — rather than through cloudflared — can put
+  // anything in X-Forwarded-For, which `trust proxy 1` above would then trust,
+  // and that header is exactly what the login rate limiter keys callers on.
+  server.listen(CFG.port, CFG.bindHost, () => {
+    console.log(`\n[WA-CAMPAIGN] Listening on ${CFG.bindHost}:${CFG.port}`);
     console.log(`[WA-CAMPAIGN] Phone Number ID : ${CFG.phoneNumberId || 'NOT SET'}`);
     console.log(`[WA-CAMPAIGN] Access Token    : ${CFG.accessToken ? 'SET' : 'NOT SET'}`);
     console.log(`[WA-CAMPAIGN] Password gate   : ${CFG.appPassword ? 'ON' : 'OFF — API LOCKED until APP_PASSWORD is set'}`);
