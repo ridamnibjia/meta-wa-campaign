@@ -3988,7 +3988,7 @@ console.log('\ndelivery failures that arrive over the webhook');
     }
   });
 
-  test('a halt delivered twice parks once', () => withLiveCampaign('waiting', () => {
+  test('a second halt on a parked campaign is logged, never re-parked', () => withLiveCampaign('waiting', () => {
     const run = newRun();
     const p = people(1);
     buildRun(run, p);
@@ -3997,8 +3997,10 @@ console.log('\ndelivery failures that arrive over the webhook');
     assert.equal(handleDeliveryFailure(failure), 'halted', 'a paused template fails every send, whichever phase the loop is in');
     const reason = S.pauseReason, lastLog = S.logs[S.logs.length - 1];
     assert.equal(handleDeliveryFailure(failure), 'halted');
-    assert.equal(S.pauseReason, reason, 'the park is not re-announced');
-    assert.equal(S.logs[S.logs.length - 1], lastLog, 'and nothing new is logged');
+    assert.equal(S.pauseReason, reason, 'the park is not re-announced or repainted');
+    const said = S.logs.slice(S.logs.indexOf(lastLog) + 1);
+    assert.equal(said.length, 1, 'one line — a refusal absorbed in silence is one the operator never hears about');
+    assert.match(said[0].msg, /\[132015\].*already paused/, 'naming the code, and that nothing was re-parked');
     assert.equal(webhook('w.halt.twice', 132015), 'ignored',
       'and Meta\'s own redelivery never reaches it: the status was already failed');
   }));

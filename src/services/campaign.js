@@ -432,7 +432,8 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
   // walking it; an idle or finished one has no loop to stop, and a flag left set
   // there would greet the next Start as a pause. Parks once: a second halt, or
   // one landing on a pause already under the flag — the operator's own included
-  // — changes nothing, so a redelivery or a replay is free. And a Stop in flight
+  // — adds a log line and changes nothing else. (A redelivery or a replay never
+  // gets here: applyStatus only hands over the transition into failed.) And a Stop in flight
   // is final: /stop has cleared the flag and said idle, but campaignActive()
   // stays true until the loop notices, and a pause repainted in that window is
   // what used to let a stopped run come back.
@@ -445,6 +446,12 @@ function handleDeliveryFailure({ waId, runId, wamid, code }) {
       log('error', `+${waId} — Meta refused a delivery [${code}] for a reason that fails every send — campaign paused. Fix the cause, then press Resume.`);
       if (hint) log('error', `   ↳ ${hint}`);
       saveCampaignNow(); broadcast();
+    } else {
+      // Already parked — by an earlier halt or by the operator. Not re-parked:
+      // the first reason stays on screen, and the operator's Pause stays
+      // theirs. But not swallowed either: each refusal is one more contact the
+      // fault reached, and the log is where the operator counts them.
+      log('warn', `+${waId} — Meta refused a delivery [${code}] for a reason that fails every send; the campaign is already paused, so nothing else changes.`);
     }
     return 'halted';
   }
