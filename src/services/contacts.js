@@ -203,9 +203,13 @@ const WHERE = `
    WHERE (? = '' OR phone LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')
      AND (? = 'all' OR (? = 'enabled' AND enabled = 1) OR (? = 'disabled' AND enabled = 0))`;
 
+// enabled DESC, same rationale as allRows above: page 1 of the directory is
+// what an operator sees first, and it should lead with who a campaign will
+// actually reach, not who it will skip. This used to sort ASC, so opening the
+// directory led with exactly the contacts a campaign leaves out.
 const pageQ = db.prepare(`
   SELECT * FROM contacts ${WHERE}
-   ORDER BY enabled ASC, name COLLATE NOCASE ASC, phone ASC
+   ORDER BY enabled DESC, name COLLATE NOCASE ASC, phone ASC
    LIMIT ? OFFSET ?`);
 const pageCountQ = db.prepare(`SELECT count(*) AS n FROM contacts ${WHERE}`);
 

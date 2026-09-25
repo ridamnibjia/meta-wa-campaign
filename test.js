@@ -7734,6 +7734,17 @@ console.log('\ncontacts — directory paging, rename, delete, suppression');
       'and paging past the end is empty rather than an error');
   });
 
+  test('page 1 of "all" leads with enabled rows, the same rationale as the CSV export', () => {
+    const marker = `Order${Date.now()}`;
+    const pDisabled = nextPhone(), pEnabled = nextPhone();
+    seed(pDisabled, `${marker} disabled`);
+    contacts.disable(pDisabled, 'manual');
+    seed(pEnabled, `${marker} enabled`);
+    const first = contacts.page({ q: marker, limit: 10, offset: 0 });
+    assert.equal(first.rows[0].enabled, 1,
+      'an operator opening the directory should see who a campaign will reach first, not who it will skip');
+  });
+
   test('a hand-edited limit cannot ask for the whole table', () => {
     assert.equal(contacts.page({ limit: 1000000 }).limit, 200, 'the ceiling is the server\'s, not the query string\'s');
     assert.equal(contacts.page({ limit: 0 }).limit, 50);
