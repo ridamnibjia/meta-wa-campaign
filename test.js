@@ -2203,6 +2203,57 @@ console.log('\nmedia — saveUpload');
     assert.match(d.error, /outside the uploads directory/);
   });
 
+  test('saveUpload refuses to dedupe through a stored path that escapes UPLOAD_DIR', () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const bytes = Buffer.from(`%PDF-1.7 escape-dedupe ${Math.random()}`);
+    const first = saveUpload(file(bytes, 'legit.pdf', 'application/pdf'));
+    assert.equal(first.ok, true, first.error);
+
+    // A real file outside UPLOAD_DIR — if the dedupe/restore write went
+    // through, this is exactly what a crafted `path` column would let it
+    // overwrite.
+    const name = `wa-escape-dedupe-${process.pid}-${Date.now()}.txt`;
+    const outside = pathx.join(UPLOAD_DIR, '..', name);
+    fsx.writeFileSync(outside, 'sentinel-untouched');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', name), first.asset.id);
+
+    try {
+      // Same bytes → same sha256 → the dedupe branch, not a fresh insert.
+      const again = saveUpload(file(bytes, 'legit-copy.pdf', 'application/pdf'));
+      assert.equal(again.ok, false, 'a corrupted row must refuse, not write through it');
+      assert.match(again.error, /outside the uploads directory/);
+      assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched',
+        'nothing may be written to whatever the escaped path points at');
+    } finally { fsx.unlinkSync(outside); }
+  });
+
+  test('saveUpload refuses to revive a tombstoned row through a stored path that escapes UPLOAD_DIR', () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const bytes = Buffer.from(`%PDF-1.7 escape-revive ${Math.random()}`);
+    const first = saveUpload(file(bytes, 'legit2.pdf', 'application/pdf'));
+    assert.equal(first.ok, true, first.error);
+
+    const name = `wa-escape-revive-${process.pid}-${Date.now()}.txt`;
+    const outside = pathx.join(UPLOAD_DIR, '..', name);
+    fsx.writeFileSync(outside, 'sentinel-untouched-2');
+    // Tombstoned AND escaping in one update — the revive branch is reached
+    // only once existing.deleted_at is set, and it writes unconditionally,
+    // with no existsSync gate, making it the more dangerous of the two.
+    db.prepare('UPDATE media_assets SET path = ?, deleted_at = ? WHERE id = ?')
+      .run(pathx.join('..', name), Date.now(), first.asset.id);
+
+    try {
+      const again = saveUpload(file(bytes, 'legit2-copy.pdf', 'application/pdf'));
+      assert.equal(again.ok, false, 'reviving through a corrupted row must refuse, not write through it');
+      assert.match(again.error, /outside the uploads directory/);
+      assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched-2',
+        'the revive write must never reach a path the row does not legitimately own');
+    } finally { fsx.unlinkSync(outside); }
+  });
+
   test('an originalname with a NUL byte in its extension never throws', () => {
     // path.extname does not validate characters — a NUL byte survives into the
     // filename fs.writeFileSync is given, and Node refuses any path containing

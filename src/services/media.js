@@ -114,6 +114,14 @@ function saveUpload(file) {
   // Upload and one media id. Dedupe on content, not on name: a renamed copy of
   // last month's price list is still last month's price list.
   const existing = byHash.get(sha);
+  // `path` is a column, and a column is data. Both branches below write
+  // through it (fs.writeFileSync, when bytes are missing or the row is being
+  // revived) on the strength of a byte match alone — a corrupted or crafted
+  // row must not turn an upload into a write to wherever it points, which is
+  // exactly the guard deleteAsset already holds for the same column.
+  if (existing && !insideDir(UPLOAD_DIR, assetPath(existing))) {
+    return { ok: false, error: escapedMsg(existing) };
+  }
   if (existing && !existing.deleted_at) {
     // The row can outlive its bytes — a wa.db restored without the uploads
     // directory. Re-uploading the identical file is the natural repair, and a
@@ -372,6 +380,13 @@ const deletedMsg = a =>
 // looking at their internet connection instead of their disk.
 const missingMsg = a =>
   `The file for "${a.filename}" is missing on this server — upload the same file again to restore it.`;
+
+// Distinct from missingMsg: a path that resolves outside UPLOAD_DIR is not
+// simply absent, the ROW itself is suspect — re-uploading repairs a missing
+// file, but a corrupted path column is a fact about the row, which is why
+// this names the row rather than just the file.
+const escapedMsg = a =>
+  `The stored location for "${a.filename}" is outside the uploads directory, so it was refused — the database row looks corrupted; delete it from the Storage page and upload the file again.`;
 
 // Template CREATION wants an h:… handle from the Resumable Upload API, which
 // keys on the APP id — not the WABA id, not the business id. It is a two-call
