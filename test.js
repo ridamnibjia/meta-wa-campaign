@@ -784,6 +784,17 @@ test('normalizePhone — prefixes 91, strips zero and formatting, rejects toll-f
   assert.equal(normalizePhone('12345'), null, 'rejects numbers that are too short');
   assert.equal(normalizePhone(''), null, 'rejects empty input');
 });
+test('normalizePhone reads the 00 international prefix', () => {
+  assert.equal(normalizePhone('0044 20 7946 0958'), '442079460958', 'no country code starts with 0 — sending 0044… always fails');
+  assert.equal(normalizePhone('00971 50 123 4567'), '971501234567');
+});
+test('toll-free rules: explicit + is trusted, Indian service lines are not', () => {
+  assert.equal(normalizePhone('+1 860 555 1234'), '18605551234', 'Hartford, Connecticut is a real area code');
+  assert.equal(normalizePhone('1860 123 4567'), null, 'a bare 1860 line is an Indian service number');
+  assert.equal(normalizePhone('+91 1800 123 4567'), null, 'the Indian toll-free the rule exists for, written the way CSV-FORMAT.md asks');
+  assert.equal(normalizePhone('91 1800 123 4567'), null);
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'an ordinary Indian mobile is untouched');
+});
 
 console.log('\nparseCSV');
 test('reads name and mobile, and dedupes', () => {

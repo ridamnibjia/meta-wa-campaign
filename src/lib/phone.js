@@ -4,16 +4,40 @@
 // Anything already carrying a country code passes through untouched — which is
 // why CSV-FORMAT.md tells people to always include one. The bare-10-digit branch
 // below has to guess a country, and it guesses India.
-function normalizePhone(raw) {
+//
+// Returns { d, guessed } rather than a bare string — `guessed` is true only for
+// the two branches below that ASSUMED India (bare 10 digits, or a leading zero).
+// parseCSV sums it into `guessedCountry` and the upload route says so out loud
+// (routes/contacts.js), because a guess this consequential must not be silent.
+// normalizePhone stays the public, digit-string-or-null contract every other
+// caller in src/ already relies on; `guessed` never leaves this file except
+// through parseCSV's count.
+function normalize(raw) {
   if (!raw) return null;
-  let d = String(raw).trim().replace(/\D/g, '');
+  const s = String(raw).trim();
+  let d = s.replace(/\D/g, '');
   if (!d || d.length < 7) return null;
-  if (/^1(800|860|900)/.test(d)) return null;   // toll-free numbers
-  if (d.length === 10)                  d = '91' + d;        // 10-digit Indian
-  if (d.length === 11 && d[0] === '0') d = '91' + d.slice(1); // 0xxxxxxxxxx
+  // 00 is the international access prefix European and Gulf exports dial
+  // instead of +. No real E.164 country code starts with 0, so a number long
+  // enough to still hold a country code after two digits are stripped is
+  // always the access prefix, never part of the number.
+  if (d.length > 11 && d.startsWith('00')) d = d.slice(2);
+  // Two toll-free rules, independent of each other. This one is raw-digit
+  // pattern matching and only trustworthy when the country is UNKNOWN — an
+  // explicit + means it is not: +1 860 is Hartford, Connecticut, a real area
+  // code that collides with the Indian 1860 service-line prefix in bare digits.
+  if (!/^\+/.test(s) && /^1(800|860|900)/.test(d)) return null;
+  // The Indian toll-free/shared-cost lines this rule actually exists for,
+  // however they are written. Country code 91 is no longer in doubt here, so
+  // a leading + does not exempt it the way it does above.
+  if (/^91(1800|1860|1900)/.test(d)) return null;
+  let guessed = false;
+  if (d.length === 10)                 { d = '91' + d; guessed = true; }         // 10-digit Indian
+  if (d.length === 11 && d[0] === '0') { d = '91' + d.slice(1); guessed = true; } // 0xxxxxxxxxx
   if (d.length < 11 || d.length > 15) return null;
-  return d;
+  return { d, guessed };
 }
+const normalizePhone = raw => normalize(raw)?.d ?? null;
 
 // RFC 4180 fields. Splitting on a bare comma was wrong in a way that never
 // announced itself: a quoted name like "Doe, John" shifted every column to its
