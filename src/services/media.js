@@ -621,6 +621,18 @@ function dropBytes(row) {
 // directory itself, not only paths outside it: a stored path of "." would
 // otherwise resolve to the bare directory, and unlinking a directory is never
 // a legitimate outcome for any of these callers.
+//
+// ponytail: lexical, not physical — path.resolve/path.relative reason about
+// the string, so a symlink planted inside UPLOAD_DIR/MEDIA_DIR pointing back
+// out would still read as "inside" here. The ceiling is the same one every
+// caller already accepts by trusting the directory itself (the bytes an
+// operator can put inside UPLOAD_DIR are already theirs to control); it stops
+// being acceptable the day this directory's contents are not fully trusted.
+// Upgrade path: fs.realpathSync() on both `dir` and `file` before comparing,
+// which resolves symlinks — deliberately not done here because a dangling
+// symlink (the target deleted, the link left behind) would throw ENOENT on a
+// path this function's callers otherwise treat as a clean "no" rather than
+// an error worth surfacing.
 function insideDir(dir, file) {
   const root = path.resolve(dir);
   const rel  = path.relative(root, path.resolve(file));
