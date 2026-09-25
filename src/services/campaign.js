@@ -4,7 +4,8 @@ const { readJSON, writeJSON, debouncedWriter } = require('../lib/store');
 const { S, flags, ACTIVE_PHASES, campaignActive, log, sleep } = require('../state');
 const { broadcast } = require('./status');
 const { isDisabled, disable, markMessaged, getRow } = require('./contacts');
-const { effectiveCap, markWarmupDay, capWindow, capCount, warmupDay } = require('./warmup');
+const { effectiveCap, markWarmupDay, capWindow, capCount, warmupDay,
+        QUALITY_RATINGS, adoptQuality } = require('./warmup');
 const { recordOutbound, funnelForRun, startRun, buildRun, nextPending,
         recordRecipientSent, recordRecipientSkipped, recordRecipientRetry,
         requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
@@ -530,17 +531,35 @@ async function sleepUntil(at) {
 // Meta's phone_number_quality_update webhook, which can be unsubscribed or lost.
 //
 // Never throws — the loop awaits it — and a failure keeps the last rating: no
-// answer is not a GREEN answer. fetchAccountInfo resolves { error } for a Graph
-// refusal and rejects on a network one (or its timeout); both are said.
+// answer is not a GREEN answer, and neither is an answer with no rating in it
+// (adoptQuality). fetchAccountInfo resolves { error } for a Graph refusal and
+// rejects on a network one (or its timeout); both are said.
+//
+// Raced against the loop's own flags, in slices like sleepUntil: the Graph call
+// can take up to TIMEOUTS.graphMs to give up, flags.running stays true while it
+// does, and campaignBlocker() refuses every Start and upload for that long — so
+// a Stop or a Pause pressed while Meta is slow is answered within the slice,
+// not after the timeout. The abandoned request ends on its own timeout, and its
+// answer is not used.
 async function refreshQuality() {
   const keep = () => `Keeping the last rating (${S.quality ?? 'none yet'}).`;
+  let settled = false;
+  const interrupted = (async () => {
+    while (!settled && !flags.stopFlag && !flags.pauseFlag) await sleep(100);
+    return { interrupted: true };
+  })();
   try {
-    const info = await fetchAccountInfo();
-    if (info?.qualityRating) S.quality = info.qualityRating;
-    else log('warn', `Could not re-read the quality rating — ${info?.error || 'no rating in the answer'}. ${keep()}`);
+    const info = await Promise.race([fetchAccountInfo(), interrupted]);
+    if (info?.interrupted) return;
+    const rating = info?.qualityRating;
+    if (!QUALITY_RATINGS.includes(rating)) {
+      log('warn', `Could not re-read the quality rating — ${info?.error || `Meta's answer had no rating (${rating ?? 'none'})`}. ${keep()}`);
+    } else if (adoptQuality(rating)) {
+      log('info', `Quality rating is now ${rating}`);
+    }
   } catch (e) {
     log('warn', `Could not re-read the quality rating — ${e?.message ?? e}. ${keep()}`);
-  }
+  } finally { settled = true; }
 }
 
 // ── One campaign at a time ─────────────────────────────────────────────────────

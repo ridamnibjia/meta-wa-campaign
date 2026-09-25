@@ -4,7 +4,7 @@ const { CFG } = require('../config');
 const { S, flags, log } = require('../state');
 const { broadcast } = require('../services/status');
 const { isDisabled, markMessaged, getRow } = require('../services/contacts');
-const { W, effectiveCap, graduated, markWarmupDay, capWindow, warmupDay } = require('../services/warmup');
+const { W, effectiveCap, graduated, markWarmupDay, capWindow, warmupDay, adoptQuality } = require('../services/warmup');
 const { recordOutbound, progressForRun, skippedForRun,
         listRuns, runDetail } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
@@ -146,9 +146,10 @@ router.post('/start', async (req, res) => {
   }
 
   // Quality gates the warm-up climb, so read it fresh rather than trusting a
-  // value cached from whenever the dashboard last loaded.
+  // value cached from whenever the dashboard last loaded — adopted only if it
+  // is a real rating: 'UNKNOWN' would lift a held rung (warmup.js:adoptQuality).
   const info = await fetchAccountInfo().catch(() => ({}));
-  if (info.qualityRating) S.quality = info.qualityRating;
+  adoptQuality(info.qualityRating);
 
   // Two awaits above, and no loop is running during them, so a CSV upload in
   // another tab passes its own campaignBlocker() here and stages a new run.

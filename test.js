@@ -3443,6 +3443,67 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
   });
 
+  // graph.js reports a missing rating as 'UNKNOWN' for the screen, and every
+  // writer took whatever came back — so an answer without a rating LIFTED a
+  // YELLOW or RED hold on the rung, climbing it on no evidence at all. Only
+  // GREEN, YELLOW and RED are adopted, through one helper every door uses.
+  test('adoptQuality takes only a real rating', () => {
+    const saved = S.quality;
+    try {
+      S.quality = 'RED';
+      for (const junk of ['UNKNOWN', null, undefined, '', 'green', 'NA']) {
+        assert.equal(M.adoptQuality(junk), false);
+        assert.equal(S.quality, 'RED', `${junk} is not a rating — the hold on the rung stands`);
+      }
+      assert.equal(M.adoptQuality('YELLOW'), true, 'a real rating is adopted, and says it changed');
+      assert.equal(M.adoptQuality('YELLOW'), false, 'the same rating again is no change');
+      assert.equal(S.quality, 'YELLOW');
+    } finally { S.quality = saved; }
+  });
+
+  const unrated = async () => ({ ok: true, json: async () => ({ messaging_limit_tier: 'TIER_1K' }) });
+
+  testAsync('a re-read with no rating in it keeps a RED hold', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'RED';
+    global.fetch = unrated;
+    try {
+      await M.refreshQuality();
+      assert.equal(S.quality, 'RED', 'an answer without a rating must not lift the hold on the rung');
+      assert.match(S.logs[S.logs.length - 1].msg, /quality rating/, 'and the log says the rating could not be read');
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  testAsync('the account screen keeps a RED hold when Meta\'s answer has no rating', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'RED';
+    global.fetch = unrated;
+    try {
+      const info = await callRoute('get', '/account-info', {}, './src/routes/settings');
+      assert.equal(info.qualityRating, 'UNKNOWN', 'the screen is still told what Meta said');
+      assert.equal(S.quality, 'RED', 'but the ladder keeps the last real rating');
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  // The loop awaits the re-read while flags.running is true, and campaignBlocker()
+  // refuses every Start and upload until the loop exits — so a Stop pressed while
+  // Meta is slow to answer must still be answered within a second, not after the
+  // 30-second Graph timeout. The answer that arrives afterwards is not used.
+  testAsync('a Stop during a slow quality re-read is answered within a second', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'GREEN';
+    global.fetch = () => new Promise(r => setTimeout(() => r({ ok: true,
+      json: async () => ({ quality_rating: 'RED' }) }), 2000));      // not unref'd: the suite must wait for it
+    try {
+      const t0 = Date.now();
+      const refreshing = M.refreshQuality();
+      setTimeout(() => { M.flags.stopFlag = true; }, 50);
+      await refreshing;
+      assert.ok(Date.now() - t0 < 1000, `answered in ${Date.now() - t0} ms — a Stop must not wait out Meta`);
+      assert.equal(S.quality, 'GREEN', 'an answer nobody waited for is not adopted');
+    } finally { M.flags.stopFlag = false; global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
   // The wake itself, through the real loop: parked on your own cap until IST
   // midnight, the clock is moved past the deadline, and the loop asks Meta for
   // the rating as it wakes. One seat is dated two days ahead so the count stays
@@ -7042,8 +7103,8 @@ function graphErr(error) {
 // A campaign route called the way Express calls it, minus the socket: the
 // handlers are thin, and HTTP would only add a port to close and a stubbed
 // fetch that has to wave localhost through.
-function callRoute(method, path, body = {}) {
-  const router = require('./src/routes/campaign');
+function callRoute(method, path, body = {}, routerPath = './src/routes/campaign') {
+  const router = require(routerPath);
   const layer = router.stack.find(l => l.route?.path === path && l.route.methods[method]);
   if (!layer) throw new Error(`no ${method.toUpperCase()} ${path} on the campaign router`);
   return new Promise((resolve, reject) => {
@@ -7678,6 +7739,26 @@ console.log('\na Reset that lands mid-send');
       assert.equal(flags.running, false, 'no loop was started');
       assert.notEqual(S.phase, 'running', 'and nothing on screen claims one was');
       assert.equal(h.row(swapped, '919000033002').attempted_at, null, 'the uploaded list is untouched');
+    });
+  });
+
+  // /start reads the rating fresh, and an answer without one must not lift a
+  // held rung any more than the loop's own re-read may.
+  testAsync('/start keeps a RED hold when Meta\'s answer has no rating', async () => {
+    await withLoop(async url => {
+      if (String(url).includes('/message_templates')) return templateList('quality_hold');
+      if (String(url).endsWith('/messages')) return graphOk('wamid.qualityhold.1');
+      return { ok: true, json: async () => ({ messaging_limit_tier: 'TIER_1K' }) };
+    }, async h => {
+      const { S } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'quality_hold';
+      S.quality = 'RED';
+      h.stage([{ dialStr: '919000033031', name: 'Marco' }], 'quality-hold-start');
+      S.phase = 'idle';
+      const r = await callRoute('post', '/start');
+      assert.equal(r.ok, true, r.error);
+      assert.equal(S.quality, 'RED', 'the rung stays held — "UNKNOWN" is no evidence the number recovered');
     });
   });
 

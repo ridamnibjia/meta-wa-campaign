@@ -33,6 +33,20 @@ function rawStep() {
 
 const warmupStep = () => Math.min(rawStep(), WARMUP_PLAN.length - 1);
 
+// The only ratings that mean anything to the ladder. graph.js reports a missing
+// rating as 'UNKNOWN' for the screen, and every writer used to take whatever
+// came back — so an answer without a rating LIFTED a YELLOW or RED hold (rawStep
+// holds only on those two) and climbed the rung on no evidence at all. Every
+// door that reads Meta's rating — /start, the account screen, the loop's own
+// re-read — adopts it through here, so none of them can. Returns whether the
+// rating changed.
+const QUALITY_RATINGS = ['GREEN', 'YELLOW', 'RED'];
+function adoptQuality(rating) {
+  if (!QUALITY_RATINGS.includes(rating) || S.quality === rating) return false;
+  S.quality = rating;
+  return true;
+}
+
 // ── The end of the ladder ──────────────────────────────────────────────────────
 // The plan is a warm-UP, not a permanent ceiling. Its job is to prove a new
 // number can send steadily without collecting blocks and reports; once every
@@ -162,4 +176,4 @@ function markWarmupDay() {
 
 module.exports = { W, WARMUP_PLAN, saveWarmup, warmupStep, warmupCap, effectiveCap,
                    markWarmupDay, graduated, dailyCount, capWindow, capCount, warmupDay,
-                   reconcileWarmupDays };
+                   QUALITY_RATINGS, adoptQuality, reconcileWarmupDays };
