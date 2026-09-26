@@ -7,7 +7,9 @@ function SettingsView() {
   const [settings, setSettings] = useState({ delaySec: 2, dailyCap: 0 });
   const [prices,   setPrices]   = useState({ MARKETING: 0, UTILITY: 0, AUTHENTICATION: 0, currency: '₹' });
   const [creds,    setCreds]    = useState({ phoneId: '', token: '', wabaId: '' });
-  const [saved,    setSaved]    = useState('');
+  // { msg, ok } | null — ok picks the badge's tone, so a network failure does
+  // not flash the same green pill a real save does.
+  const [saved,    setSaved]    = useState(null);
 
   // Only the counts are read here — the list itself lives on the Contacts page.
   // size=1 because this asks a question about totals, not about rows: the
@@ -36,15 +38,17 @@ function SettingsView() {
     if (account) setCreds(c => ({ ...c, phoneId: account.phoneNumberId || '', wabaId: account.wabaId || '' }));
   }, [account]);
 
-  const flash = msg => { setSaved(msg); setTimeout(() => setSaved(''), 2500); };
+  const flash = (msg, ok = true) => { setSaved({ msg, ok }); setTimeout(() => setSaved(null), 2500); };
 
   const savePacing = async () => {
-    await api.post('/api/config', { delaySec: settings.delaySec, dailyCap: settings.dailyCap });
-    flash('Pacing saved');
+    const r = await api.post('/api/config', { delaySec: settings.delaySec, dailyCap: settings.dailyCap })
+      .catch(() => ({ ok: false, error: 'Network error — nothing was saved' }));
+    flash(r.ok ? 'Pacing saved' : r.error, r.ok);
   };
   const savePrices = async () => {
-    await api.post('/api/config', { prices });
-    flash('Rates saved for this session');
+    const r = await api.post('/api/config', { prices })
+      .catch(() => ({ ok: false, error: 'Network error — nothing was saved' }));
+    flash(r.ok ? 'Rates saved for this session' : r.error, r.ok);
   };
   const saveCreds = async () => {
     const r = await api.post('/api/config', { phoneNumberId: creds.phoneId, accessToken: creds.token, wabaId: creds.wabaId });
@@ -61,7 +65,7 @@ function SettingsView() {
           <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
           <p className="text-xs text-muted-foreground">Changes apply to this session. Restarting reverts to .env.</p>
         </div>
-        {saved && <Badge variant="success">{saved}</Badge>}
+        {saved && <Badge variant={saved.ok ? 'success' : 'destructive'}>{saved.msg}</Badge>}
       </div>
 
       {/* Pricing */}
@@ -106,8 +110,12 @@ function SettingsView() {
                      onChange={e => setSettings(p => ({ ...p, delaySec: parseInt(e.target.value) || 1 }))} />
             </Field>
             <Field label="Daily cap" hint={
-              settings.dailyCap === 0 ? 'No cap of yours — Meta\'s messaging tier is the only limit'
-              : warm?.enabled && !warm?.graduated ? `Warm-up holds today at ${num(warm.cap)} — whichever is lower wins`
+              // Warm-up checked FIRST: while it is active and not graduated it
+              // holds the real ceiling regardless of what this field says, and
+              // "no cap of yours" printed over a number the ladder is still
+              // capping read as a promise this field could not keep.
+              warm?.enabled && !warm?.graduated ? `Warm-up holds today at ${num(warm.cap)} — whichever is lower wins`
+              : settings.dailyCap === 0 ? 'No cap of yours — Meta\'s messaging tier is the only limit'
               : account?.tierCap ? `Your tier allows ${num(account.tierCap)}` : 'Messages per day'}>
               {/* min 0, and 0 means no cap. Nothing here is per-account: a new
                   install still walks the warm-up ladder whatever this says, and
