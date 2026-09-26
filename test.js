@@ -51,6 +51,42 @@ Object.assign(process.env, {
   BIND_HOST: '', RENDER: '',
 });
 
+// Dozens of tests below (and server.js's own singleton, required next) spin up
+// a real HTTP server with http.createServer(...).listen(0, …) and tear it down
+// with a bare server.close(). Plain close() stops accepting NEW connections but
+// leaves already-open (idle keep-alive) sockets running until the OTHER side
+// gives them up — and Node's global fetch (undici) pools one keep-alive
+// connection per origin (host:port). With ~20 such ephemeral servers created
+// and closed across a single `npm test` run, the OS reuses port numbers fast
+// enough that a LATER test's listen(0) can land on a port a lingering socket
+// from an EARLIER, already-closed server still holds, so that later test's
+// fetch() can silently reuse the stale connection — talking to a server that
+// is already gone, or racing its teardown — instead of opening a fresh one.
+// That is what produced two different one-off failures in real-HTTP tests
+// (a webhook signature check and a challenge-echo check) that had nothing to
+// do with either test's own logic. closeAllConnections() (Node >=18.2, well
+// within this app's >=22.5 floor) forces every socket a server holds shut
+// immediately, so nothing is left for the next test to inherit. Patched once
+// here, on the http module every createServer call below shares — rather than
+// editing every one of the dozens of `.close()` call sites individually,
+// which is one thing to get right instead of dozens, and covers server.js's
+// own singleton (torn down via io.close(), which closes this same instance)
+// for free. Installed before requiring ./server, so the singleton created at
+// its module-load time (server.js's `const server = http.createServer(app)`)
+// is wrapped too.
+{
+  const http = require('http');
+  const realCreateServer = http.createServer.bind(http);
+  http.createServer = (...args) => {
+    const srv = realCreateServer(...args);
+    const realClose = srv.close.bind(srv);
+    // closeAllConnections() is a no-op when nothing is open, so it is always
+    // safe to call before close() rather than only when something might be.
+    srv.close = (...closeArgs) => { srv.closeAllConnections(); return realClose(...closeArgs); };
+    return srv;
+  };
+}
+
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
 // touches the network or the campaign loop.
