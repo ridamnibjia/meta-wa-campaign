@@ -180,7 +180,8 @@ const Stat = ({ label, value, tone, hint }) => (
 );
 
 const Progress = ({ value, className }) => (
-  <div className={cn('h-2 w-full overflow-hidden rounded-full bg-secondary', className)}>
+  <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(value)}
+       className={cn('h-2 w-full overflow-hidden rounded-full bg-secondary', className)}>
     <div className="h-full rounded-full bg-primary transition-all duration-500" style={{ width: `${Math.min(100, Math.max(0, value))}%` }} />
   </div>
 );
@@ -227,8 +228,12 @@ const FUNNEL_ROWS = [
     hint: 'Either every attempt was used, or the code was one the app never retries. Open the list — each row says which, and how many times it was tried. Nothing was billed.' },
   { key: 'unreachable', label: 'Cannot receive messages', tone: 'text-destructive',
     hint: 'Meta reports the number as undeliverable — usually not on WhatsApp. Switched off automatically, so later runs skip them.' },
+  // No longer only the never-attempted half: a contact messaged in THIS run
+  // who answered with 131050 (turned marketing off inside WhatsApp, mid-run)
+  // lands here too, and that one WAS attempted — "never attempted" would be
+  // wrong for them specifically, not just imprecise.
   { key: 'optedOut',    label: 'Opted out or switched off',
-    hint: 'Never attempted. Tapped “Stop promotions”, or you disabled them.' },
+    hint: 'Tapped “Stop promotions” earlier, turned your marketing off inside WhatsApp, or switched off by you. Some of these were never attempted; others were sent this message and opted out in response.' },
 ];
 
 // How many times this contact was actually put on the wire. `attempts` counts
@@ -446,7 +451,7 @@ function Funnel({ funnel, recipients, title, live = true }) {
           return (
             <div key={r.key} className={cn('rounded-md', isOpen && 'border border-border', !n && 'opacity-45')}>
               {canOpen ? (
-                <button type="button"
+                <button type="button" aria-expanded={isOpen}
                   onClick={() => { setOpen(isOpen ? null : r.key); setQ(''); }}
                   className="flex w-full items-baseline gap-3 rounded-md px-2 py-1.5 text-left hover:bg-accent">
                   {body}
