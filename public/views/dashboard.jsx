@@ -2,7 +2,7 @@
 // things you might want to do next.
 function Dashboard() {
   const { ss, account, threads, logs, contacts } = useApp();
-  const { phase, total, dailyCount, dailyCap,
+  const { phase, total, dailyCount, dailyCap, capCount, capWindow,
           pricing = {}, warmup, retrying = 0, nextRetry, lastRun, currentIdx = 0,
           funnel } = ss;
 
@@ -146,15 +146,19 @@ function Dashboard() {
           <CardContent className="space-y-2">
             <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
               <span><strong className="text-foreground tabular-nums">{num(lastRun.progress.sent)}</strong> of {num(lastRun.progress.total)} sent</span>
-              {/* The funnel, not countsForRun: this card sits beside tiles that
-                  read the funnel, and the message-table numbers disagree with
-                  them the moment a test send or a webhook failure exists —
-                  "2 failed · 2 retrying" about the same two people. */}
+              {/* The funnel, not countsForRun or progress: this card sits
+                  beside tiles that read the funnel, and a different table
+                  disagrees with them the moment a test send or a webhook
+                  failure exists — "2 failed · 2 retrying" about the same two
+                  people. progress.skipped folds in API refusals the Failed
+                  figure already counts, so it is not shown here at all —
+                  funnel.optedOut is the honest word for who this row means. */}
               <span><strong className="text-foreground tabular-nums">{num(lastRun.funnel.delivered)}</strong> delivered</span>
               <span><strong className="text-foreground tabular-nums">{num(lastRun.funnel.failed)}</strong> failed</span>
-              <span><strong className="text-foreground tabular-nums">{num(lastRun.progress.skipped)}</strong> skipped</span>
-              {lastRun.progress.retrying > 0 && (
-                <span><strong className="text-warning tabular-nums">{num(lastRun.progress.retrying)}</strong> retrying</span>
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.funnel.unreachable)}</strong> not on WhatsApp</span>
+              <span><strong className="text-foreground tabular-nums">{num(lastRun.funnel.optedOut)}</strong> opted out or switched off</span>
+              {lastRun.funnel.retrying > 0 && (
+                <span><strong className="text-warning tabular-nums">{num(lastRun.funnel.retrying)}</strong> retrying</span>
               )}
             </div>
             {lastRun.unfinished && (
@@ -182,7 +186,7 @@ function Dashboard() {
             the ledger. Every tile in this row is now a slice of that same
             funnel, so a tile can never disagree with the row beneath it. */}
         <Stat label="Failed"    value={num(failed)}    tone={failed ? 'text-destructive' : undefined}
-              hint="gave up after every attempt" />
+              hint="every attempt used, or never retryable" />
         <Stat label="Not on WhatsApp" value={num(unreachable)}
               tone={unreachable ? 'text-destructive' : undefined} hint="Meta says undeliverable" />
         {/* funnel.optedOut, not progress.skipped: the queue's `skipped` also
@@ -263,10 +267,19 @@ function Dashboard() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="rounded-md border border-border p-3">
                     <p className="text-xs text-muted-foreground">Sent today</p>
+                    <p className="text-lg font-semibold tabular-nums">{num(dailyCount)}</p>
                     {/* dailyCap is null when nothing is capping this number.
                         num(null) is "0", which would read as a cap that blocks
-                        every send — the opposite of what null means. */}
-                    <p className="text-lg font-semibold tabular-nums">{num(dailyCount)} <span className="text-sm font-normal text-muted-foreground">{dailyCap == null ? '· no cap' : `/ ${num(dailyCap)}`}</span></p>
+                        every send — the opposite of what null means. The count
+                        the cap is actually compared against (contract C1) is
+                        capCount, not dailyCount: while a warm-up rung governs,
+                        that is a rolling 24h window and can differ from
+                        today's IST-day total, so the caption names which
+                        window produced the number on the left of the slash. */}
+                    <p className="text-[11px] text-muted-foreground">
+                      {dailyCap == null ? 'No daily cap'
+                        : `${num(capCount ?? dailyCount)} / ${num(dailyCap)} ${capWindow === '24h' ? 'in the last 24 hours' : 'today'}`}
+                    </p>
                     {/* The caption has to name the ceiling that is ACTUALLY in
                         force. It used to print the warm-up sentence whatever the
                         number above it was, so a graduated ladder read "Meta's
