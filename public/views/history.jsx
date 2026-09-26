@@ -86,7 +86,7 @@ function RunDetail({ id, onBack }) {
         <Stat label="Contacts"      value={num(f.total)} hint="rows in the CSV" />
         <Stat label="Delivered"     value={num(f.delivered)} tone={f.delivered ? 'text-success' : ''} hint={pct(f.delivered)} />
         <Stat label="Read"          value={num(f.read)} hint="see note below" />
-        <Stat label="Failed"        value={num(f.failed)} tone={f.failed ? 'text-destructive' : ''} hint="gave up after every attempt" />
+        <Stat label="Failed"        value={num(f.failed)} tone={f.failed ? 'text-destructive' : ''} hint="every attempt used, or never retryable" />
         <Stat label="Not on WhatsApp" value={num(f.unreachable)} tone={f.unreachable ? 'text-destructive' : ''} hint="Meta says undeliverable" />
         <Stat label="Opted out"     value={num(f.optedOut)} hint="never attempted" />
       </div>
