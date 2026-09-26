@@ -4044,11 +4044,13 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   //
   // atTheRung puts the ladder on a fresh day at the smallest rung above what this
   // shared database has already sent inside the last 24 hours, then fills the
-  // window to exactly that rung: every seat an hour old except the last, which
-  // is sent at `lastAt` — so the test decides when the next slot frees. The rows
-  // are removed afterwards; later tests count this window too.
+  // window to exactly that rung: every seat `fillerAge` old except the last,
+  // which is sent at `lastAt` — so the test decides when the next slot frees.
+  // fillerAge defaults to an hour, which is what every call site used before it
+  // became a parameter. The rows are removed afterwards; later tests count this
+  // window too.
   const ROLL_DAY = 86400000;
-  const atTheRung = (lastAt) => {
+  const atTheRung = (lastAt, fillerAge = 3600000) => {
     const already = M.sentSince(Date.now() - ROLL_DAY);
     const k = M.WARMUP_PLAN.findIndex(r => r > already);
     W.enabled = true; S.quality = 'GREEN'; S.config.dailyCap = 0;
@@ -4057,7 +4059,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     const wamids = [];
     for (let i = 0; i < M.WARMUP_PLAN[k] - already; i++) {
       const wamid = `rung-seat.${Date.now()}.${i}`;
-      ins.run(wamid, `9190001${String(i).padStart(5, '0')}`, i === 0 ? lastAt : Date.now() - 3600000);
+      ins.run(wamid, `9190001${String(i).padStart(5, '0')}`, i === 0 ? lastAt : Date.now() - fillerAge);
       wamids.push(wamid);
     }
     return { rung: M.WARMUP_PLAN[k], day: k + 1,
@@ -4130,8 +4132,19 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       if (String(url).includes('quality_rating')) return qualityIs('GREEN')(url);
       return graphOk(`wamid.rungday.${++sends}`);
     }, async h => {
-      const seats = atTheRung(realNow() - 3600000);       // every seat an hour old: the first frees in 23 hours
+      // Every seat sent at real `now`, not an hour ago: the earliest a fresh
+      // seat can free is a full 24h + 1s away, which nextIstMidnight() (at
+      // most a day plus its own two-minute slack away) is all but guaranteed
+      // to beat. Seats an hour old used to make the seat free in 23 hours —
+      // between roughly 00:00 and 01:02 IST that is EARLIER than midnight, so
+      // the test silently exercised the seat wake below instead of the
+      // midnight wake it exists to prove. The precondition assertion right
+      // after is the net for the sliver of time (the ~two minutes right after
+      // midnight) this still cannot rule out by construction alone.
+      const seats = atTheRung(realNow(), 0);
       try {
+        assert.ok(M.nextIstMidnight() < M.slotFreesAt(),
+          'precondition: midnight must be the earlier of the two, or this test is not exercising the midnight wake it is named for');
         h.stage([{ dialStr: '919000038001', name: 'Rahul' }], 'rung-midnight');
         h.start();
         await h.until(() => S.phase === 'paused');
