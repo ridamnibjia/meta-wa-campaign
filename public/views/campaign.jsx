@@ -506,7 +506,10 @@ function Campaign() {
       buttons:       compose.buttons,
     }).catch(() => ({ ok: false, errors: ['Network error — is the server running?'] }));
     setCompose(c => ({ ...c, submitting: false, errors: r.ok ? [] : (r.errors || ['Unknown error']) }));
-    if (r.ok) { setWriting(false); await loadTemplates(r.name); }
+    // Both the name AND the language just submitted — a create that adds a
+    // second language to an existing name must adopt THAT variant, not
+    // whichever one the picker had open before this compose session started.
+    if (r.ok) { setWriting(false); await loadTemplates(r.name, compose.language); }
   };
 
   const confirmDelete = async () => {
