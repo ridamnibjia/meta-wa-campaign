@@ -4255,6 +4255,25 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     } finally { M.flags.stopFlag = false; global.fetch = saved.fetch; S.quality = saved.quality; }
   });
 
+  // A Pause is not a Stop: it is resumable, and the whole point of asking Meta
+  // again at a cap-park wake is to have the freshest rating ready for when
+  // Resume derives the next day's rung. Giving up on a Pause exactly like a
+  // Stop dropped a late RED on the floor — S.quality stayed at whatever it was
+  // before the Pause, and Resume could then climb a rung on a stale GREEN.
+  testAsync('a Pause during a slow quality re-read still adopts the late answer', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'GREEN';
+    global.fetch = () => new Promise(r => setTimeout(() => r({ ok: true,
+      json: async () => ({ quality_rating: 'RED' }) }), 200));
+    try {
+      const refreshing = M.refreshQuality();
+      setTimeout(() => { M.flags.pauseFlag = true; }, 50);
+      await refreshing;
+      assert.equal(S.quality, 'RED',
+        'only Stop may abandon the re-read — a Pause must still let the answer land so Resume sees it');
+    } finally { M.flags.pauseFlag = false; global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
   // The wake itself, through the real loop: parked on your own cap until IST
   // midnight, the clock is moved past the deadline, and the loop asks Meta for
   // the rating as it wakes. One seat is dated two days ahead so the count stays
