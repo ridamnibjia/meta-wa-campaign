@@ -429,7 +429,12 @@ function SendFilePanel({ waId, onSent, onClose }) {
 }
 
 function Thread({ waId, onBack }) {
-  const { loadInbox } = useApp();
+  const { loadInbox, threads } = useApp();
+  // The socket-fed threads list, not a poll of its own: `threads` already
+  // updates the moment ingest.js processes an inbound webhook, so watching
+  // this contact's own lastAt is how the open transcript learns something new
+  // arrived without a timer.
+  const lastAt = threads.find(t => t.waId === waId)?.lastAt;
   const [data, setData] = useState(null);
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -449,6 +454,32 @@ function Thread({ waId, onBack }) {
   }, [waId]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Merge, never reload: load() resets `older`, and an inbound must not throw
+  // away the pages the operator scrolled back through. If the fresh newest
+  // page no longer overlaps the one on screen, more than a page arrived while
+  // nobody was watching — reload is the only correct answer to that.
+  const refreshNewest = useCallback(() => {
+    api.get(`/api/inbox/${waId}`).then(fresh => setData(cur => {
+      if (!cur) return fresh;
+      const ids = new Set(cur.messages.map(m => m.id));
+      if (!fresh.messages.some(m => ids.has(m.id))) { load(); return cur; }
+      const freshById = new Map(fresh.messages.map(m => [m.id, m]));
+      // Entries already on screen pick up their fresher copy too — a status
+      // moving sent → delivered → read on a bubble already rendered — and
+      // anything in the fresh page that was not here yet is appended after it.
+      const updated = cur.messages.map(m => freshById.get(m.id) || m);
+      const merged  = [...updated, ...fresh.messages.filter(m => !ids.has(m.id))];
+      return { ...fresh, messages: merged, nextBefore: cur.nextBefore, hasMore: cur.hasMore };
+    })).catch(() => {});
+  }, [waId, load]);
+  const seen = useRef(lastAt);
+  // Reset the watermark on a thread switch rather than let it carry the
+  // PREVIOUS conversation's timestamp — otherwise the first render after
+  // switching reads that stale mismatch as "something new arrived" and fires
+  // a redundant fetch right on top of the one `load()` above already made.
+  useEffect(() => { seen.current = lastAt; }, [waId]);
+  useEffect(() => { if (lastAt && lastAt !== seen.current) { seen.current = lastAt; refreshNewest(); } }, [lastAt, refreshNewest]);
 
   // The cursor for the next page back is the oldest one fetched so far.
   const nextBefore = older.length ? older[0].nextBefore : data?.nextBefore;
