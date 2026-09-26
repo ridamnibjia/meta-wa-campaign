@@ -381,10 +381,10 @@ function SendFilePanel({ waId, onSent, onClose }) {
         <Button variant="ghost" size="sm" onClick={onClose}>✕</Button>
       </div>
 
-      <label className={cn('mb-2 block rounded-md border border-dashed border-border p-3 text-center text-xs',
+      <label className={cn('mb-2 block rounded-md border border-dashed border-border p-3 text-center text-xs focus-within:ring-2 focus-within:ring-ring',
         busy ? 'text-muted-foreground' : 'cursor-pointer text-muted-foreground hover:bg-accent')}>
         {busy ? 'Working…' : 'Upload a new file'}
-        <input type="file" className="hidden" disabled={busy}
+        <input type="file" className="sr-only" disabled={busy}
                onChange={e => { upload(e.target.files[0]); e.target.value = ''; }} />
       </label>
 
