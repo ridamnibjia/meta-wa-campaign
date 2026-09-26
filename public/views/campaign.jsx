@@ -137,9 +137,13 @@ function MediaPicker({ format, assetId, onPick, disabled, disabledReason }) {
         onDrop={e => { e.preventDefault(); setOver(false); send(e.dataTransfer.files[0]); }}>
         {busy ? 'Uploading…' : <>
           Drop a {kind} here, or{' '}
-          <label className="cursor-pointer text-primary underline">
+          <label className="cursor-pointer rounded text-primary underline focus-within:ring-2 focus-within:ring-ring">
             choose a file
-            <input type="file" className="hidden" onChange={e => send(e.target.files[0])} />
+            {/* sr-only, not hidden: a file input people tab to needs to stay in
+                the accessibility tree and paint a visible focus ring on the
+                label wrapping it, which display:none removes it from. */}
+            <input type="file" className="sr-only"
+                   onChange={e => { send(e.target.files[0]); e.target.value = ''; }} />
           </label>
         </>}
       </div>
@@ -221,8 +225,14 @@ const SKIP_GROUPS = [
     blurb: 'These used up every attempt and still failed for a reason nothing on your side controls — usually the per-person marketing cap, which resets on a scale of days. Put them in a later campaign; there is nothing to fix here.' },
   { key: 'fix',       title: 'Fix something first',
     blurb: 'These failed because of a setting on your side. Retrying unchanged repeats the failure; correcting the cause makes the whole list sendable.' },
-  { key: 'permanent', title: 'Meta will not deliver these',
-    blurb: 'A property of the number, not of the attempt. They have been disabled so later runs skip them automatically.' },
+  // Two populations, not one: most of these are a property of the NUMBER
+  // (131026 — not on WhatsApp, or blocked on quality grounds), but 131050 is
+  // the PERSON turning your marketing off inside WhatsApp — permanent in the
+  // same sense (no retry changes the answer) but nothing wrong with the
+  // number. The per-row sentence (explainError, server-composed) says which
+  // one this contact actually is; the group copy only has to be true for both.
+  { key: 'permanent', title: 'Switched off — the number cannot receive WhatsApp messages, or the person turned off your marketing',
+    blurb: 'Either a property of the number, or something the person did inside WhatsApp — the sentence on each row below says which. Either way they have been disabled so later runs skip them automatically.' },
   { key: 'disabled',  title: 'Switched off before the run',
     blurb: 'Nobody attempted these — they were already disabled when the queue was built.' },
   { key: 'unclassified', title: 'Not yet classified',
@@ -262,6 +272,7 @@ function SkipReport({ phase, retrying = 0 }) {
           return (
             <div key={g.key} className="rounded-md border border-border">
               <button className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left"
+                      aria-expanded={open === g.key}
                       onClick={() => setOpen(open === g.key ? null : g.key)}>
                 <span className="text-sm font-medium">{title}</span>
                 <span className="flex items-center gap-2">
@@ -313,7 +324,8 @@ function SkipReport({ phase, retrying = 0 }) {
 // Module scope, like Step below: a component declared inside another component
 // is a new type on every render, and React remounts new types.
 function CampaignBar({ ss, phase, onPause, onResume, onStop }) {
-  const { total = 0, currentIdx = 0, retrying = 0, nextRetry, dailyCount = 0, dailyCap } = ss;
+  const { total = 0, currentIdx = 0, retrying = 0, nextRetry, dailyCount = 0, dailyCap,
+          capCount, capWindow } = ss;
   const done = Math.min(currentIdx, total);
   const pct  = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const paused = phase === 'paused';
@@ -328,12 +340,24 @@ function CampaignBar({ ss, phase, onPause, onResume, onStop }) {
     <div className="sticky top-0 z-20 -mx-4 mb-4 border-b border-border bg-background/95 px-4 py-3 backdrop-blur md:-mx-6 md:px-6">
       <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-4 gap-y-2">
         <Badge variant={tone}>{label}</Badge>
+        {/* The template this run is actually sending — the one control an
+            operator wants confirmed in a hurry is Stop, and the second is
+            "stop WHICH one" on a screen that can compose a different template
+            while this one sends. */}
+        {ss.config?.templateName && (
+          <span className="truncate text-sm text-muted-foreground">“{ss.config.templateName}”</span>
+        )}
         <span className="text-sm font-medium tabular-nums">{num(done)} of {num(total)}</span>
         <span className="text-xs text-muted-foreground">
+          {num(dailyCount)} sent today
           {/* dailyCap is null when there is no ceiling at all — a finished
               warm-up and no cap of your own. num(null) renders "0", which reads
-              as a limit that blocks every send. */}
-          {num(dailyCount)} sent today{dailyCap == null ? ' · no daily cap' : ` / ${num(dailyCap)}`}
+              as a limit that blocks every send. The count the cap is actually
+              compared against (contract C1) is capCount, not dailyCount: while
+              a warm-up rung governs, that count is a rolling 24h window and can
+              differ from today's IST-day total, so the caption says which. */}
+          {dailyCap == null ? ' · no daily cap'
+            : ` · ${num(capCount ?? dailyCount)} / ${num(dailyCap)} ${capWindow === '24h' ? 'in the last 24 hours' : 'today'}`}
           {retrying > 0 && ` · ${num(retrying)} retrying${nextRetry ? `, next ${clockOf(nextRetry.at)}` : ''}`}
         </span>
         <div className="ml-auto flex gap-2">
@@ -366,7 +390,8 @@ const Step = ({ n, title, state, right, children }) => (
 
 function Campaign() {
   const {
-    ss, contacts, setContacts, templates, picked, setPicked, params, setParams,
+    ss, contacts, setContacts, templates, picked, setPicked, pickedLang, setPickedLang,
+    tmplLockMsg, params, setParams,
     tmplErr, active, vars, flushParams, loadTemplates, uploadCSV, logs, setLogs,
     failLog, setFailLog,
   } = useApp();
@@ -447,9 +472,13 @@ function Campaign() {
   const needsAttachment = ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(ss.config?.headerFormat)
                           && !ss.config?.headerAssetId;
   const ready = configured && contacts.count > 0 && approved && phase === 'idle'
-                && !unfilled.length && !needsAttachment;
+                && !unfilled.length && !needsAttachment && !ss.config?.templateUnsupported;
 
   const blockedBy =
+    // Heads the chain: a template this app cannot fill is not sendable no
+    // matter what else is true, and it is a fact about the template Meta just
+    // approved, not about anything the operator did on this screen.
+    ss.config?.templateUnsupported ? ss.config.templateUnsupported :
     !configured        ? 'Credentials missing on the server — check .env, or open Settings' :
     !contacts.count    ? 'Upload a CSV to get started' :
     !active            ? 'Pick or write a message template' :
@@ -492,29 +521,53 @@ function Campaign() {
     const numbers = test.to.split(/[,\s]+/).filter(Boolean);
     if (!numbers.length) return;
     setTest(t => ({ ...t, sending: true, results: null }));
-    await api.post('/api/config', { templateName: picked });
-    await flushParams();
-    const r = await api.post('/api/test-send', { numbers })
-      .catch(() => ({ ok: false, results: [{ input: numbers[0], ok: false, error: 'Network error' }] }));
-    setTest(t => ({ ...t, sending: false, results: r.results || [{ ok: false, error: r.error }] }));
+    try {
+      // templateLanguage rides along (contract C2): two variants share a name,
+      // and the server has to be told which one this session picked.
+      const cfgR = await api.post('/api/config', { templateName: picked, templateLanguage: pickedLang });
+      if (!cfgR.ok) return alert(cfgR.error);
+      await flushParams();
+      const r = await api.post('/api/test-send', { numbers })
+        .catch(() => ({ ok: false, results: [{ input: numbers[0], ok: false, error: 'Network error' }] }));
+      setTest(t => ({ ...t, results: r.results || [{ ok: false, error: r.error }] }));
+    } catch (e) {
+      alert('Network error — the test send did not go out.');
+    } finally {
+      setTest(t => ({ ...t, sending: false }));
+    }
   };
 
   const doStart = async () => {
     setStarting(true);
-    await api.post('/api/config', { delaySec: settings.delaySec, dailyCap: settings.dailyCap, templateName: picked });
-    await flushParams();
-    const r = await api.post('/api/start');
-    if (!r.ok) alert('Could not start: ' + r.error);
-    setStarting(false);
+    try {
+      const cfgR = await api.post('/api/config', { delaySec: settings.delaySec, dailyCap: settings.dailyCap,
+                                                    templateName: picked, templateLanguage: pickedLang });
+      // A refusal here is the C4 lock — a campaign elsewhere is already
+      // sending a different template — and must stop the start outright
+      // rather than press on to /api/start with the wrong template adopted.
+      if (!cfgR.ok) return alert(cfgR.error);
+      await flushParams();
+      const r = await api.post('/api/start');
+      if (!r.ok) alert('Could not start: ' + r.error);
+    } catch (e) {
+      alert('Network error — could not start the campaign.');
+    } finally {
+      setStarting(false);
+    }
   };
   const doPause  = () => api.post('/api/pause');
   const doResume = () => api.post('/api/resume');
-  const doStop   = () => confirm(isWaiting
-    ? `Stop the campaign? ${num(ss.retrying || 0)} contact(s) are waiting on a retry — stopping leaves them un-messaged, listed in the report below.`
-    : 'Stop the campaign? It stays where it is — Resume picks up from the same contact.') && api.post('/api/stop');
-  const doReset  = () => {
+  const doStop   = async () => {
+    if (!confirm(isWaiting
+      ? `Stop the campaign? ${num(ss.retrying || 0)} contact(s) are waiting on a retry — stopping leaves them un-messaged, listed in the report below.`
+      : 'Stop the campaign? It stays where it is — Resume picks up from the same contact.')) return;
+    const r = await api.post('/api/stop').catch(() => ({ ok: false, error: 'Network error — nothing was stopped' }));
+    if (!r.ok) alert(r.error);
+  };
+  const doReset  = async () => {
     if (!confirm('Clear contacts, stats and logs? This cannot be undone.')) return;
-    api.post('/api/reset');
+    const r = await api.post('/api/reset').catch(() => ({ ok: false, error: 'Network error — nothing was reset' }));
+    if (!r.ok) return alert(r.error);
     setContacts({ count: 0, sample: [], file: '' }); setLogs([]); setFailLog([]);
   };
 
@@ -540,11 +593,18 @@ function Campaign() {
               Writing and submitting a new template is fine meanwhile.
             </Alert>
           )}
-          <label htmlFor="csv"
+          {/* Persistent, not alert(): a modal the operator dismisses is gone by
+              the time they reach for the dropzone again, and a parse failure
+              is exactly the kind of thing worth re-reading before a second
+              try. Cleared the moment a later upload succeeds. */}
+          {contacts.uploadError && (
+            <Alert variant="destructive" title="That CSV could not be read">{contacts.uploadError}</Alert>
+          )}
+          <label
             onDragOver={e => { e.preventDefault(); if (!isActive) setDragging(true); }}
             onDragLeave={() => setDragging(false)}
             onDrop={e => { e.preventDefault(); setDragging(false); if (isActive) return; const f = e.dataTransfer.files[0]; if (f?.name.endsWith('.csv')) uploadCSV(f); }}
-            className={cn('flex min-h-[104px] flex-col items-center justify-center gap-1 rounded-lg border border-dashed p-4 text-center transition-colors',
+            className={cn('flex min-h-[104px] flex-col items-center justify-center gap-1 rounded-lg border border-dashed p-4 text-center transition-colors focus-within:ring-2 focus-within:ring-ring',
               isActive ? 'pointer-events-none border-input opacity-50'
                 : dragging ? 'cursor-pointer border-primary bg-primary/5'
                 : 'cursor-pointer border-input hover:border-primary hover:bg-primary/5')}>
@@ -557,9 +617,12 @@ function Campaign() {
               <span className="text-sm font-semibold">Drop your CSV here</span>
               <span className="text-xs text-muted-foreground">or click to choose · Google Contacts export works as-is</span>
             </>}
+            {/* sr-only, nested inside the label: focus-within on the label
+                above only sees a DESCENDANT's focus, and hidden/display:none
+                would also drop the input out of the tab order entirely. */}
+            <input type="file" accept=".csv" className="sr-only" disabled={isActive}
+                   onChange={e => { const f = e.target.files[0]; e.target.value = ''; if (f) uploadCSV(f); }} />
           </label>
-          <input id="csv" type="file" accept=".csv" hidden disabled={isActive}
-                 onChange={e => e.target.files[0] && uploadCSV(e.target.files[0])} />
 
           {/* The other way in: the contacts already on this server. Every
               upload grows the directory, so a repeat campaign does not need
@@ -620,6 +683,25 @@ function Campaign() {
                   {contacts.breakdown.newCount != null && <> · {num(contacts.breakdown.newCount)} new to this server</>}
                 </p>
               )}
+              {/* guessedPhone is a sentence fragment already ("their values
+                  under \"Mobile\""), not a bare header name — it slots
+                  straight into this sentence. Shown whenever the parser had
+                  to guess rather than read a named phone column. */}
+              {contacts.breakdown?.guessedPhone && (
+                <p className="text-[11px] text-muted-foreground">
+                  No column header names a phone number, so the numbers were read from {contacts.breakdown.guessedPhone}.
+                </p>
+              )}
+              {/* Amber, not muted: this is a guess the parser made about a
+                  whole country, not a housekeeping fact like a merged
+                  duplicate — and it is wrong for every non-Indian audience. */}
+              {contacts.breakdown?.guessedCountry > 0 && (
+                <p className="text-[11px] font-medium text-warning">
+                  {num(contacts.breakdown.guessedCountry)} number{contacts.breakdown.guessedCountry === 1 ? '' : 's'} had no
+                  country code and {contacts.breakdown.guessedCountry === 1 ? 'was' : 'were'} assumed Indian (+91) — check the
+                  list below if this is not an Indian audience.
+                </p>
+              )}
               <div className="divide-y divide-border">
                 {(contacts.sample || []).slice(0, 3).map((c, i) => (
                   <div key={i} className="flex justify-between py-1.5 text-xs">
@@ -656,14 +738,29 @@ function Campaign() {
               right={active && <Badge variant={STATUS_VARIANT[active.status] || 'destructive'}>{active.status}</Badge>}>
           {!writing ? (
             <>
-              <Field label="Template" hint={active?.status === 'PENDING'
-                ? 'Meta usually approves within minutes. This list refreshes on its own — no need to reload.'
-                : `${ready2.length} template${ready2.length === 1 ? '' : 's'} ready to send right now.`}>
+              <Field label="Template" hint={
+                // Locked heads the hint too — it is WHY the picker below is
+                // greyed out, and the pending/ready counts under it would
+                // otherwise read as live guidance for a control nothing can
+                // act on right now.
+                isActive ? 'Locked while a campaign is sending'
+                : active?.status === 'PENDING'
+                  ? 'Meta usually approves within minutes. This list refreshes on its own — no need to reload.'
+                  : `${ready2.length} template${ready2.length === 1 ? '' : 's'} ready to send right now.`}>
                 <div className="flex gap-2">
-                  <Select value={picked} onChange={e => setPicked(e.target.value)} className="flex-1">
-                    {templates.length === 0 && <option value="">No templates found</option>}
+                  {/* Value carries language too (contract C2): two variants
+                      share a `name`, and a bare-name value could not tell the
+                      picker apart. Split on the FIRST colon — names and
+                      language codes are never anything but [a-z0-9_]. */}
+                  <Select value={`${picked}:${pickedLang}`} disabled={isActive} className="flex-1"
+                    onChange={e => {
+                      const i = e.target.value.indexOf(':');
+                      setPicked(e.target.value.slice(0, i));
+                      setPickedLang(e.target.value.slice(i + 1));
+                    }}>
+                    {templates.length === 0 && <option value=":">No templates found</option>}
                     {templates.map(t => (
-                      <option key={t.name + t.language} value={t.name}>
+                      <option key={t.name + t.language} value={`${t.name}:${t.language}`}>
                         {t.name} · {t.language} · {t.status}
                       </option>
                     ))}
@@ -676,6 +773,7 @@ function Campaign() {
               </Field>
 
               {tmplErr && <Alert variant="destructive" title="Could not load templates">{tmplErr}</Alert>}
+              {tmplLockMsg && <Alert variant="destructive" title="Could not switch templates">{tmplLockMsg}</Alert>}
               {active?.rejectedReason && <Alert variant="destructive" title="Rejected by Meta">{active.rejectedReason}</Alert>}
 
               {vars.length > 0 && (
@@ -787,7 +885,7 @@ function Campaign() {
               </div>
               <Switch checked={compose.addOptOut} onChange={v => setCompose(c => ({ ...c, addOptOut: v }))}
                       label="Add a “Stop promotions” button (strongly recommended)" />
-              <Field label="Buttons (optional)" hint="Meta allows 3 quick replies, 2 links and 1 call button. The Stop promotions button counts as a quick reply.">
+              <Field label="Buttons (optional)" hint="Meta allows up to 10 quick replies, 2 links and 1 call button, and quick replies must sit together. The Stop promotions button counts as a quick reply.">
                 <ButtonEditor buttons={compose.buttons}
                               onChange={b => setCompose(c => ({ ...c, buttons: b }))} />
               </Field>
