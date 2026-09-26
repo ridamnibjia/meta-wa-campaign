@@ -2659,7 +2659,17 @@ console.log('\nmedia — saveUpload');
     try {
       const again = saveUpload(file(bytes, 'legit2-copy.pdf', 'application/pdf'));
       assert.equal(again.ok, false, 'reviving through a corrupted row must refuse, not write through it');
-      assert.match(again.error, /outside the uploads directory/);
+      // Not escapedMsg's sentence: its remedy — "delete it from the Storage
+      // page and upload the file again" — is impossible for a TOMBSTONED row.
+      // deleteAsset refuses outright once deleted_at is set (line ~287) and
+      // listAssets() does not even show a tombstone to click delete on, so
+      // that sentence sends the operator looking for a button that does not
+      // exist. A row this corrupted cannot be repaired by re-uploading either
+      // — only a different file gets them unstuck.
+      assert.doesNotMatch(again.error, /delete it from the Storage page/,
+        'that remedy does not exist for a tombstoned row — the Storage page offers no delete for one');
+      assert.match(again.error, /corrupted/i, 'still names the row as the problem, not the file');
+      assert.match(again.error, /pick a different file|pick another/i, 'and points at the one thing the operator actually can do');
       assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched-2',
         'the revive write must never reach a path the row does not legitimately own');
     } finally { fsx.unlinkSync(outside); }

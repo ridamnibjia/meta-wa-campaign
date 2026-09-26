@@ -120,7 +120,10 @@ function saveUpload(file) {
   // row must not turn an upload into a write to wherever it points, which is
   // exactly the guard deleteAsset already holds for the same column.
   if (existing && !insideDir(UPLOAD_DIR, assetPath(existing))) {
-    return { ok: false, error: escapedMsg(existing) };
+    // A tombstoned row cannot take escapedMsg's remedy (see escapedTombstoneMsg) —
+    // checked here, before the deleted_at branches below, because both of them
+    // would otherwise try to write through this same corrupted path first.
+    return { ok: false, error: existing.deleted_at ? escapedTombstoneMsg(existing) : escapedMsg(existing) };
   }
   if (existing && !existing.deleted_at) {
     // The row can outlive its bytes — a wa.db restored without the uploads
@@ -387,6 +390,15 @@ const missingMsg = a =>
 // this names the row rather than just the file.
 const escapedMsg = a =>
   `The stored location for "${a.filename}" is outside the uploads directory, so it was refused — the database row looks corrupted; delete it from the Storage page and upload the file again.`;
+
+// escapedMsg's remedy is impossible here: deleteAsset refuses outright once
+// deleted_at is set (see the check just below ensureHandle), and the Storage
+// page does not even list a tombstone to click delete on. Re-uploading is
+// also not a fix — it is the very thing that just hit this corrupted row —
+// so the only way forward is a different file, and the message has to say so
+// rather than send the operator looking for a button that does not exist.
+const escapedTombstoneMsg = a =>
+  `The stored record for "${a.filename}" is corrupted, and the file cannot be restored from this upload — pick a different file.`;
 
 // Template CREATION wants an h:… handle from the Resumable Upload API, which
 // keys on the APP id — not the WABA id, not the business id. It is a two-call
