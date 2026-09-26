@@ -8847,6 +8847,60 @@ console.log('\na Reset that lands mid-send');
     });
   });
 
+  // The SEND-TIME halt branch (haltsCampaign, right after sendTemplate) had no
+  // guard at all against a Stop or a Pause landing in the same window — unlike
+  // the rate-limit branch just above (B3's M2 fix). A Stop already writes
+  // S.phase='idle'/S.pauseReason=null synchronously in the route, before this
+  // send even resolves; overwriting that with 'paused' and a halt reason, then
+  // persisting it with saveCampaignNow(), leaves a crash in the gap before the
+  // loop's own stopFlag check runs again free to resurrect a campaign the
+  // operator stopped. The loop's own flag check owns what happens next — Stop
+  // exits idle on its very next iteration — so this branch must defer to it
+  // rather than writing an answer of its own.
+  testAsync('a Stop landing during a halting send is not painted over as a resumable pause', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      await callRoute('post', '/stop');                    // lands while this send is still in flight
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags } = h.M;
+      h.stage([{ dialStr: '919000034101', name: 'Asha' }], 'halt-during-stop');
+      h.start();
+      await h.until(() => !flags.running);
+      assert.equal(s.phase, 'idle', 'a Stop is final — a halt landing after it must not repaint it as paused');
+      assert.equal(s.pauseReason, null, 'nothing here may leave a stale halt reason behind an already-stopped run');
+      assert.equal(flags.pauseFlag, false, 'the halt branch must not turn a stopped run into one Resume could lift');
+      assert.equal(sends, 1, 'the loop must not keep sending after a Stop landed mid-send');
+      assert.ok(!s.logs.some(l => /190/.test(l.msg) && /paused, nobody was skipped/.test(l.msg)),
+        'the halt must not be announced as a fresh park once the campaign is already stopping');
+    });
+  });
+
+  // Same race, the operator's own Pause instead of a Stop. USER_PAUSE is what
+  // tells resumeIfInterrupted this pause is the operator's to lift, not one the
+  // loop gave itself — overwriting it with the halt reason silently turned an
+  // operator Pause into one the next boot auto-resumes on its own.
+  testAsync('a Pause landing during a halting send keeps USER_PAUSE, not the halt reason', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      await callRoute('post', '/pause');                   // lands while this send is still in flight
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags, USER_PAUSE: up } = h.M;
+      h.stage([{ dialStr: '919000034111', name: 'Rahul' }], 'halt-during-pause');
+      h.start();
+      await h.until(() => sends === 1 && s.logs.some(l => /190/.test(l.msg)));
+      assert.equal(s.pauseReason, up, 'the operator\'s own Pause must not be overwritten by the halt reason');
+      assert.equal(s.phase, 'paused');
+      assert.equal(flags.pauseFlag, true, 'still set, so Resume is theirs to press');
+      assert.equal(sends, 1, 'the fault must not be probed again while the operator\'s pause holds');
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused by the operator/.test(l.msg)),
+        'the fault is still said out loud in one line, even though the pause stays the operator\'s');
+    });
+  });
+
   // ── An account-level fault must pause the campaign, not burn the list ───────
   // Every send after an expired token / paused template / billing hold fails
   // identically. The loop used to write that identical failure once per contact
