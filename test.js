@@ -1783,6 +1783,35 @@ test('a status that beats its own send is applied when the send is recorded', ()
     'an early status that is not a failure is applied quietly — there is nothing to retry');
   assert.equal(statusOf('wamid.EARLY-SENT').status, 'sent');
 });
+// The hold keeps one entry PER STATUS VALUE, not one per wamid (onUnknownStatus
+// above) — a send that raced two DIFFERENT statuses before this server had
+// recorded it at all has to replay both, in arrival order, when recordOutbound
+// finally claims them. Nothing above isolates this: every race test so far
+// holds exactly one status ahead of the row.
+test('two different statuses held for one wamid are both replayed, in order', () => {
+  const runId = newRunRow('race-multi');
+  applyStatus({ id: 'wamid.RACE2', status: 'sent' });
+  applyStatus({ id: 'wamid.RACE2', status: 'failed', errors: [{ code: 131049, title: 'x' }] });
+  assert.equal(statusOf('wamid.RACE2'), undefined, 'still nothing to update — the send has not been recorded');
+
+  const f = recordOutbound({ wamid: 'wamid.RACE2', waId: '919000004305', name: 'Asha', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE2').status, 'failed',
+    'both held statuses are replayed in arrival order — sent, then the failure that followed it');
+  assert.deepEqual(f, { failed: true, waId: '919000004305', runId, wamid: 'wamid.RACE2', code: 131049, title: 'x' },
+    'the descriptor from the SECOND held status is still handed back, so the ladder sees the failure');
+});
+test('a held failure survives a stale held status that arrived after it', () => {
+  const runId = newRunRow('race-stale');
+  applyStatus({ id: 'wamid.RACE3', status: 'failed', errors: [{ code: 131049, title: 'x' }] });
+  applyStatus({ id: 'wamid.RACE3', status: 'delivered' });      // Meta redelivers and promises no order
+  assert.equal(statusOf('wamid.RACE3'), undefined);
+
+  const f = recordOutbound({ wamid: 'wamid.RACE3', waId: '919000004306', name: 'Rahul', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE3').status, 'failed',
+    'a device cannot un-receive a message — the stale held "delivered" must not overwrite the failure');
+  assert.deepEqual(f, { failed: true, waId: '919000004306', runId, wamid: 'wamid.RACE3', code: 131049, title: 'x' },
+    'claimHeld must not let the later no-op status (the || in its loop) erase the earlier failure descriptor');
+});
 test('the early-status hold is bounded — statuses nobody claims cannot grow it forever', () => {
   // Another tool sending from the same number produces a status for every
   // message it sends, and none of them will ever be claimed. The hold keeps the
@@ -4097,7 +4126,19 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   testAsync('a slot that frees within the minute is waited for silently, then used', async () => {
     let sends = 0, sentAt = null;
     await withLoop(async () => { sentAt = Date.now(); return graphOk(`wamid.rungq.${++sends}`); }, async h => {
-      const seats = atTheRung(Date.now() - ROLL_DAY + 50);     // the last seat leaves in a second
+      // The seat's OWN free time (capCount()'s raw 24h boundary, sentSince's
+      // `at >= now - DAY_MS`) is 24h after its `at`, with no grace — the extra
+      // second only lives in slotFreesAt()'s answer, as the wake deadline. A
+      // margin of 50ms between "seat placed" and that raw boundary used to be
+      // the whole safety net against the real delay before the loop's first
+      // capCount() check — plain JS and in-memory SQLite normally, but under
+      // real CPU/disk contention (seen right after `npm ci`) that gap can run
+      // into the hundreds of ms. Once it beat 50ms the seat had already left
+      // the window by the loop's first look, the cap never appeared full, the
+      // send went out immediately, and `sentAt >= frees` failed — about 1 run
+      // in 17 under load. 700ms is generous against that delay while the total
+      // wait (about 1.7s) is still comfortably "within the minute".
+      const seats = atTheRung(Date.now() - ROLL_DAY + 700);
       const savedLogs = S.logs;
       S.logs = [];
       try {
@@ -4107,8 +4148,11 @@ console.log('\nrun_recipients — retrying a moment-based failure');
         const phases = new Set();
         h.start();
         // Sampled only while the wait lasts: once the send goes out the run is
-        // over and the phase moves on to 'done', as it should.
-        await h.until(() => { if (sends === 0) phases.add(S.phase); return sends > 0; }, 4000);
+        // over and the phase moves on to 'done', as it should. The outer
+        // budget is generous relative to the ~1.7s nominal wait for the same
+        // reason the margin above is — headroom against real timer jitter
+        // under load, not a wait anything here expects to spend in full.
+        await h.until(() => { if (sends === 0) phases.add(S.phase); return sends > 0; }, 8000);
         assert.equal(sends, 1, 'once a contact has left the window, the slot is used');
         assert.ok(sentAt >= frees, 'and not before — the ceiling held until then');
         assert.deepEqual([...phases], ['running'], 'a wait this short is slept silently — no pause flashed on screen');
