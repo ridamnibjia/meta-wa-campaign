@@ -5404,6 +5404,35 @@ console.log('\nwebhook ingest — what an envelope means');
     }
   });
 
+  // fetchAccountInfo() maps a missing rating to the string 'UNKNOWN' (so the
+  // account screen has something to show) — which is truthy, so assigning
+  // S.quality directly from a successful-but-ratingless re-read overwrote a
+  // held RED/YELLOW warm-up hold with a value the ladder does not recognise,
+  // lifting the hold on no evidence the number recovered. adoptQuality is the
+  // one door every other reader of Meta's rating goes through for exactly
+  // this (warmup.js, /start, Settings); this webhook path has to use it too.
+  testAsync('a quality update whose re-read carries no rating does not lift a held RED', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality,
+                    token: CFG.accessToken, phone: CFG.phoneNumberId };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = 'test-phone';
+    try {
+      S.quality = 'RED';
+      // No quality_rating field at all — fetchAccountInfo turns this into 'UNKNOWN'.
+      global.fetch = async () => ({ json: async () => ({ messaging_limit_tier: 'TIER_1K' }) });
+      processEnvelope(envelopeOf('phone_number_quality_update', { event: 'FLAGGED' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'RED', 'UNKNOWN is not evidence the number recovered — the held rung must stay held');
+
+      global.fetch = async () => ({ json: async () => ({ quality_rating: 'YELLOW', messaging_limit_tier: 'TIER_1K' }) });
+      processEnvelope(envelopeOf('phone_number_quality_update', { event: 'DOWNGRADE' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'YELLOW', 'a real rating on the same path is still adopted');
+    } finally {
+      global.fetch = saved.fetch; S.quality = saved.quality;
+      CFG.accessToken = saved.token; CFG.phoneNumberId = saved.phone;
+    }
+  });
+
   // The wa_id Meta reports is not always the number the campaign dialed —
   // Brazil's ninth digit, Mexico's 521, Argentina's 9. Filed under the wa_id
   // alone, an opt-out suppressed a string no campaign row will ever match, and

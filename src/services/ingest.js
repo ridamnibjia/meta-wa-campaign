@@ -8,12 +8,13 @@
 // recovering from something.
 const { CFG, OPT_OUT_LABEL } = require('../config');
 const { db } = require('../lib/db');
-const { S, log, emit } = require('../state');
+const { log, emit } = require('../state');
 const { broadcast } = require('./status');
 const { disable } = require('./contacts');
 const { applyStatus, markEnvelopeProcessed, waIdForWamid } = require('./messages');
 const { handleDeliveryFailure } = require('./campaign');
 const { fetchAccountInfo } = require('./graph');
+const { QUALITY_RATINGS, adoptQuality } = require('./warmup');
 const inbox = require('./inbox');
 
 // One broadcast per envelope, not one per message and one per status.
@@ -66,10 +67,20 @@ function processEnvelope(body) {
         fetchAccountInfo()
           .then(i => {
             // fetchAccountInfo reports a Graph refusal as { error } rather than
-            // throwing; both land in the same catch, so neither is silent.
-            if (!i?.qualityRating) throw new Error(i?.error || 'Graph returned no rating');
-            S.quality = i.qualityRating;
-            broadcast();
+            // throwing; that still lands in the catch below, so neither is silent.
+            if (i?.error) throw new Error(i.error);
+            // A missing rating comes back as the string 'UNKNOWN' (graph.js) —
+            // truthy, so assigning S.quality directly here used to let a
+            // ratingless re-read overwrite a held YELLOW/RED with a value the
+            // warm-up gate does not recognise, lifting the hold on no evidence
+            // the number recovered. adoptQuality is the one door every other
+            // reader of Meta's rating goes through (warmup.js) for exactly
+            // this, and broadcasting only when it actually changed keeps this
+            // in line with `buildState()` running once per meaningful event.
+            if (!QUALITY_RATINGS.includes(i?.qualityRating)) {
+              throw new Error(`Graph returned no usable rating (${i?.qualityRating ?? 'none'})`);
+            }
+            if (adoptQuality(i.qualityRating)) broadcast();
           })
           .catch(e => log('warn', `Could not re-read the quality rating: ${e.message}`));
         continue;
