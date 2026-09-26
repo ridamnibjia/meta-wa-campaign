@@ -13,6 +13,19 @@ process.env.WA_UPLOAD_DIR = require('path').join(
 process.env.WA_MEDIA_DIR = require('path').join(
   require('os').tmpdir(), `wa-media-${process.pid}-${Date.now()}`);
 
+// Runtime state — campaign.json, warmup.json, opt-outs.json, inbox.json,
+// msg-index.json — goes to a throwaway directory too, for the same reason as
+// the two stores above. WA_DATA_DIR used to be blanked below (Object.assign),
+// which falls back to ROOT (src/config.js): every run of this suite left a
+// live campaign.json in the checkout, and running it in the owner's real
+// checkout would silently overwrite their actual campaign state. Unlike the
+// two stores above, store.js's writeJSON does not mkdir its target, and
+// several tests below write FILES.campaign/warmup directly — so the
+// directory has to exist before ./server (and its config) loads.
+process.env.WA_DATA_DIR = require('path').join(
+  require('os').tmpdir(), `wa-data-${process.pid}-${Date.now()}`);
+require('fs').mkdirSync(process.env.WA_DATA_DIR, { recursive: true });
+
 // The free-space floor defaults to 2 GB, which makes every media test a
 // referendum on how full the developer's laptop is. The floor is exercised
 // deliberately, in its own test, by raising it — so the default here is zero.
@@ -35,7 +48,7 @@ Object.assign(process.env, {
   ACCESS_TOKEN: 'test-token', PHONE_NUMBER_ID: 'test-phone',
   WABA_ID: '', BUSINESS_ID: '', APP_ID: '', APP_SECRET: '', APP_PASSWORD: '',
   WEBHOOK_VERIFY_TOKEN: '', CLAMAV_ADDRESS: '', FRONTEND_URL: '',
-  WA_DATA_DIR: '', BIND_HOST: '', RENDER: '',
+  BIND_HOST: '', RENDER: '',
 });
 
 // Run: node test.js
@@ -2218,6 +2231,19 @@ console.log('\nconfig — where the app listens and where it writes');
     assert.equal(boxed.MEDIA_DIR, '/data/media');
     assert.equal(boxed.UPLOAD_DIR, '/data/uploads');
     assert.equal(boxed.PUBLIC_DIR, pathx.join(boxed.ROOT, 'public'), 'the code the app serves does not move');
+  });
+
+  test('the suite itself writes state files outside the checkout, not just when boxed', () => {
+    // This checks the LIVE config the whole suite runs against (the module
+    // require('./server') already loaded at the top of this file), not a
+    // pristine configWith() re-require. The hermetic block used to set
+    // WA_DATA_DIR to '', which falls back to ROOT — every run of this suite
+    // then left a real campaign.json (and warmup.json) in the checkout root,
+    // and running the suite in the owner's actual checkout would silently
+    // overwrite their live campaign state.
+    const { FILES, ROOT } = require('./src/config');
+    assert.ok(!FILES.campaign.startsWith(ROOT), 'campaign.json must land in a throwaway dir during tests, not the checkout');
+    assert.ok(!FILES.warmup.startsWith(ROOT), 'warmup.json must land in a throwaway dir during tests, not the checkout');
   });
 
   test('every Meta call has a timeout, and byte transfers get longer than JSON calls', () => {
