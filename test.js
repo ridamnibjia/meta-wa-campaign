@@ -9846,6 +9846,18 @@ test('README documents only a deployment the session cookie can actually authent
   assert.match(md, /\bWA_DATA_DIR\b/, 'the data directory env var must be documented for anyone running this outside the repo root, e.g. the Docker volume');
   assert.match(md, /docker compose up/, 'the Docker deployment path needs its own instructions now that the Dockerfile and compose file exist');
 });
+test('the DigitalOcean droplet option publishes on loopback only, same as the Docker option above it', () => {
+  const md = fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8');
+  const start = md.indexOf('### Option C: DigitalOcean Droplet');
+  const section = md.slice(start, md.indexOf('### Option D', start));
+  assert.doesNotMatch(section, /-p 3002:3000/,
+    'publishing on every interface with no proxy or tunnel in front is exactly what the loopback default (Docker, BIND_HOST) exists to close');
+  assert.doesNotMatch(section, /ufw allow 3002/,
+    'a firewall rule for a port bound to loopback only exposes it to nothing and just contradicts the line above it');
+  assert.match(section, /-p 127\.0\.0\.1:3002:3000/, 'bound to loopback, same as docker-compose.yml');
+  assert.match(section, /reverse proxy|Cloudflare Tunnel/i,
+    'a loopback-only port needs something in front of it for a public URL, or the droplet is unreachable and the option is useless');
+});
 test('the tracked backup scripts carry no hosting username', () => {
   const read = f => fsx.readFileSync(pathx.join(__dirname, f), 'utf8');
   assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service'), /\/home\/[a-z]/,
