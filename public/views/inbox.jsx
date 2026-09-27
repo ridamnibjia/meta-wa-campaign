@@ -465,10 +465,21 @@ function Thread({ waId, onBack }) {
       const ids = new Set(cur.messages.map(m => m.id));
       if (!fresh.messages.some(m => ids.has(m.id))) { load(); return cur; }
       const freshById = new Map(fresh.messages.map(m => [m.id, m]));
+      // The oldest timestamp this fetch actually covers (messages come back
+      // oldest-first). A cur entry at or after it would have been IN `fresh`
+      // if it were still visible, so its absence means the server just hid
+      // it — VISIBLE excludes an outbound reply the instant a delayed status
+      // turns it 'failed', and applyStatus restamps threads.last_at for
+      // exactly that transition, which is what fires this refresh. A cur
+      // entry OLDER than the range is simply outside what this fetch asked
+      // for — merges only ever grow `cur.messages` past one page's worth —
+      // and must survive being merely absent from it.
+      const rangeStart = fresh.messages[0]?.at ?? -Infinity;
+      const kept = cur.messages.filter(m => m.at < rangeStart || freshById.has(m.id));
       // Entries already on screen pick up their fresher copy too — a status
       // moving sent → delivered → read on a bubble already rendered — and
       // anything in the fresh page that was not here yet is appended after it.
-      const updated = cur.messages.map(m => freshById.get(m.id) || m);
+      const updated = kept.map(m => freshById.get(m.id) || m);
       const merged  = [...updated, ...fresh.messages.filter(m => !ids.has(m.id))];
       return { ...fresh, messages: merged, nextBefore: cur.nextBefore, hasMore: cur.hasMore };
     })).catch(() => {});
