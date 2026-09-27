@@ -403,6 +403,11 @@ function Campaign() {
   const [dir,      setDir]      = useState(null);
   const [staging,  setStaging]  = useState(false);
   const [writing,  setWriting]  = useState(false);
+  // The C4 lock sentence from a submit that succeeded on Meta but was not
+  // adopted — a campaign elsewhere is sending a different template. Distinct
+  // from compose.errors: that list is Meta saying no to the submission
+  // itself, and this is Meta saying yes while the picker says not yet.
+  const [templateNotice, setTemplateNotice] = useState(null);
   const [starting, setStarting] = useState(false);
   const [deleting, setDeleting] = useState(null);   // template name pending confirmation
   const [test, setTest] = useState({ to: '', sending: false, results: null });
@@ -495,6 +500,7 @@ function Campaign() {
   // ── Actions ─────────────────────────────────────────────────────
   const submitTemplate = async () => {
     setCompose(c => ({ ...c, submitting: true, errors: [] }));
+    setTemplateNotice(null);
     const r = await api.post('/api/template/create', {
       displayName: compose.displayName, bodyText: compose.bodyText, footerText: compose.footerText,
       sampleValues: compose.sampleValues, addOptOut: compose.addOptOut,
@@ -505,6 +511,20 @@ function Campaign() {
       headerAssetId: compose.headerAssetId,
       buttons:       compose.buttons,
     }).catch(() => ({ ok: false, errors: ['Network error — is the server running?'] }));
+    // adopted:false is the ONE branch that uses a singular `error` rather than
+    // an `errors` array, and it is not a rejection: Meta accepted the
+    // template (it is saved and under review), it just was not SELECTED
+    // because a campaign is sending a different one right now. Reading
+    // `r.errors` here fell through to "Unknown error" about a submission
+    // that had, in fact, gone through — the compose form's error list is for
+    // Meta saying no, not for this.
+    if (r.adopted === false) {
+      setCompose(c => ({ ...c, submitting: false, errors: [] }));
+      setWriting(false);
+      setTemplateNotice(r.error);
+      await loadTemplates();   // list refreshed; selection left alone on purpose
+      return;
+    }
     setCompose(c => ({ ...c, submitting: false, errors: r.ok ? [] : (r.errors || ['Unknown error']) }));
     // Both the name AND the language just submitted — a create that adds a
     // second language to an existing name must adopt THAT variant, not
@@ -558,8 +578,18 @@ function Campaign() {
       setStarting(false);
     }
   };
-  const doPause  = () => api.post('/api/pause');
-  const doResume = () => api.post('/api/resume');
+  const doPause  = async () => {
+    const r = await api.post('/api/pause').catch(() => ({ ok: false, error: 'Network error — nothing was paused' }));
+    if (!r.ok) alert(r.error);
+  };
+  // /api/resume refuses a loop-owned pause (daily cap, quiet hours, a halt the
+  // operator has not fixed yet) with a sentence naming why — fire-and-forget
+  // silently dropped it, and the operator pressed Resume with nothing to show
+  // they had.
+  const doResume = async () => {
+    const r = await api.post('/api/resume').catch(() => ({ ok: false, error: 'Network error — nothing was resumed' }));
+    if (!r.ok) alert(r.error);
+  };
   const doStop   = async () => {
     if (!confirm(isWaiting
       ? `Stop the campaign? ${num(ss.retrying || 0)} contact(s) are waiting on a retry — stopping leaves them un-messaged, listed in the report below.`
@@ -777,6 +807,12 @@ function Campaign() {
 
               {tmplErr && <Alert variant="destructive" title="Could not load templates">{tmplErr}</Alert>}
               {tmplLockMsg && <Alert variant="destructive" title="Could not switch templates">{tmplLockMsg}</Alert>}
+              {/* Not a rejection — Meta accepted this one. warning, not
+                  destructive, and the title says so before the verbatim
+                  server sentence explains why it was not picked. */}
+              {templateNotice && (
+                <Alert variant="warning" title="Submitted for review — not selected yet">{templateNotice}</Alert>
+              )}
               {active?.rejectedReason && <Alert variant="destructive" title="Rejected by Meta">{active.rejectedReason}</Alert>}
 
               {vars.length > 0 && (
@@ -810,7 +846,7 @@ function Campaign() {
               <Preview body={active?.bodyText} optOut={(active?.buttons || []).length > 0}
                        sample={sampleName} values={previewValues} header={activeHeader} />
 
-              <Button variant="outline" size="sm" onClick={() => setWriting(true)}>+ Write a new template instead</Button>
+              <Button variant="outline" size="sm" onClick={() => { setWriting(true); setTemplateNotice(null); }}>+ Write a new template instead</Button>
             </>
           ) : (
             <>
