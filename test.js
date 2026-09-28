@@ -78,12 +78,31 @@ Object.assign(process.env, {
 //    response header) stops undici from ever pooling the socket in the first
 //    place — closing (2) at the source rather than racing to clean up after
 //    it like (1) does.
+// 3. (1) and (2) stop a socket being reused, but every call site below still
+//    fires close() in a `finally` and never awaits it — the callback form
+//    exists, the call sites just do not pass it. That leaves the NEXT test's
+//    listen(0) free to start, and get its first request ANSWERED, while this
+//    server is still mid-teardown: closeAllConnections() makes that fast, but
+//    "fast" is still an async hop or two, not zero. A listen(0) landing in
+//    that gap has been seen to come back EADDRINUSE-free and then, on its
+//    very first request, get a "fetch failed", a body that is not this app's
+//    JSON, or headers this route never sets — each chased as that test's own
+//    bug and each actually the PREVIOUS server, not gone yet. __pendingCloses
+//    counts every close() this override has started; testAsync waits for it
+//    to reach zero before the next test's body runs, so two ad-hoc servers'
+//    lifetimes can no longer overlap at all.
 //
 // Patched once here, on the http module every createServer call below shares
 // — rather than editing every one of the dozens of individual test-server
 // call sites — and covers server.js's own singleton (required next; torn down
 // via io.close(), which closes this same instance) for free, installed before
 // requiring ./server for exactly that reason.
+let __pendingCloses = 0;
+function __drainServerCloses() {
+  return new Promise(resolve => {
+    (function poll() { __pendingCloses > 0 ? setTimeout(poll, 5) : resolve(); })();
+  });
+}
 {
   const http = require('http');
   const realCreateServer = http.createServer.bind(http);
@@ -106,7 +125,13 @@ Object.assign(process.env, {
     // defense in depth alongside Connection: close above, not a duplicate of
     // it: this covers a socket that never got to send a response at all (a
     // request still in flight when a test's finally block runs).
-    srv.close = (...closeArgs) => { srv.closeAllConnections(); return realClose(...closeArgs); };
+    srv.close = (...closeArgs) => {
+      srv.closeAllConnections();
+      __pendingCloses++;
+      const cb = closeArgs[closeArgs.length - 1];
+      const done = () => { __pendingCloses--; if (typeof cb === 'function') cb(); };
+      return typeof cb === 'function' ? realClose(...closeArgs.slice(0, -1), done) : realClose(done);
+    };
     return srv;
   };
 }
@@ -162,7 +187,9 @@ const pending = [];
 // the previous test's assertions AND cleanup to settle.
 let chain = Promise.resolve();
 const testAsync = (name, fn) => {
-  const p = chain.then(() => fn())
+  // Wait out any earlier test's still-closing server BEFORE this test's own
+  // listen(0) can land in that gap — see __pendingCloses above.
+  const p = chain.then(() => __drainServerCloses()).then(() => fn())
     .then(() => { passed++; console.log(`  ok   ${name}`); })
     .catch(e => { console.error(`  FAIL ${name}\n       ${e.message}`); process.exitCode = 1; });
   chain = p;
