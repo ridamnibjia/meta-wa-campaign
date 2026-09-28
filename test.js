@@ -13,6 +13,19 @@ process.env.WA_UPLOAD_DIR = require('path').join(
 process.env.WA_MEDIA_DIR = require('path').join(
   require('os').tmpdir(), `wa-media-${process.pid}-${Date.now()}`);
 
+// Runtime state — campaign.json, warmup.json, opt-outs.json, inbox.json,
+// msg-index.json — goes to a throwaway directory too, for the same reason as
+// the two stores above. WA_DATA_DIR used to be blanked below (Object.assign),
+// which falls back to ROOT (src/config.js): every run of this suite left a
+// live campaign.json in the checkout, and running it in the owner's real
+// checkout would silently overwrite their actual campaign state. Unlike the
+// two stores above, store.js's writeJSON does not mkdir its target, and
+// several tests below write FILES.campaign/warmup directly — so the
+// directory has to exist before ./server (and its config) loads.
+process.env.WA_DATA_DIR = require('path').join(
+  require('os').tmpdir(), `wa-data-${process.pid}-${Date.now()}`);
+require('fs').mkdirSync(process.env.WA_DATA_DIR, { recursive: true });
+
 // The free-space floor defaults to 2 GB, which makes every media test a
 // referendum on how full the developer's laptop is. The floor is exercised
 // deliberately, in its own test, by raising it — so the default here is zero.
@@ -35,8 +48,68 @@ Object.assign(process.env, {
   ACCESS_TOKEN: 'test-token', PHONE_NUMBER_ID: 'test-phone',
   WABA_ID: '', BUSINESS_ID: '', APP_ID: '', APP_SECRET: '', APP_PASSWORD: '',
   WEBHOOK_VERIFY_TOKEN: '', CLAMAV_ADDRESS: '', FRONTEND_URL: '',
-  WA_DATA_DIR: '', BIND_HOST: '', RENDER: '',
+  BIND_HOST: '', RENDER: '',
 });
+
+// Dozens of tests below (and server.js's own singleton, required next) spin up
+// a real HTTP server with http.createServer(...).listen(0, …) and tear it down
+// with a bare server.close(). Two separate ways that lets a LATER test's
+// listen(0) inherit a connection an EARLIER, already-closed server's client
+// (Node's global fetch, i.e. undici) still considers good, once the OS
+// recycles the ephemeral port — with ~20 such servers created and closed
+// across one `npm test` run, that recycling happens often enough to matter:
+//
+// 1. server.close() stops accepting NEW connections but leaves already-open
+//    (idle keep-alive) sockets running until the OTHER side gives them up.
+//    closeAllConnections() (Node >=18.2, within this app's >=22.5 floor)
+//    forces every socket a server holds shut immediately on close, so there
+//    is nothing already-open left for a later test to find.
+// 2. Even with (1), undici still POOLS a keep-alive connection the moment a
+//    response finishes without saying otherwise — so a socket opened and
+//    used by test A can sit in the pool, unused but not yet closed, for the
+//    entire gap until test A's teardown runs. A later test B whose server
+//    happens to reuse that port before undici has noticed the old socket is
+//    gone can have its fetch() reuse it, landing on whatever test A's server
+//    (or nothing at all) answers with instead of test B's own server — this
+//    is what produced a real 200 where a password-gated route must answer
+//    401, on a test that has nothing to do with authentication itself.
+//    Telling every response `Connection: close` (Node caps 'connection' on
+//    the REQUEST as a forbidden fetch header, so this has to be the SERVER's
+//    response header) stops undici from ever pooling the socket in the first
+//    place — closing (2) at the source rather than racing to clean up after
+//    it like (1) does.
+//
+// Patched once here, on the http module every createServer call below shares
+// — rather than editing every one of the dozens of individual test-server
+// call sites — and covers server.js's own singleton (required next; torn down
+// via io.close(), which closes this same instance) for free, installed before
+// requiring ./server for exactly that reason.
+{
+  const http = require('http');
+  const realCreateServer = http.createServer.bind(http);
+  http.createServer = (...args) => {
+    // http.createServer([options], [requestListener]) — every call site below
+    // passes exactly one function (an Express app or a raw handler). Popped
+    // off and re-attached as a SECOND 'request' listener, after our own: both
+    // fire for every request (http.Server's requestListener is just its first
+    // 'request' listener), in registration order, so ours setting the header
+    // always runs before the real handler has a chance to already have sent
+    // one — a route that answers synchronously will otherwise have flushed
+    // its headers before a listener added after it could touch them.
+    const listener = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+    const srv = realCreateServer(...args);
+    srv.on('request', (req, res) => res.setHeader('Connection', 'close'));
+    if (listener) srv.on('request', listener);
+    const realClose = srv.close.bind(srv);
+    // closeAllConnections() is a no-op when nothing is open, so it is always
+    // safe to call before close() rather than only when something might be —
+    // defense in depth alongside Connection: close above, not a duplicate of
+    // it: this covers a socket that never got to send a response at all (a
+    // request still in flight when a test's finally block runs).
+    srv.close = (...closeArgs) => { srv.closeAllConnections(); return realClose(...closeArgs); };
+    return srv;
+  };
+}
 
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
@@ -1770,6 +1843,35 @@ test('a status that beats its own send is applied when the send is recorded', ()
     'an early status that is not a failure is applied quietly — there is nothing to retry');
   assert.equal(statusOf('wamid.EARLY-SENT').status, 'sent');
 });
+// The hold keeps one entry PER STATUS VALUE, not one per wamid (onUnknownStatus
+// above) — a send that raced two DIFFERENT statuses before this server had
+// recorded it at all has to replay both, in arrival order, when recordOutbound
+// finally claims them. Nothing above isolates this: every race test so far
+// holds exactly one status ahead of the row.
+test('two different statuses held for one wamid are both replayed, in order', () => {
+  const runId = newRunRow('race-multi');
+  applyStatus({ id: 'wamid.RACE2', status: 'sent' });
+  applyStatus({ id: 'wamid.RACE2', status: 'failed', errors: [{ code: 131049, title: 'x' }] });
+  assert.equal(statusOf('wamid.RACE2'), undefined, 'still nothing to update — the send has not been recorded');
+
+  const f = recordOutbound({ wamid: 'wamid.RACE2', waId: '919000004305', name: 'Asha', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE2').status, 'failed',
+    'both held statuses are replayed in arrival order — sent, then the failure that followed it');
+  assert.deepEqual(f, { failed: true, waId: '919000004305', runId, wamid: 'wamid.RACE2', code: 131049, title: 'x' },
+    'the descriptor from the SECOND held status is still handed back, so the ladder sees the failure');
+});
+test('a held failure survives a stale held status that arrived after it', () => {
+  const runId = newRunRow('race-stale');
+  applyStatus({ id: 'wamid.RACE3', status: 'failed', errors: [{ code: 131049, title: 'x' }] });
+  applyStatus({ id: 'wamid.RACE3', status: 'delivered' });      // Meta redelivers and promises no order
+  assert.equal(statusOf('wamid.RACE3'), undefined);
+
+  const f = recordOutbound({ wamid: 'wamid.RACE3', waId: '919000004306', name: 'Rahul', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE3').status, 'failed',
+    'a device cannot un-receive a message — the stale held "delivered" must not overwrite the failure');
+  assert.deepEqual(f, { failed: true, waId: '919000004306', runId, wamid: 'wamid.RACE3', code: 131049, title: 'x' },
+    'claimHeld must not let the later no-op status (the || in its loop) erase the earlier failure descriptor');
+});
 test('the early-status hold is bounded — statuses nobody claims cannot grow it forever', () => {
   // Another tool sending from the same number produces a status for every
   // message it sends, and none of them will ever be claimed. The hold keeps the
@@ -2220,6 +2322,19 @@ console.log('\nconfig — where the app listens and where it writes');
     assert.equal(boxed.PUBLIC_DIR, pathx.join(boxed.ROOT, 'public'), 'the code the app serves does not move');
   });
 
+  test('the suite itself writes state files outside the checkout, not just when boxed', () => {
+    // This checks the LIVE config the whole suite runs against (the module
+    // require('./server') already loaded at the top of this file), not a
+    // pristine configWith() re-require. The hermetic block used to set
+    // WA_DATA_DIR to '', which falls back to ROOT — every run of this suite
+    // then left a real campaign.json (and warmup.json) in the checkout root,
+    // and running the suite in the owner's actual checkout would silently
+    // overwrite their live campaign state.
+    const { FILES, ROOT } = require('./src/config');
+    assert.ok(!FILES.campaign.startsWith(ROOT), 'campaign.json must land in a throwaway dir during tests, not the checkout');
+    assert.ok(!FILES.warmup.startsWith(ROOT), 'warmup.json must land in a throwaway dir during tests, not the checkout');
+  });
+
   test('every Meta call has a timeout, and byte transfers get longer than JSON calls', () => {
     const { TIMEOUTS } = require('./src/config');
     assert.ok(TIMEOUTS.graphMs > 0 && TIMEOUTS.graphMs <= 60_000,
@@ -2604,7 +2719,17 @@ console.log('\nmedia — saveUpload');
     try {
       const again = saveUpload(file(bytes, 'legit2-copy.pdf', 'application/pdf'));
       assert.equal(again.ok, false, 'reviving through a corrupted row must refuse, not write through it');
-      assert.match(again.error, /outside the uploads directory/);
+      // Not escapedMsg's sentence: its remedy — "delete it from the Storage
+      // page and upload the file again" — is impossible for a TOMBSTONED row.
+      // deleteAsset refuses outright once deleted_at is set (line ~287) and
+      // listAssets() does not even show a tombstone to click delete on, so
+      // that sentence sends the operator looking for a button that does not
+      // exist. A row this corrupted cannot be repaired by re-uploading either
+      // — only a different file gets them unstuck.
+      assert.doesNotMatch(again.error, /delete it from the Storage page/,
+        'that remedy does not exist for a tombstoned row — the Storage page offers no delete for one');
+      assert.match(again.error, /corrupted/i, 'still names the row as the problem, not the file');
+      assert.match(again.error, /pick a different file|pick another/i, 'and points at the one thing the operator actually can do');
       assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched-2',
         'the revive write must never reach a path the row does not legitimately own');
     } finally { fsx.unlinkSync(outside); }
@@ -4018,11 +4143,13 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   //
   // atTheRung puts the ladder on a fresh day at the smallest rung above what this
   // shared database has already sent inside the last 24 hours, then fills the
-  // window to exactly that rung: every seat an hour old except the last, which
-  // is sent at `lastAt` — so the test decides when the next slot frees. The rows
-  // are removed afterwards; later tests count this window too.
+  // window to exactly that rung: every seat `fillerAge` old except the last,
+  // which is sent at `lastAt` — so the test decides when the next slot frees.
+  // fillerAge defaults to an hour, which is what every call site used before it
+  // became a parameter. The rows are removed afterwards; later tests count this
+  // window too.
   const ROLL_DAY = 86400000;
-  const atTheRung = (lastAt) => {
+  const atTheRung = (lastAt, fillerAge = 3600000) => {
     const already = M.sentSince(Date.now() - ROLL_DAY);
     const k = M.WARMUP_PLAN.findIndex(r => r > already);
     W.enabled = true; S.quality = 'GREEN'; S.config.dailyCap = 0;
@@ -4031,7 +4158,7 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     const wamids = [];
     for (let i = 0; i < M.WARMUP_PLAN[k] - already; i++) {
       const wamid = `rung-seat.${Date.now()}.${i}`;
-      ins.run(wamid, `9190001${String(i).padStart(5, '0')}`, i === 0 ? lastAt : Date.now() - 3600000);
+      ins.run(wamid, `9190001${String(i).padStart(5, '0')}`, i === 0 ? lastAt : Date.now() - fillerAge);
       wamids.push(wamid);
     }
     return { rung: M.WARMUP_PLAN[k], day: k + 1,
@@ -4069,7 +4196,19 @@ console.log('\nrun_recipients — retrying a moment-based failure');
   testAsync('a slot that frees within the minute is waited for silently, then used', async () => {
     let sends = 0, sentAt = null;
     await withLoop(async () => { sentAt = Date.now(); return graphOk(`wamid.rungq.${++sends}`); }, async h => {
-      const seats = atTheRung(Date.now() - ROLL_DAY + 50);     // the last seat leaves in a second
+      // The seat's OWN free time (capCount()'s raw 24h boundary, sentSince's
+      // `at >= now - DAY_MS`) is 24h after its `at`, with no grace — the extra
+      // second only lives in slotFreesAt()'s answer, as the wake deadline. A
+      // margin of 50ms between "seat placed" and that raw boundary used to be
+      // the whole safety net against the real delay before the loop's first
+      // capCount() check — plain JS and in-memory SQLite normally, but under
+      // real CPU/disk contention (seen right after `npm ci`) that gap can run
+      // into the hundreds of ms. Once it beat 50ms the seat had already left
+      // the window by the loop's first look, the cap never appeared full, the
+      // send went out immediately, and `sentAt >= frees` failed — about 1 run
+      // in 17 under load. 700ms is generous against that delay while the total
+      // wait (about 1.7s) is still comfortably "within the minute".
+      const seats = atTheRung(Date.now() - ROLL_DAY + 700);
       const savedLogs = S.logs;
       S.logs = [];
       try {
@@ -4079,8 +4218,11 @@ console.log('\nrun_recipients — retrying a moment-based failure');
         const phases = new Set();
         h.start();
         // Sampled only while the wait lasts: once the send goes out the run is
-        // over and the phase moves on to 'done', as it should.
-        await h.until(() => { if (sends === 0) phases.add(S.phase); return sends > 0; }, 4000);
+        // over and the phase moves on to 'done', as it should. The outer
+        // budget is generous relative to the ~1.7s nominal wait for the same
+        // reason the margin above is — headroom against real timer jitter
+        // under load, not a wait anything here expects to spend in full.
+        await h.until(() => { if (sends === 0) phases.add(S.phase); return sends > 0; }, 8000);
         assert.equal(sends, 1, 'once a contact has left the window, the slot is used');
         assert.ok(sentAt >= frees, 'and not before — the ceiling held until then');
         assert.deepEqual([...phases], ['running'], 'a wait this short is slept silently — no pause flashed on screen');
@@ -4104,8 +4246,19 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       if (String(url).includes('quality_rating')) return qualityIs('GREEN')(url);
       return graphOk(`wamid.rungday.${++sends}`);
     }, async h => {
-      const seats = atTheRung(realNow() - 3600000);       // every seat an hour old: the first frees in 23 hours
+      // Every seat sent at real `now`, not an hour ago: the earliest a fresh
+      // seat can free is a full 24h + 1s away, which nextIstMidnight() (at
+      // most a day plus its own two-minute slack away) is all but guaranteed
+      // to beat. Seats an hour old used to make the seat free in 23 hours —
+      // between roughly 00:00 and 01:02 IST that is EARLIER than midnight, so
+      // the test silently exercised the seat wake below instead of the
+      // midnight wake it exists to prove. The precondition assertion right
+      // after is the net for the sliver of time (the ~two minutes right after
+      // midnight) this still cannot rule out by construction alone.
+      const seats = atTheRung(realNow(), 0);
       try {
+        assert.ok(M.nextIstMidnight() < M.slotFreesAt(),
+          'precondition: midnight must be the earlier of the two, or this test is not exercising the midnight wake it is named for');
         h.stage([{ dialStr: '919000038001', name: 'Rahul' }], 'rung-midnight');
         h.start();
         await h.until(() => S.phase === 'paused');
@@ -4227,6 +4380,25 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       assert.ok(Date.now() - t0 < 1000, `answered in ${Date.now() - t0} ms — a Stop must not wait out Meta`);
       assert.equal(S.quality, 'GREEN', 'an answer nobody waited for is not adopted');
     } finally { M.flags.stopFlag = false; global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  // A Pause is not a Stop: it is resumable, and the whole point of asking Meta
+  // again at a cap-park wake is to have the freshest rating ready for when
+  // Resume derives the next day's rung. Giving up on a Pause exactly like a
+  // Stop dropped a late RED on the floor — S.quality stayed at whatever it was
+  // before the Pause, and Resume could then climb a rung on a stale GREEN.
+  testAsync('a Pause during a slow quality re-read still adopts the late answer', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'GREEN';
+    global.fetch = () => new Promise(r => setTimeout(() => r({ ok: true,
+      json: async () => ({ quality_rating: 'RED' }) }), 200));
+    try {
+      const refreshing = M.refreshQuality();
+      setTimeout(() => { M.flags.pauseFlag = true; }, 50);
+      await refreshing;
+      assert.equal(S.quality, 'RED',
+        'only Stop may abandon the re-read — a Pause must still let the answer land so Resume sees it');
+    } finally { M.flags.pauseFlag = false; global.fetch = saved.fetch; S.quality = saved.quality; }
   });
 
   // The wake itself, through the real loop: parked on your own cap until IST
@@ -5372,6 +5544,35 @@ console.log('\nwebhook ingest — what an envelope means');
       assert.ok(heard.some(h => h.event === 'log' && /quality rating/i.test(h.payload.msg)
                                 && /network down/.test(h.payload.msg)),
         'and the failure is said out loud, not swallowed');
+    } finally {
+      global.fetch = saved.fetch; S.quality = saved.quality;
+      CFG.accessToken = saved.token; CFG.phoneNumberId = saved.phone;
+    }
+  });
+
+  // fetchAccountInfo() maps a missing rating to the string 'UNKNOWN' (so the
+  // account screen has something to show) — which is truthy, so assigning
+  // S.quality directly from a successful-but-ratingless re-read overwrote a
+  // held RED/YELLOW warm-up hold with a value the ladder does not recognise,
+  // lifting the hold on no evidence the number recovered. adoptQuality is the
+  // one door every other reader of Meta's rating goes through for exactly
+  // this (warmup.js, /start, Settings); this webhook path has to use it too.
+  testAsync('a quality update whose re-read carries no rating does not lift a held RED', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality,
+                    token: CFG.accessToken, phone: CFG.phoneNumberId };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = 'test-phone';
+    try {
+      S.quality = 'RED';
+      // No quality_rating field at all — fetchAccountInfo turns this into 'UNKNOWN'.
+      global.fetch = async () => ({ json: async () => ({ messaging_limit_tier: 'TIER_1K' }) });
+      processEnvelope(envelopeOf('phone_number_quality_update', { event: 'FLAGGED' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'RED', 'UNKNOWN is not evidence the number recovered — the held rung must stay held');
+
+      global.fetch = async () => ({ json: async () => ({ quality_rating: 'YELLOW', messaging_limit_tier: 'TIER_1K' }) });
+      processEnvelope(envelopeOf('phone_number_quality_update', { event: 'DOWNGRADE' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'YELLOW', 'a real rating on the same path is still adopted');
     } finally {
       global.fetch = saved.fetch; S.quality = saved.quality;
       CFG.accessToken = saved.token; CFG.phoneNumberId = saved.phone;
@@ -8773,6 +8974,60 @@ console.log('\na Reset that lands mid-send');
     });
   });
 
+  // The SEND-TIME halt branch (haltsCampaign, right after sendTemplate) had no
+  // guard at all against a Stop or a Pause landing in the same window — unlike
+  // the rate-limit branch just above (B3's M2 fix). A Stop already writes
+  // S.phase='idle'/S.pauseReason=null synchronously in the route, before this
+  // send even resolves; overwriting that with 'paused' and a halt reason, then
+  // persisting it with saveCampaignNow(), leaves a crash in the gap before the
+  // loop's own stopFlag check runs again free to resurrect a campaign the
+  // operator stopped. The loop's own flag check owns what happens next — Stop
+  // exits idle on its very next iteration — so this branch must defer to it
+  // rather than writing an answer of its own.
+  testAsync('a Stop landing during a halting send is not painted over as a resumable pause', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      await callRoute('post', '/stop');                    // lands while this send is still in flight
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags } = h.M;
+      h.stage([{ dialStr: '919000034101', name: 'Asha' }], 'halt-during-stop');
+      h.start();
+      await h.until(() => !flags.running);
+      assert.equal(s.phase, 'idle', 'a Stop is final — a halt landing after it must not repaint it as paused');
+      assert.equal(s.pauseReason, null, 'nothing here may leave a stale halt reason behind an already-stopped run');
+      assert.equal(flags.pauseFlag, false, 'the halt branch must not turn a stopped run into one Resume could lift');
+      assert.equal(sends, 1, 'the loop must not keep sending after a Stop landed mid-send');
+      assert.ok(!s.logs.some(l => /190/.test(l.msg) && /paused, nobody was skipped/.test(l.msg)),
+        'the halt must not be announced as a fresh park once the campaign is already stopping');
+    });
+  });
+
+  // Same race, the operator's own Pause instead of a Stop. USER_PAUSE is what
+  // tells resumeIfInterrupted this pause is the operator's to lift, not one the
+  // loop gave itself — overwriting it with the halt reason silently turned an
+  // operator Pause into one the next boot auto-resumes on its own.
+  testAsync('a Pause landing during a halting send keeps USER_PAUSE, not the halt reason', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      await callRoute('post', '/pause');                   // lands while this send is still in flight
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags, USER_PAUSE: up } = h.M;
+      h.stage([{ dialStr: '919000034111', name: 'Rahul' }], 'halt-during-pause');
+      h.start();
+      await h.until(() => sends === 1 && s.logs.some(l => /190/.test(l.msg)));
+      assert.equal(s.pauseReason, up, 'the operator\'s own Pause must not be overwritten by the halt reason');
+      assert.equal(s.phase, 'paused');
+      assert.equal(flags.pauseFlag, true, 'still set, so Resume is theirs to press');
+      assert.equal(sends, 1, 'the fault must not be probed again while the operator\'s pause holds');
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused by the operator/.test(l.msg)),
+        'the fault is still said out loud in one line, even though the pause stays the operator\'s');
+    });
+  });
+
   // ── An account-level fault must pause the campaign, not burn the list ───────
   // Every send after an expired token / paused template / billing hold fails
   // identically. The loop used to write that identical failure once per contact
@@ -9660,6 +9915,18 @@ test('README documents only a deployment the session cookie can actually authent
   assert.match(md, /\bBIND_HOST\b/, 'the bind-host env var must be documented now that Docker and Render both set it differently than the 127.0.0.1 default');
   assert.match(md, /\bWA_DATA_DIR\b/, 'the data directory env var must be documented for anyone running this outside the repo root, e.g. the Docker volume');
   assert.match(md, /docker compose up/, 'the Docker deployment path needs its own instructions now that the Dockerfile and compose file exist');
+});
+test('the DigitalOcean droplet option publishes on loopback only, same as the Docker option above it', () => {
+  const md = fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8');
+  const start = md.indexOf('### Option C: DigitalOcean Droplet');
+  const section = md.slice(start, md.indexOf('### Option D', start));
+  assert.doesNotMatch(section, /-p 3002:3000/,
+    'publishing on every interface with no proxy or tunnel in front is exactly what the loopback default (Docker, BIND_HOST) exists to close');
+  assert.doesNotMatch(section, /ufw allow 3002/,
+    'a firewall rule for a port bound to loopback only exposes it to nothing and just contradicts the line above it');
+  assert.match(section, /-p 127\.0\.0\.1:3002:3000/, 'bound to loopback, same as docker-compose.yml');
+  assert.match(section, /reverse proxy|Cloudflare Tunnel/i,
+    'a loopback-only port needs something in front of it for a public URL, or the droplet is unreachable and the option is useless');
 });
 test('the tracked backup scripts carry no hosting username', () => {
   const read = f => fsx.readFileSync(pathx.join(__dirname, f), 'utf8');

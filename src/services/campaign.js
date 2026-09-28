@@ -542,17 +542,22 @@ async function sleepUntil(at) {
 // (adoptQuality). fetchAccountInfo resolves { error } for a Graph refusal and
 // rejects on a network one (or its timeout); both are said.
 //
-// Raced against the loop's own flags, in slices like sleepUntil: the Graph call
-// can take up to TIMEOUTS.graphMs to give up, flags.running stays true while it
-// does, and campaignBlocker() refuses every Start and upload for that long — so
-// a Stop or a Pause pressed while Meta is slow is answered within the slice,
-// not after the timeout. The abandoned request ends on its own timeout, and its
-// answer is not used.
+// Raced against flags.stopFlag ONLY, not pauseFlag: a Stop ends the campaign,
+// so waiting out Meta's timeout just to throw the answer away would hold
+// flags.running (and campaignBlocker()'s refusal of every Start and upload)
+// for no reason — that race is answered within a second, the abandoned
+// request ends on its own timeout, and its answer is not used. A Pause is
+// resumable, and this call exists so the RUNG Resume derives is based on the
+// freshest rating available; racing pauseFlag too used to abandon the same
+// way a Stop does, so a RED that arrived a moment after Pause was pressed
+// never reached S.quality, and Resume then climbed a rung on the stale
+// pre-pause rating. Letting the read finish costs at most TIMEOUTS.graphMs
+// of the pause the operator already asked for.
 async function refreshQuality() {
   const keep = () => `Keeping the last rating (${S.quality ?? 'none yet'}).`;
   let settled = false;
   const interrupted = (async () => {
-    while (!settled && !flags.stopFlag && !flags.pauseFlag) await sleep(100);
+    while (!settled && !flags.stopFlag) await sleep(100);
     return { interrupted: true };
   })();
   try {
@@ -864,6 +869,30 @@ async function campaignLoop() {
     // skipDisposition, and deliberately not every 'fix' code: a bad CSV value
     // is one row's problem and must not stop the other nine hundred.
     if (!result.ok && haltsCampaign(result.errorCode)) {
+      // A Stop or the operator's own Pause can already have landed while this
+      // send was in flight — both routes write S.phase/S.pauseReason
+      // synchronously, so painting over either here is a real bug, not just
+      // untidy. Over a Stop (already idle, pauseReason already null) it would
+      // repaint 'paused' and persist it with saveCampaignNow(): a crash in the
+      // gap before the loop's own stopFlag check runs again on the very next
+      // iteration would leave that paused state on disk, and
+      // resumeIfInterrupted would resurrect a campaign the operator stopped.
+      // Same class as the rate-limit branch's own M2 fix below: the loop's
+      // flag check owns what happens next, so this branch defers to it rather
+      // than writing an answer of its own.
+      if (flags.stopFlag) continue;
+      // The operator's own Pause landed first (USER_PAUSE, set synchronously
+      // by /api/pause) while this send was still in flight. Overwriting it
+      // with the halt reason turned USER_PAUSE into a reason
+      // resumeIfInterrupted treats as one the LOOP gave itself — silently
+      // auto-resuming, on the next boot, a campaign the operator asked to stay
+      // paused. The fault is still worth knowing about, so it is logged as one
+      // line without touching pauseReason.
+      if (S.pauseReason === USER_PAUSE) {
+        log('warn', `${n} [${result.errorCode}] ${result.error}${result.hint ? ` — ${result.hint}` : ''}`
+          + ' — already paused by the operator, not overwritten.');
+        continue;
+      }
       flags.pauseFlag = true;
       S.phase = 'paused';
       S.pauseReason = `Campaign paused — ${result.hint || result.error} [${result.errorCode}]`;

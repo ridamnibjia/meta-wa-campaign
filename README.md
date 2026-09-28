@@ -910,23 +910,25 @@ ssh root@YOUR_DROPLET_IP
 mkdir -p /opt/meta-wa && cd /opt/meta-wa
 git clone https://github.com/YOUR_USERNAME/meta-wa-campaign .
 cp .env.example .env && nano .env    # fill in token + phone number ID
-ufw allow 3002/tcp
 docker build -t meta-wa-img .
-docker run -d --name meta-wa -p 3002:3000 --env-file .env --restart unless-stopped meta-wa-img
-# Visit: http://YOUR_DROPLET_IP:3002
+docker run -d --name meta-wa -p 127.0.0.1:3002:3000 --env-file .env --restart unless-stopped meta-wa-img
 ```
+
+Loopback only, same as `docker-compose.yml` (Docker, above) — no `ufw allow` here,
+since nothing outside the droplet can reach it yet. Put a reverse proxy (Caddy or
+nginx with TLS) or a Cloudflare Tunnel (Option B) in front for a public URL.
 
 **Updating:**
 ```bash
 cd /opt/meta-wa && git pull
 docker stop meta-wa && docker rm meta-wa
-docker build -t meta-wa-img . && docker run -d --name meta-wa -p 3002:3000 --env-file .env --restart unless-stopped meta-wa-img
+docker build -t meta-wa-img . && docker run -d --name meta-wa -p 127.0.0.1:3002:3000 --env-file .env --restart unless-stopped meta-wa-img
 ```
 
 **Full cleanup:**
 ```bash
 docker stop meta-wa && docker rm meta-wa && docker rmi meta-wa-img
-rm -rf /opt/meta-wa && ufw delete allow 3002/tcp
+rm -rf /opt/meta-wa
 ```
 
 ---
