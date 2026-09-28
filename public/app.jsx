@@ -193,12 +193,18 @@ function App() {
   // name" silently sent the wrong body to every contact on a run started in
   // the other language.
   const [pickedLang, setPickedLang] = useState('');
-  // Mirrors pickedLang for loadTemplates below, which must stay a stable
-  // (deps-`[]`) callback — it is itself a dependency of the initial-load
-  // effect, and giving it pickedLang as a dependency would re-run that whole
-  // effect (re-fetching account info, fail log, the inbox list) on every
-  // template pick. A ref reads the latest value with no such dependency.
+  // Mirror `picked`/`pickedLang` for loadTemplates below, which must stay a
+  // stable (deps-`[]`) callback — it is itself a dependency of the
+  // initial-load effect, and giving it either as a dependency would re-run
+  // that whole effect (re-fetching account info, fail log, the inbox list)
+  // on every template pick. Refs read the latest value with no dependency,
+  // and — unlike reading `picked` via `setPicked(cur => ...)` — without
+  // needing a second setState call nested inside that updater: an updater
+  // function must be pure, and `setPickedLang(...)` from inside one is a
+  // side effect React does not promise to run exactly once.
+  const pickedRef = useRef('');
   const pickedLangRef = useRef('');
+  useEffect(() => { pickedRef.current = picked; }, [picked]);
   useEffect(() => { pickedLangRef.current = pickedLang; }, [pickedLang]);
   const [params,   setParams]   = useState([]);
   const [tmplErr,  setTmplErr]  = useState(null);
@@ -277,22 +283,24 @@ function App() {
     if (r.error) { setTmplErr(r.error); return; }
     setTmplErr(null);
     setTemplates(r.templates);
-    setPicked(cur => {
-      const wantName = preferName || cur;
-      // A caller that names no language (the 15s poll, the socket refresh)
-      // means "keep what is on screen" — pickedLangRef.current — not "any
-      // language", which would silently switch a deliberately-picked variant
-      // back to whichever one happens to sort first under this name.
-      const wantLang = preferLang !== undefined ? preferLang : pickedLangRef.current;
-      // Exact name+language first; a name match under any OTHER language next
-      // (keeps the selection alive when the preferred language is not the one
-      // on screen); the previous default — first approved, else first — last.
-      const t = (wantName && r.templates.find(x => x.name === wantName && x.language === wantLang))
-             || (wantName && r.templates.find(x => x.name === wantName))
-             || r.templates.find(x => x.status === 'APPROVED') || r.templates[0] || null;
-      setPickedLang(t?.language || '');
-      return t?.name || '';
-    });
+    const wantName = preferName || pickedRef.current;
+    // A caller that names no language (the 15s poll, the socket refresh)
+    // means "keep what is on screen" — pickedLangRef.current — not "any
+    // language", which would silently switch a deliberately-picked variant
+    // back to whichever one happens to sort first under this name.
+    const wantLang = preferLang !== undefined ? preferLang : pickedLangRef.current;
+    // Exact name+language first; a name match under any OTHER language next
+    // (keeps the selection alive when the preferred language is not the one
+    // on screen); the previous default — first approved, else first — last.
+    const t = (wantName && r.templates.find(x => x.name === wantName && x.language === wantLang))
+           || (wantName && r.templates.find(x => x.name === wantName))
+           || r.templates.find(x => x.status === 'APPROVED') || r.templates[0] || null;
+    // Two plain sets, not one nested inside the other's updater: reading
+    // `picked` via `pickedRef` up front means neither call needs to be a
+    // functional update, so neither is a side effect running inside React's
+    // own state-reducer pass for a DIFFERENT hook.
+    setPicked(t?.name || '');
+    setPickedLang(t?.language || '');
   }, []);
 
   useEffect(() => { reloadTmpl.current = loadTemplates; }, [loadTemplates]);
@@ -336,13 +344,21 @@ function App() {
   // right body rather than whichever Graph happened to return first.
   useEffect(() => {
     if (!picked || !session.authed) return;
+    // A quick second pick before the first request resolves put two fetches
+    // in flight; if the FIRST one's response arrived last it overwrote the
+    // second pick's correct lock state with its own stale one. The cleanup
+    // below runs when this effect re-fires (React calls the PREVIOUS run's
+    // cleanup before the new one starts), so a response landing after its own
+    // pick has moved on is dropped rather than applied.
+    let stale = false;
     const q = `name=${encodeURIComponent(picked)}${pickedLang ? `&language=${encodeURIComponent(pickedLang)}` : ''}`;
     // ok:false here is only ever the C4 lock — a campaign sending a different
     // template right now — since every other outcome (found, not found, a
     // fetch error) has no `ok` field at all.
     api.get(`/api/validate-template?${q}`)
-      .then(r => setTmplLockMsg(r && r.ok === false ? r.error : null))
+      .then(r => { if (!stale) setTmplLockMsg(r && r.ok === false ? r.error : null); })
       .catch(() => {});
+    return () => { stale = true; };
   }, [picked, pickedLang, session.authed]);
 
   // Poll Meta while anything in the list is still under review.
