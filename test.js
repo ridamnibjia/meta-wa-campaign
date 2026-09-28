@@ -53,35 +53,59 @@ Object.assign(process.env, {
 
 // Dozens of tests below (and server.js's own singleton, required next) spin up
 // a real HTTP server with http.createServer(...).listen(0, …) and tear it down
-// with a bare server.close(). Plain close() stops accepting NEW connections but
-// leaves already-open (idle keep-alive) sockets running until the OTHER side
-// gives them up — and Node's global fetch (undici) pools one keep-alive
-// connection per origin (host:port). With ~20 such ephemeral servers created
-// and closed across a single `npm test` run, the OS reuses port numbers fast
-// enough that a LATER test's listen(0) can land on a port a lingering socket
-// from an EARLIER, already-closed server still holds, so that later test's
-// fetch() can silently reuse the stale connection — talking to a server that
-// is already gone, or racing its teardown — instead of opening a fresh one.
-// That is what produced two different one-off failures in real-HTTP tests
-// (a webhook signature check and a challenge-echo check) that had nothing to
-// do with either test's own logic. closeAllConnections() (Node >=18.2, well
-// within this app's >=22.5 floor) forces every socket a server holds shut
-// immediately, so nothing is left for the next test to inherit. Patched once
-// here, on the http module every createServer call below shares — rather than
-// editing every one of the dozens of `.close()` call sites individually,
-// which is one thing to get right instead of dozens, and covers server.js's
-// own singleton (torn down via io.close(), which closes this same instance)
-// for free. Installed before requiring ./server, so the singleton created at
-// its module-load time (server.js's `const server = http.createServer(app)`)
-// is wrapped too.
+// with a bare server.close(). Two separate ways that lets a LATER test's
+// listen(0) inherit a connection an EARLIER, already-closed server's client
+// (Node's global fetch, i.e. undici) still considers good, once the OS
+// recycles the ephemeral port — with ~20 such servers created and closed
+// across one `npm test` run, that recycling happens often enough to matter:
+//
+// 1. server.close() stops accepting NEW connections but leaves already-open
+//    (idle keep-alive) sockets running until the OTHER side gives them up.
+//    closeAllConnections() (Node >=18.2, within this app's >=22.5 floor)
+//    forces every socket a server holds shut immediately on close, so there
+//    is nothing already-open left for a later test to find.
+// 2. Even with (1), undici still POOLS a keep-alive connection the moment a
+//    response finishes without saying otherwise — so a socket opened and
+//    used by test A can sit in the pool, unused but not yet closed, for the
+//    entire gap until test A's teardown runs. A later test B whose server
+//    happens to reuse that port before undici has noticed the old socket is
+//    gone can have its fetch() reuse it, landing on whatever test A's server
+//    (or nothing at all) answers with instead of test B's own server — this
+//    is what produced a real 200 where a password-gated route must answer
+//    401, on a test that has nothing to do with authentication itself.
+//    Telling every response `Connection: close` (Node caps 'connection' on
+//    the REQUEST as a forbidden fetch header, so this has to be the SERVER's
+//    response header) stops undici from ever pooling the socket in the first
+//    place — closing (2) at the source rather than racing to clean up after
+//    it like (1) does.
+//
+// Patched once here, on the http module every createServer call below shares
+// — rather than editing every one of the dozens of individual test-server
+// call sites — and covers server.js's own singleton (required next; torn down
+// via io.close(), which closes this same instance) for free, installed before
+// requiring ./server for exactly that reason.
 {
   const http = require('http');
   const realCreateServer = http.createServer.bind(http);
   http.createServer = (...args) => {
+    // http.createServer([options], [requestListener]) — every call site below
+    // passes exactly one function (an Express app or a raw handler). Popped
+    // off and re-attached as a SECOND 'request' listener, after our own: both
+    // fire for every request (http.Server's requestListener is just its first
+    // 'request' listener), in registration order, so ours setting the header
+    // always runs before the real handler has a chance to already have sent
+    // one — a route that answers synchronously will otherwise have flushed
+    // its headers before a listener added after it could touch them.
+    const listener = typeof args[args.length - 1] === 'function' ? args.pop() : null;
     const srv = realCreateServer(...args);
+    srv.on('request', (req, res) => res.setHeader('Connection', 'close'));
+    if (listener) srv.on('request', listener);
     const realClose = srv.close.bind(srv);
     // closeAllConnections() is a no-op when nothing is open, so it is always
-    // safe to call before close() rather than only when something might be.
+    // safe to call before close() rather than only when something might be —
+    // defense in depth alongside Connection: close above, not a duplicate of
+    // it: this covers a socket that never got to send a response at all (a
+    // request still in flight when a test's finally block runs).
     srv.close = (...closeArgs) => { srv.closeAllConnections(); return realClose(...closeArgs); };
     return srv;
   };
