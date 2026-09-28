@@ -9241,7 +9241,15 @@ console.log('\na Reset that lands mid-send');
       const t0 = Date.now();
       await h.until(() => !flags.running);
       assert.equal(flags.running, false);
-      assert.ok(Date.now() - t0 < 1500, 'Stop is answered within a second, not when the throttle lifts');
+      // sleepUntil polls in slices of up to ONE SECOND (campaign.js) — Stop can
+      // land right after a slice starts, so the true worst case is close to
+      // 1000ms before flags.stopFlag is even read again, before any of the
+      // Stop branch's own work (saveCampaignNow, broadcast). 1500ms left under
+      // 500ms of margin over that documented granularity and failed for real
+      // (not just here — under load) about 1 run in 20: flaky on the WAIT, not
+      // on the behaviour. 2500ms keeps this nowhere near "waited for the
+      // throttle" (4h away) while giving the poll loop room to answer.
+      assert.ok(Date.now() - t0 < 2500, 'Stop is answered within a couple of seconds, not when the throttle lifts');
     });
   });
 
