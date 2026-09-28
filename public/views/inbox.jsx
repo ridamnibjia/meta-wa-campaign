@@ -474,8 +474,13 @@ function Thread({ waId, onBack }) {
       // entry OLDER than the range is simply outside what this fetch asked
       // for — merges only ever grow `cur.messages` past one page's worth —
       // and must survive being merely absent from it.
+      // `<=`, not `<`: Meta timestamps whole seconds, so several messages can
+      // share rangeStart and the page's LIMIT can cut between them — one that
+      // merely aged out of the newest page then has m.at === rangeStart. The
+      // client has no rowid to break that tie, so a tie is kept: a duplicate
+      // line heals on reload, an omission is a message the operator never saw.
       const rangeStart = fresh.messages[0]?.at ?? -Infinity;
-      const kept = cur.messages.filter(m => m.at < rangeStart || freshById.has(m.id));
+      const kept = cur.messages.filter(m => m.at <= rangeStart || freshById.has(m.id));
       // Entries already on screen pick up their fresher copy too — a status
       // moving sent → delivered → read on a bubble already rendered — and
       // anything in the fresh page that was not here yet is appended after it.
