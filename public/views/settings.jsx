@@ -51,8 +51,12 @@ function SettingsView() {
     flash(r.ok ? 'Rates saved for this session' : r.error, r.ok);
   };
   const saveCreds = async () => {
-    const r = await api.post('/api/config', { phoneNumberId: creds.phoneId, accessToken: creds.token, wabaId: creds.wabaId });
-    flash(r.configured ? 'Credentials saved' : 'Saved — still incomplete');
+    const r = await api.post('/api/config', { phoneNumberId: creds.phoneId, accessToken: creds.token, wabaId: creds.wabaId })
+      .catch(() => ({ ok: false, error: 'Network error — nothing was saved' }));
+    // r.ok checked first: a network failure has no `configured` field either,
+    // and reading it directly read that absence as "saved — still
+    // incomplete" about a save that never reached the server at all.
+    flash(r.ok ? (r.configured ? 'Credentials saved' : 'Saved — still incomplete') : r.error, r.ok);
   };
 
   const eta  = Math.max(1, Math.round((ss.total || 0) * settings.delaySec / 60));
@@ -106,8 +110,14 @@ function SettingsView() {
         <CardContent className="space-y-3">
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Delay between sends" hint="Seconds · 2 is safe">
+              {/* Raw value, not `parseInt(v) || 1`: that fallback silently
+                  turned a typed 0 (or anything unparseable) into 1 before it
+                  ever reached the server, so the operator never saw
+                  /api/config's own "must be 1 or more" sentence — they just
+                  watched their 0 mysteriously become a 1. The server already
+                  validates on Save; let it be the one that says so. */}
               <Input type="number" min="1" max="60" value={settings.delaySec}
-                     onChange={e => setSettings(p => ({ ...p, delaySec: parseInt(e.target.value) || 1 }))} />
+                     onChange={e => setSettings(p => ({ ...p, delaySec: e.target.value }))} />
             </Field>
             <Field label="Daily cap" hint={
               // Warm-up checked FIRST: while it is active and not graduated it
