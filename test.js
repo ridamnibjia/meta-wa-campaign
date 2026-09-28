@@ -119,6 +119,28 @@ function __drainServerCloses() {
     const srv = realCreateServer(...args);
     srv.on('request', (req, res) => res.setHeader('Connection', 'close'));
     if (listener) srv.on('request', listener);
+    // listen(0) with no host binds the WILDCARD address (`::`/`0.0.0.0`).
+    // On BSD/Darwin a DIFFERENT process's bind to the SPECIFIC address
+    // 127.0.0.1:P is allowed to coexist with our wildcard bind on the same
+    // port P, and an incoming connection to 127.0.0.1:P is routed to the
+    // MORE SPECIFIC socket — not ours, even though our own listen(0)
+    // succeeded and .address().port says P. That is how a request this
+    // suite sends to its own freshly-bound port came back "Healthy" or
+    // "404 page not found": an unrelated local process (an IDE language
+    // server, confirmed with lsof/curl — see flake-report.md) already held
+    // 127.0.0.1 specifically on that port. Binding 127.0.0.1 ourselves
+    // removes the ambiguity: the OS can never hand listen(0) a port already
+    // held specifically on 127.0.0.1, so fetch()'s 127.0.0.1:P always
+    // reaches this server. Only the exact `listen(0, …)` shape the call
+    // sites below use is rewritten, to (0, '127.0.0.1', …) — anything that
+    // already names a host is left alone.
+    const realListen = srv.listen.bind(srv);
+    srv.listen = (...listenArgs) => {
+      if (listenArgs[0] === 0 && (listenArgs.length === 1 || typeof listenArgs[1] === 'function')) {
+        listenArgs.splice(1, 0, '127.0.0.1');
+      }
+      return realListen(...listenArgs);
+    };
     const realClose = srv.close.bind(srv);
     // closeAllConnections() is a no-op when nothing is open, so it is always
     // safe to call before close() rather than only when something might be —
