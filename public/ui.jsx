@@ -179,12 +179,18 @@ const Stat = ({ label, value, tone, hint }) => (
   </Card>
 );
 
-const Progress = ({ value, className }) => (
-  <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(value)}
-       className={cn('h-2 w-full overflow-hidden rounded-full bg-secondary', className)}>
-    <div className="h-full rounded-full bg-primary transition-all duration-500" style={{ width: `${Math.min(100, Math.max(0, value))}%` }} />
-  </div>
-);
+const Progress = ({ value, className }) => {
+  // One clamp, read by both the bar's width and its own aria-valuenow — a
+  // caller passing an out-of-range value (150, -10) must not report an
+  // aria-valuenow outside aria-valuemin/max while the bar itself reads 100%/0%.
+  const pct = Math.min(100, Math.max(0, value));
+  return (
+    <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)}
+         className={cn('h-2 w-full overflow-hidden rounded-full bg-secondary', className)}>
+      <div className="h-full rounded-full bg-primary transition-all duration-500" style={{ width: `${pct}%` }} />
+    </div>
+  );
+};
 
 // ── Where every contact in the list ended up ───────────────────────────────────
 // The stat tiles on the dashboard and in History answer "how is it going". This
