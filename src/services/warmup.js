@@ -169,9 +169,13 @@ function markWarmupDay() {
   W.days.push(today);
   saveWarmup();
   const cap = warmupCap();
+  // capWindow() says which window this cap is actually being counted over —
+  // see its own comment above. "Any 24 hours" is only true while the rung
+  // governs; once your own lower cap does, the count is the IST calendar day,
+  // and saying "any 24 hours" there names a window nothing is counting.
   log('info', cap === null
     ? `Warm-up complete after ${W.days.length} sending days — the ceiling is now your own cap and Meta's tier`
-    : `Warm-up — day ${W.days.length}: at most ${cap} people in any 24 hours`);
+    : `Warm-up — day ${W.days.length}: at most ${cap} people ${capWindow() === 'day' ? 'today' : 'in any 24 hours'}`);
 }
 
 module.exports = { W, WARMUP_PLAN, saveWarmup, warmupStep, warmupCap, effectiveCap,

@@ -1243,6 +1243,25 @@ console.log('\nwarm-up ladder');
     setup(new Array(50).fill(0).map((_, i) => 'd' + i)); S.config.dailyCap = 0;
     assert.equal(effectiveCap(), null);
   });
+
+  // The day-start log announces the window the cap in force counts over.
+  // capWindow() says which: a rolling 24 hours while the rung governs, the IST
+  // day once your own lower cap does. The log named "any 24 hours"
+  // unconditionally, which is exactly wrong when your own cap is the one
+  // actually counting the calendar day instead.
+  test('the day-start log says "today" when your own lower cap governs, not "any 24 hours"', () => {
+    const { markWarmupDay, capWindow } = require('./server');
+    setup([]); S.config.dailyCap = 0;               // nothing of your own: the rung governs, rolling
+    markWarmupDay();
+    assert.equal(capWindow(), '24h', 'precondition: the rung is the cap in force');
+    assert.match(S.logs[S.logs.length - 1].msg, /at most 20 people in any 24 hours/);
+
+    setup([]); S.config.dailyCap = 5;                // below day 1's rung of 20: your own cap governs
+    markWarmupDay();
+    assert.equal(capWindow(), 'day', 'precondition: your own lower cap is the one counting');
+    assert.match(S.logs[S.logs.length - 1].msg, /at most 20 people today/,
+      'your own cap counts the IST day, not a rolling 24 hours, and the log must say so');
+  });
   // The shipped default, read from a pristine copy of the module rather than
   // from the S every other test has been writing to. It was 1000, and a number
   // this file invents is a number nothing on screen can explain: it outlived the
