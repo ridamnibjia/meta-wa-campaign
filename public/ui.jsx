@@ -242,11 +242,12 @@ const FUNNEL_ROWS = [
     // Not "sent this message and opted out in response" — that would also be
     // true of someone WhatsApp delivered this run's message to who then opted
     // out, and that contact stays in `delivered` (bucketOf never rewrites a
-    // resolved wamid). Every population actually in this bucket — disabled
-    // before the queue reached them, disabled before a queued retry could go
-    // out, or refused this run with WhatsApp's own opt-out code — has one
-    // thing in common instead: none of them were delivered.
-    hint: 'Tapped “Stop promotions” earlier, turned your marketing off inside WhatsApp, or switched off by you — before the queue reached them, or before a queued retry could go out. None of them received this run\'s message.' },
+    // resolved wamid). Three populations land here: disabled before the queue
+    // reached them (nothing sent), disabled before a queued retry could go out
+    // (an earlier attempt was refused), and refused THIS run with 131050
+    // (attempted, and WhatsApp refused it). "Before anything went out" is false
+    // for the last two, so the hint says only what all three share.
+    hint: 'Tapped “Stop promotions” earlier, turned your marketing off inside WhatsApp, or switched off by you. Either nothing was sent to them, or WhatsApp refused the send — none of them received this run\'s message.' },
 ];
 
 // How many times this contact was actually put on the wire. `attempts` counts

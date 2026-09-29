@@ -559,18 +559,20 @@ function Thread({ waId, onBack }) {
         <MediaInfo previewHours={data.previewHours} />
       </div>
 
-      {/* A transcript is what the two people said to each other, so a campaign
-          message Meta refused is not in it — the customer never saw it, cannot
-          answer it and does not know it exists. Stating the count is the honest
+      {/* A transcript is what the two people said to each other, so a message
+          Meta refused is not in it — the customer never saw it, cannot answer
+          it and does not know it exists. Stating the count is the honest
           middle: it is out of the conversation, and the fact that we tried is
-          not hidden. The codes and the reasons live in Campaign history, which
-          is the surface built to answer them. */}
+          not hidden. The count covers EVERY refused outbound row (countUndelivered
+          has no run filter), so a refused inbox reply is in it too — "campaign
+          message" was false for those, and only campaign sends have a reason in
+          Campaign history. */}
       {data.undelivered > 0 && (
         <p className="border-b border-border bg-muted/50 px-4 py-2 text-[11px] text-muted-foreground">
-          {num(data.undelivered)} campaign message{data.undelivered === 1 ? '' : 's'} to this contact
-          {data.undelivered === 1 ? ' was' : ' were'} not delivered by Meta and{' '}
-          {data.undelivered === 1 ? 'is' : 'are'} not shown here — they never reached this person.
-          See <strong>Campaign history</strong> for the reason.
+          {num(data.undelivered)} message{data.undelivered === 1 ? '' : 's'} to this contact
+          {data.undelivered === 1 ? ' was' : ' were'} refused by Meta and{' '}
+          {data.undelivered === 1 ? 'is' : 'are'} not shown here — {data.undelivered === 1 ? 'it' : 'they'} never
+          reached this person. For a campaign send, <strong>Campaign history</strong> has the reason.
         </p>
       )}
 

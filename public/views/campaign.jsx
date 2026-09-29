@@ -742,8 +742,10 @@ function Campaign() {
                   being silent about it. */}
               {contacts.breakdown?.shortPlus > 0 && (
                 <p className="text-[11px] font-medium text-warning">
-                  {num(contacts.breakdown.shortPlus)} number(s) start with + but have only 10 digits — dialled exactly as
-                  written. If they are Indian mobiles, write them as +91 followed by the 10 digits.
+                  {num(contacts.breakdown.shortPlus)} number{contacts.breakdown.shortPlus === 1 ? ' starts' : 's start'} with
+                  + but {contacts.breakdown.shortPlus === 1 ? 'has' : 'have'} only 10 digits — dialled exactly as written.
+                  If {contacts.breakdown.shortPlus === 1 ? 'it is an Indian mobile, write it' : 'they are Indian mobiles, write them'} as
+                  +91 followed by the 10 digits.
                 </p>
               )}
               <div className="divide-y divide-border">
