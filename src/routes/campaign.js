@@ -1,10 +1,10 @@
 'use strict';
 const express = require('express');
 const { CFG } = require('../config');
-const { S, flags, log, todayKey } = require('../state');
+const { S, flags, log } = require('../state');
 const { broadcast } = require('../services/status');
 const { isDisabled, markMessaged, getRow } = require('../services/contacts');
-const { W, effectiveCap, graduated } = require('../services/warmup');
+const { W, effectiveCap, graduated, markWarmupDay, capWindow, warmupDay, adoptQuality } = require('../services/warmup');
 const { recordOutbound, progressForRun, skippedForRun,
         listRuns, runDetail } = require('../services/messages');
 const { normalizePhone } = require('../lib/phone');
@@ -14,6 +14,7 @@ const { skipDisposition, explainError } = require('../lib/errors');
 const {
   sendTemplate, missingParams, startLoop, saveCampaignNow, clearCampaignFile,
   campaignBlocker, campaignActive, suppressIfPermanent, USER_PAUSE,
+  handleDeliveryFailure,
 } = require('../services/campaign');
 
 const router = express.Router();
@@ -27,11 +28,17 @@ router.post('/test-send', async (req, res) => {
   if (!CFG.accessToken || !CFG.phoneNumberId) return res.json({ ok: false, error: 'Credentials not configured' });
 
   const check = await validateTemplate(S.config.templateName).catch(e => ({ error: e.message }));
-  adoptTemplate(S.config.templateName, check);
+  // The language travels with the name, exactly as in /start: of two language
+  // variants of one template, a test send must adopt the one the operator chose
+  // rather than whichever Meta lists first — or testing would switch the
+  // campaign's language under them.
+  adoptTemplate(S.config.templateName, check, S.config.templateLanguage);
   if (check.error) return res.json({ ok: false, error: `Could not verify template: ${check.error}` });
   if (S.config.templateStatus !== 'APPROVED') {
     return res.json({ ok: false, error: `Template "${S.config.templateName}" is ${S.config.templateStatus || 'not found'} — only APPROVED templates can be sent` });
   }
+  // Same door, same refusal as /start: a body with a slot this app cannot fill.
+  if (S.config.templateUnsupported) return res.json({ ok: false, error: S.config.templateUnsupported });
   // Same guard as /start: a media-header template sent with no file attached
   // fails at Meta with a code the operator has to look up. Refuse it here with
   // the fix instead.
@@ -58,11 +65,16 @@ router.post('/test-send', async (req, res) => {
       // counted — by the daily cap (a query over these rows) and by
       // countsForRun. It stages no queue row, so the funnel-driven tiles
       // deliberately do not move; the confirmation is the phone in your hand.
+      // And it is a sending day: reconcileWarmupDays already counts this row's
+      // day at the next boot, so not marking it here made the rung on screen
+      // move across a restart with nothing sent in between.
+      markWarmupDay();
       markMessaged(dialStr);
-      recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
+      const early = recordOutbound({ wamid: r.messageId, waId: dialStr, name: contact.name,
                        body: renderBody(S.config.templateBody, r.params)
                              ?? `[template: ${S.config.templateName}]`,
                        runId: S.currentRunId });
+      if (early) handleDeliveryFailure(early);   // its failure webhook beat this send's response
       log('success', `test send accepted — +${dialStr}`);
     } else {
       log('error', `test send failed — +${dialStr} [${r.errorCode}] ${r.error}`);
@@ -91,7 +103,10 @@ router.post('/start', async (req, res) => {
   if (blocked) return res.json({ ok: false, error: blocked });
   if (!CFG.phoneNumberId) return res.json({ ok: false, error: 'Phone Number ID not configured' });
   if (!CFG.accessToken)   return res.json({ ok: false, error: 'Access Token not configured' });
-  const staged = progressForRun(S.currentRunId);
+  // The run every check below is about, read once before the awaits — the same
+  // capture-before-await rule the loop follows for S.currentRunId.
+  const runId  = S.currentRunId;
+  const staged = progressForRun(runId);
   if (!staged.total) return res.json({ ok: false, error: 'Upload a CSV first' });
   if (!staged.pending) return res.json({ ok: false, error: 'Every contact in this run has already been attempted. Upload a CSV to start a new one.' });
 
@@ -99,7 +114,9 @@ router.post('/start', async (req, res) => {
   // could otherwise launch a campaign against a template that was since rejected.
   try {
     const r = await validateTemplate(S.config.templateName);
-    adoptTemplate(S.config.templateName, r);
+    // The selected language, so of two variants of one name the one the
+    // operator picked is the one adopted — not whichever Meta lists first.
+    adoptTemplate(S.config.templateName, r, S.config.templateLanguage);
     if (r.error) return res.json({ ok: false, error: `Could not verify template: ${r.error}` });
     if (S.config.templateStatus !== 'APPROVED') {
       return res.json({ ok: false, error: `Template "${S.config.templateName}" is ${S.config.templateStatus || 'not found'} — only APPROVED templates can be sent` });
@@ -107,6 +124,12 @@ router.post('/start', async (req, res) => {
   } catch (e) {
     return res.json({ ok: false, error: `Could not verify template: ${e.message}` });
   }
+
+  // A template this app cannot fill — named {{first_name}} variables, which
+  // adoptTemplate has just re-read from Meta's copy (contract C6). Every contact
+  // would fail at Meta on the slot nobody can fill, so refuse with the sentence
+  // that names the fix. Checked after the adopt, so it is today's verdict.
+  if (S.config.templateUnsupported) return res.json({ ok: false, error: S.config.templateUnsupported });
 
   // A media-header template with no file chosen would go out with no header
   // component at all, and Meta refuses that per contact — a whole run of
@@ -125,9 +148,26 @@ router.post('/start', async (req, res) => {
   }
 
   // Quality gates the warm-up climb, so read it fresh rather than trusting a
-  // value cached from whenever the dashboard last loaded.
+  // value cached from whenever the dashboard last loaded — adopted only if it
+  // is a real rating: 'UNKNOWN' would lift a held rung (warmup.js:adoptQuality).
   const info = await fetchAccountInfo().catch(() => ({}));
-  if (info.qualityRating) S.quality = info.qualityRating;
+  adoptQuality(info.qualityRating);
+
+  // Two awaits above, and no loop is running during them, so a CSV upload in
+  // another tab passes its own campaignBlocker() here and stages a new run.
+  // Starting now would send THAT list — with no Start pressed for it and none of
+  // the checks above made against it. Refused rather than restarted: the
+  // operator has not seen the list that is now staged.
+  if (S.currentRunId !== runId) {
+    return res.json({ ok: false, error: 'The staged list changed while starting — check it and press Start again.' });
+  }
+  // The same window lets a second Start through: another tab's Start passed the
+  // same blocker and launched the loop — which may already have parked, or been
+  // paused by the operator — and carrying on here wiped the log, cleared
+  // pauseFlag and painted 'running' over that park. Asked again, with the
+  // blocker's own sentence.
+  const busy = campaignBlocker();
+  if (busy) return res.json({ ok: false, error: busy });
 
   // The queue was staged at upload and is NOT rebuilt here. Rebuilding would
   // reset every wamid, and /start after a pause would re-send to everyone who
@@ -142,7 +182,12 @@ router.post('/start', async (req, res) => {
   S.phase = 'running'; S.pauseReason = null; saveCampaignNow(); broadcast();
   const cap = effectiveCap();
   if (W.enabled && !graduated()) {
-    log('info', `Warm-up on — day ${W.days.includes(todayKey()) ? W.days.length : W.days.length + 1}, ceiling ${cap} today`);
+    // "In any 24 hours", because that is how the loop counts the rung: Meta's
+    // window is rolling, and a count that reset at midnight let two days' rungs
+    // into one of them. A lower cap of your own is a daily number and says so.
+    log('info', capWindow() === '24h'
+      ? `Warm-up on — day ${warmupDay()}: at most ${cap} people in any 24 hours`
+      : `Warm-up on — day ${warmupDay()}, but your own cap of ${cap} a day is lower, so it applies instead`);
   } else {
     log('info', cap === null
       ? `No daily cap — this number has ${W.enabled ? 'finished its warm-up' : 'warm-up switched off'} and no cap of your own is set, so Meta's messaging tier is the only limit`

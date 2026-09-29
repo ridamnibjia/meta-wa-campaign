@@ -1,7 +1,8 @@
 'use strict';
 const { CFG, LIMITS, OPT_OUT_LABEL, PRICES } = require('../config');
-const { S, emit, todayKey } = require('../state');
-const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap, graduated, dailyCount } = require('./warmup');
+const { S, emit, log, todayKey } = require('../state');
+const { W, WARMUP_PLAN, warmupStep, warmupCap, effectiveCap, graduated, dailyCount,
+        capCount, capWindow } = require('./warmup');
 const { counts: contactCounts } = require('./contacts');
 const { countsForRun, progressForRun, funnelForRun, nextPending, billableForRun,
         nextRetryForRun, lastRunSummary, strandedWork } = require('./messages');
@@ -27,6 +28,7 @@ function buildState() {
   const billable = billableForRun(S.currentRunId);
   const next     = nextPending(S.currentRunId);
   const retry    = nextRetryForRun(S.currentRunId);
+  const today    = dailyCount();
   return {
     phase:          S.phase,
     // Contacts ATTEMPTED, not contacts resolved. It was `p.sent + p.skipped`,
@@ -83,7 +85,14 @@ function buildState() {
     // every broadcast — once per message sent — so re-asking was four queries
     // per send, one of them a three-table join, for numbers sitting in scope.
     lastRun:        lastRunSummary({ runId: S.currentRunId, progress: p, counts: c, funnel: f, nextRetry: retry }),
-    dailyCount:     dailyCount(),
+    dailyCount:     today,
+    // The count the cap IN FORCE is compared against, and the window it counts
+    // over (contract C1). While the warm-up rung governs that is the last 24
+    // hours — Meta's own window — and a different number from `dailyCount`,
+    // which stays the IST day and means "today" wherever it is shown. Published
+    // rather than left to the client, so the tile cannot rebuild the rule.
+    capCount:       capCount(today),
+    capWindow:      capWindow(),
     // null means no ceiling at all — the ladder is finished (or off) and no cap
     // of the operator's own is set. The UI must render that as "no cap", never
     // as 0: `num(null)` is "0", which reads as a number that blocks every send.
@@ -156,17 +165,41 @@ function buildState() {
 // late one.
 //
 // unref'd: a pending repaint must never be the reason the process stays alive.
+//
+// The window STRETCHES with the cost of the rebuild it follows. A fixed 250 ms
+// was sized by event rate alone, and buildState() grows with the run: ~3 ms at
+// 775 contacts, a third of a second at 100k. Once one rebuild outlasts the
+// window, rebuilding state is all the event loop does, and webhook ACKs queue
+// behind it. Four times the last rebuild holds rebuilding to about a quarter of
+// the loop at any size; below ~62 ms the floor wins, so a run of today's size
+// never sees a difference.
 const MIN_BROADCAST_MS = 250;
-let timer = null, missed = false;
+const coalesceDelay = buildMs => Math.max(MIN_BROADCAST_MS, 4 * buildMs);
 
-function broadcast() {
-  if (timer) { missed = true; return; }
-  emit('state', buildState());
-  timer = setTimeout(() => {
-    timer = null;
-    if (missed) { missed = false; broadcast(); }
-  }, MIN_BROADCAST_MS);
-  timer.unref?.();
+// One coalescer around one `send`. A factory only so test.js can drive the real
+// window with a rebuild it controls; the app has exactly one, below.
+function coalesce(send) {
+  let timer = null, missed = false, stretched = false;
+  return function fire() {
+    if (timer) { missed = true; return; }
+    const t0 = performance.now();
+    send();
+    const took = performance.now() - t0;
+    const wait = coalesceDelay(took);
+    // Once, the first time: the operator learns this ceiling exists months
+    // before it hurts, and a log line per stretch would be its own firehose.
+    if (wait > MIN_BROADCAST_MS && !stretched) {
+      stretched = true;
+      log('warn', `A state rebuild took ${Math.round(took)}ms — live updates now coalesce every ${Math.round(wait)}ms so sends and webhooks stay responsive`);
+    }
+    timer = setTimeout(() => {
+      timer = null;
+      if (missed) { missed = false; fire(); }
+    }, wait);
+    timer.unref?.();
+  };
 }
 
-module.exports = { buildState, broadcast };
+const broadcast = coalesce(() => emit('state', buildState()));
+
+module.exports = { buildState, broadcast, coalesce, coalesceDelay };

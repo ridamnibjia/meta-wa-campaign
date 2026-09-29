@@ -6,7 +6,7 @@
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('node:crypto');
-const { CFG, UPLOAD_DIR, MEDIA_DIR, MEDIA_LIMITS } = require('../config');
+const { CFG, UPLOAD_DIR, MEDIA_DIR, MEDIA_LIMITS, TIMEOUTS } = require('../config');
 const { db }  = require('../lib/db');
 const { S, campaignActive, log } = require('../state');
 const { classify, extOf } = require('../lib/filerisk');
@@ -62,7 +62,7 @@ const byId     = db.prepare('SELECT * FROM media_assets WHERE id = ?');
 const allRows  = db.prepare('SELECT * FROM media_assets WHERE deleted_at IS NULL ORDER BY uploaded_at DESC, id DESC');
 const reviveRow = db.prepare('UPDATE media_assets SET deleted_at = NULL, last_used_at = ? WHERE id = ?');
 const touchRow = db.prepare('UPDATE media_assets SET last_used_at = ? WHERE id = ?');
-const setHandle  = db.prepare('UPDATE media_assets SET meta_handle = ? WHERE id = ?');
+const setHandle  = db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?');
 const setMediaId = db.prepare('UPDATE media_assets SET media_id = ?, media_id_at = ? WHERE id = ?');
 
 const getAsset   = id => byId.get(Number(id));
@@ -114,6 +114,17 @@ function saveUpload(file) {
   // Upload and one media id. Dedupe on content, not on name: a renamed copy of
   // last month's price list is still last month's price list.
   const existing = byHash.get(sha);
+  // `path` is a column, and a column is data. Both branches below write
+  // through it (fs.writeFileSync, when bytes are missing or the row is being
+  // revived) on the strength of a byte match alone — a corrupted or crafted
+  // row must not turn an upload into a write to wherever it points, which is
+  // exactly the guard deleteAsset already holds for the same column.
+  if (existing && !insideDir(UPLOAD_DIR, assetPath(existing))) {
+    // A tombstoned row cannot take escapedMsg's remedy (see escapedTombstoneMsg) —
+    // checked here, before the deleted_at branches below, because both of them
+    // would otherwise try to write through this same corrupted path first.
+    return { ok: false, error: existing.deleted_at ? escapedTombstoneMsg(existing) : escapedMsg(existing) };
+  }
   if (existing && !existing.deleted_at) {
     // The row can outlive its bytes — a wa.db restored without the uploads
     // directory. Re-uploading the identical file is the natural repair, and a
@@ -158,9 +169,9 @@ function saveUpload(file) {
   //
   // Checked after the dedupe, because a byte-identical re-upload writes nothing
   // and refusing it on space grounds would be a lie.
-  // `free - size`, not `free`: this is the only space check in the app that
-  // knows how big the incoming file is, and a 90 MB video landing on a disk
-  // exactly at the floor should be refused before it is written, not after.
+  // `free - size`, not `free`: a 90 MB video landing on a disk exactly at the
+  // floor should be refused before it is written, not after. saveInbound's own
+  // check subtracts the claimed size the same way, for the same reason.
   // freeBytes answers Infinity when statfs cannot, which passes by design.
   const free = freeBytes(UPLOAD_DIR);
   if (free - size < MEDIA_LIMITS.minFreeBytes) {
@@ -168,7 +179,12 @@ function saveUpload(file) {
     return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Delete a file you no longer send from the library, then try again. Nothing was saved.` };
   }
 
-  const ext  = (path.extname(file.originalname || '') || '').slice(0, 10).toLowerCase();
+  // extOf, not path.extname: the originalname is operator-supplied and this is
+  // the only one of them that reaches a filesystem path. path.extname does not
+  // validate characters, so a NUL byte survives into `name` below and Node's
+  // fs calls throw on any path containing one; extOf drops anything outside
+  // [a-z0-9] instead of passing it through.
+  const ext  = extOf(file.originalname);
   const name = `${sha}${ext}`;
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   fs.writeFileSync(path.join(UPLOAD_DIR, name), file.buffer);
@@ -298,8 +314,7 @@ function deleteAsset(id, { force = false } = {}) {
   // a column is data. Resolving it and checking it still lands inside UPLOAD_DIR
   // is what stops a crafted or corrupted row unlinking something else.
   const full = path.resolve(assetPath(asset));
-  const root = path.resolve(UPLOAD_DIR);
-  if (full !== root && !full.startsWith(root + path.sep)) {
+  if (!insideDir(UPLOAD_DIR, full)) {
     log('error', `Refused to delete asset ${asset.id}: ${asset.path} resolves outside UPLOAD_DIR`);
     return { ok: false, error: 'That file is stored outside the uploads directory and was not deleted.' };
   }
@@ -345,6 +360,13 @@ function deleteAsset(id, { force = false } = {}) {
 // of failing the whole run.
 const MEDIA_ID_TTL_MS = 29 * 24 * 60 * 60 * 1000;
 
+// Mirrors MEDIA_ID_TTL_MS: the h:… handle is short-lived by design (Meta
+// documents it as single-use per submission, but re-submitting the same
+// template with the same file is the common case, so caching it briefly is
+// still right). 23h rather than 24 leaves margin against clock skew between
+// this server and Meta's.
+const HANDLE_TTL_MS = 23 * 60 * 60 * 1000;
+
 const readBytes = row => fs.readFileSync(assetPath(row));
 
 // A tombstoned row reaches every send path — a template still names it, an
@@ -353,6 +375,30 @@ const readBytes = row => fs.readFileSync(assetPath(row));
 // reading an ENOENT stack trace from a readFileSync.
 const deletedMsg = a =>
   `"${a.filename}" was deleted from this server on ${new Date(a.deleted_at).toLocaleDateString('en-IN')}. Upload the same file again to restore it, or pick another.`;
+
+// The row can outlive its bytes — a wa.db restored without the uploads
+// directory, or a file removed by hand outside the app. Checked before any
+// network call so the operator reads "the file is missing, upload it again"
+// rather than a generic "Could not reach graph.facebook.com" that sends them
+// looking at their internet connection instead of their disk.
+const missingMsg = a =>
+  `The file for "${a.filename}" is missing on this server — upload the same file again to restore it.`;
+
+// Distinct from missingMsg: a path that resolves outside UPLOAD_DIR is not
+// simply absent, the ROW itself is suspect — re-uploading repairs a missing
+// file, but a corrupted path column is a fact about the row, which is why
+// this names the row rather than just the file.
+const escapedMsg = a =>
+  `The stored location for "${a.filename}" is outside the uploads directory, so it was refused — the database row looks corrupted; delete it from the Storage page and upload the file again.`;
+
+// escapedMsg's remedy is impossible here: deleteAsset refuses outright once
+// deleted_at is set (see the check just below ensureHandle), and the Storage
+// page does not even list a tombstone to click delete on. Re-uploading is
+// also not a fix — it is the very thing that just hit this corrupted row —
+// so the only way forward is a different file, and the message has to say so
+// rather than send the operator looking for a button that does not exist.
+const escapedTombstoneMsg = a =>
+  `The stored record for "${a.filename}" is corrupted, and the file cannot be restored from this upload — pick a different file.`;
 
 // Template CREATION wants an h:… handle from the Resumable Upload API, which
 // keys on the APP id — not the WABA id, not the business id. It is a two-call
@@ -364,7 +410,20 @@ async function ensureHandle(id) {
   const asset = getAsset(id);
   if (!asset) return { ok: false, error: `Media asset ${id} not found` };
   if (asset.deleted_at) return { ok: false, error: deletedMsg(asset) };
-  if (asset.meta_handle) return { ok: true, handle: asset.meta_handle, asset };
+  // Stale when unstamped (a row from before meta_handle_at existed, or one
+  // that never recorded an age) as well as when it is simply old — either way
+  // there is no evidence the handle is still inside its window.
+  const freshHandle = asset.meta_handle && asset.meta_handle_at
+    && (Date.now() - asset.meta_handle_at) < HANDLE_TTL_MS;
+  if (freshHandle) return { ok: true, handle: asset.meta_handle, asset };
+  // Same containment guard dropBytes/deleteAsset/rescanIfNeeded hold: `path`
+  // is a column, and readBytes() below turns it into a filesystem path with
+  // no check of its own. Two distinct sentences on purpose: an escaped path
+  // means the ROW looks corrupted (re-uploading alone may not fix it — the
+  // column itself is suspect), while a missing file is repaired exactly by
+  // re-uploading the same bytes.
+  if (!insideDir(UPLOAD_DIR, assetPath(asset))) return { ok: false, error: escapedMsg(asset) };
+  if (!fs.existsSync(assetPath(asset))) return { ok: false, error: missingMsg(asset) };
   if (!CFG.accessToken) return { ok: false, error: 'Access Token not configured' };
   if (!CFG.appId) {
     return { ok: false, error: 'APP_ID is not set. A media header needs Meta\'s Resumable Upload API, which keys on the app id — copy it from Meta for Developers → your app → Settings → Basic, put it in .env as APP_ID, and restart.' };
@@ -380,7 +439,8 @@ async function ensureHandle(id) {
       + `?file_name=${encodeURIComponent(asset.filename)}`
       + `&file_length=${asset.file_size}`
       + `&file_type=${encodeURIComponent(asset.mime_type)}`,
-      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` } },
+      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` },
+        signal: AbortSignal.timeout(TIMEOUTS.graphMs) },
     );
     const session = await start.json();
     if (session.error || !session.id) {
@@ -389,18 +449,20 @@ async function ensureHandle(id) {
 
     // OAuth, not Bearer. This second call is the one documented exception in
     // the whole Graph surface, and Bearer here returns a 400 that says nothing
-    // useful about why.
+    // useful about why. transferMs, not graphMs: this call is the one moving
+    // the file's bytes, not asking a small JSON question about them.
     const put = await fetch(`https://graph.facebook.com/${CFG.apiVersion}/${session.id}`, {
       method: 'POST',
       headers: { Authorization: `OAuth ${CFG.accessToken}`, file_offset: '0' },
       body: readBytes(asset),
+      signal: AbortSignal.timeout(TIMEOUTS.transferMs),
     });
     const done = await put.json();
     if (done.error || !done.h) {
       return { ok: false, error: done.error?.message || 'Upload session did not return a handle' };
     }
 
-    setHandle.run(done.h, asset.id);
+    setHandle.run(done.h, Date.now(), asset.id);
     log('info', `Uploaded "${asset.filename}" for template approval`);
     return { ok: true, handle: done.h, asset: getAsset(asset.id) };
   } catch (e) {
@@ -422,6 +484,9 @@ async function ensureMediaId(id, { force = false } = {}) {
     && (Date.now() - asset.media_id_at) < MEDIA_ID_TTL_MS;
   if (fresh && !force) return { ok: true, mediaId: asset.media_id, asset };
 
+  // Same containment guard as ensureHandle above — see its comment.
+  if (!insideDir(UPLOAD_DIR, assetPath(asset))) return { ok: false, error: escapedMsg(asset) };
+  if (!fs.existsSync(assetPath(asset))) return { ok: false, error: missingMsg(asset) };
   if (!CFG.accessToken || !CFG.phoneNumberId) {
     return { ok: false, error: 'Credentials not configured' };
   }
@@ -440,7 +505,8 @@ async function ensureMediaId(id, { force = false } = {}) {
 
     const res = await fetch(
       `https://graph.facebook.com/${CFG.apiVersion}/${CFG.phoneNumberId}/media`,
-      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` }, body: form },
+      { method: 'POST', headers: { Authorization: `Bearer ${CFG.accessToken}` }, body: form,
+        signal: AbortSignal.timeout(TIMEOUTS.transferMs) },
     );
     const data = await res.json();
     if (data.error || !data.id) {
@@ -538,9 +604,7 @@ function dropBytes(row) {
   if (!row || !row.path) return { removed: false, freed: 0, shared: false };
 
   const file = inboundPath(row);
-  const dir  = path.resolve(MEDIA_DIR);
-  const rel  = path.relative(dir, path.resolve(file));
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+  if (!insideDir(MEDIA_DIR, file)) {
     return { removed: false, freed: 0, shared: false,
              error: `the path stored for ${row.media_id} resolves outside the media directory` };
   }
@@ -558,6 +622,33 @@ function dropBytes(row) {
   fs.rmSync(file, { force: true });
   clearInboundFile.run(row.media_id);
   return { removed: true, freed, shared: false };
+}
+
+// The one path-containment check, shared by every function that turns a
+// stored `path` column into a real filesystem path before reading or
+// unlinking it. A column is data, not a trusted path: dropBytes and
+// deleteAsset each carried their own copy of this check already, and
+// rescanIfNeeded read and unlinked bytes with no check at all — the same bug
+// in a third place, just waiting for a corrupted or crafted row. Refuses the
+// directory itself, not only paths outside it: a stored path of "." would
+// otherwise resolve to the bare directory, and unlinking a directory is never
+// a legitimate outcome for any of these callers.
+//
+// ponytail: lexical, not physical — path.resolve/path.relative reason about
+// the string, so a symlink planted inside UPLOAD_DIR/MEDIA_DIR pointing back
+// out would still read as "inside" here. The ceiling is the same one every
+// caller already accepts by trusting the directory itself (the bytes an
+// operator can put inside UPLOAD_DIR are already theirs to control); it stops
+// being acceptable the day this directory's contents are not fully trusted.
+// Upgrade path: fs.realpathSync() on both `dir` and `file` before comparing,
+// which resolves symlinks — deliberately not done here because a dangling
+// symlink (the target deleted, the link left behind) would throw ENOENT on a
+// path this function's callers otherwise treat as a clean "no" rather than
+// an error worth surfacing.
+function insideDir(dir, file) {
+  const root = path.resolve(dir);
+  const rel  = path.relative(root, path.resolve(file));
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
 // Meta reports one sha256 in two encodings — base64 in the webhook envelope,
@@ -621,7 +712,19 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
   // Already here. A Preview on a kept file must not demote it back to
   // provisional and put a 24-hour clock on something an operator kept on
   // purpose, so this returns the row as it stands rather than re-stamping it.
-  if (row.path) return { ok: true, media: row, already: true };
+  //
+  // The mirror case: Save on a row a Preview already fetched must not re-pull
+  // bytes already on disk, but it DOES have to drop the 24-hour preview clock
+  // — Preview and Save are the same fetch on different clocks, and this is
+  // the moment an operator moves from one to the other without asking Meta
+  // again.
+  if (row.path) {
+    if (row.provisional && !provisional) {
+      setKept.run(row.media_id);
+      return { ok: true, media: getInbound(mediaId), promoted: true };
+    }
+    return { ok: true, media: row, already: true };
+  }
   // Terminal, and deliberately checked before the expiry and token checks: a
   // file we have already identified as malware must not be re-fetched just
   // because someone clicked Save twice.
@@ -636,7 +739,7 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
 
   try {
     const res = await fetch(`https://graph.facebook.com/${CFG.apiVersion}/${encodeURIComponent(mediaId)}`,
-      { headers: { Authorization: `Bearer ${CFG.accessToken}` } });
+      { headers: { Authorization: `Bearer ${CFG.accessToken}` }, signal: AbortSignal.timeout(TIMEOUTS.graphMs) });
     const meta = await res.json();
     if (meta.error || !meta.url) {
       return { ok: false, error: meta.error?.message || 'Meta returned no download url for this media' };
@@ -649,12 +752,16 @@ async function saveInbound(mediaId, { provisional = false } = {}) {
       return { ok: false, error: `That file is ${mb(claimed)} — over this server's ${mb(MEDIA_LIMITS.maxBytes)} limit, so it was not downloaded.` };
     }
 
+    // `free - claimed`, not `free`: a file whose declared size would land the
+    // disk under the floor should be refused before its bytes are pulled over
+    // the wire, not after — the same reasoning saveUpload applies below.
     const free = freeBytes(MEDIA_DIR);
-    if (free < MEDIA_LIMITS.minFreeBytes) {
+    if (free - claimed < MEDIA_LIMITS.minFreeBytes) {
       return { ok: false, error: `Not enough disk space — ${mb(free)} free, and this server keeps ${mb(MEDIA_LIMITS.minFreeBytes)} in reserve. Nothing was saved.` };
     }
 
-    const dl = await fetch(meta.url, { headers: { Authorization: `Bearer ${CFG.accessToken}` } });
+    const dl = await fetch(meta.url,
+      { headers: { Authorization: `Bearer ${CFG.accessToken}` }, signal: AbortSignal.timeout(TIMEOUTS.transferMs) });
     if (!dl.ok) return { ok: false, error: `Download failed with HTTP ${dl.status}` };
     const buf = Buffer.from(await dl.arrayBuffer());
 
@@ -779,6 +886,10 @@ async function rescanIfNeeded(row) {
   if (!row || !row.path || row.scan_status !== 'skipped' || !scannerConfigured()) return row;
 
   const file = inboundPath(row);
+  // Same containment guard dropBytes and deleteAsset hold: `path` is a
+  // database column, not a trusted filesystem path, and this function reads
+  // and — on an infected verdict — unlinks bytes on the strength of it.
+  if (!insideDir(MEDIA_DIR, file)) return row;
   if (!fs.existsSync(file)) return row;
 
   const scan = await scanBuffer(fs.readFileSync(file));

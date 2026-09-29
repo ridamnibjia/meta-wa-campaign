@@ -114,7 +114,7 @@ function LoginScreen({ onIn, setupRequired }) {
 // inside a render is a new type every time, and React remounts new types.
 const NavLink = ({ r, on, unread }) => (
   <button onClick={() => go(r.path)}
-    className={cn('flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+    className={cn('flex shrink-0 items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors md:w-full md:shrink',
       on ? 'bg-secondary text-secondary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground')}>
     <span className="w-4 text-center opacity-70">{r.icon}</span>
     <span className="flex-1 text-left">{r.label}</span>
@@ -150,10 +150,13 @@ function Shell({ children }) {
             </p>
           </div>
         </div>
-        <nav className="flex gap-1 md:flex-col">
+        <nav className="flex gap-1 overflow-x-auto md:flex-col md:overflow-visible">
           {ROUTES.map(r => <NavLink key={r.path} r={r} on={tab === r.path} unread={unread} />)}
         </nav>
-        <div className="mt-auto hidden gap-1 pt-3 md:flex md:flex-col">
+        {/* Sign out and the theme toggle used to be `hidden` below md, which
+            meant there was no way to reach either from a phone — reachable
+            only by finding a desktop. A row on mobile, the column on md. */}
+        <div className="mt-auto flex gap-1 pt-3 md:flex-col">
           <Button variant="ghost" size="sm" className="justify-start" onClick={() => setDark(!dark)}>
             {dark ? '☀ Light' : '☾ Dark'}
           </Button>
@@ -185,8 +188,30 @@ function App() {
   const [contacts, setContacts] = useState({ count: 0, sample: [], file: '' });
   const [templates, setTemplates] = useState([]);
   const [picked,   setPicked]   = useState('');
+  // A template name alone no longer picks one variant: two languages of the
+  // same name are two distinct choices, and adopting "whichever matches the
+  // name" silently sent the wrong body to every contact on a run started in
+  // the other language.
+  const [pickedLang, setPickedLang] = useState('');
+  // Mirror `picked`/`pickedLang` for loadTemplates below, which must stay a
+  // stable (deps-`[]`) callback — it is itself a dependency of the
+  // initial-load effect, and giving it either as a dependency would re-run
+  // that whole effect (re-fetching account info, fail log, the inbox list)
+  // on every template pick. Refs read the latest value with no dependency,
+  // and — unlike reading `picked` via `setPicked(cur => ...)` — without
+  // needing a second setState call nested inside that updater: an updater
+  // function must be pure, and `setPickedLang(...)` from inside one is a
+  // side effect React does not promise to run exactly once.
+  const pickedRef = useRef('');
+  const pickedLangRef = useRef('');
+  useEffect(() => { pickedRef.current = picked; }, [picked]);
+  useEffect(() => { pickedLangRef.current = pickedLang; }, [pickedLang]);
   const [params,   setParams]   = useState([]);
   const [tmplErr,  setTmplErr]  = useState(null);
+  // Set only by the locked branch of /api/validate-template (contract C4) — a
+  // campaign sending a different template right now. Cleared the moment a
+  // validate call succeeds again.
+  const [tmplLockMsg, setTmplLockMsg] = useState(null);
   const [logs,     setLogs]     = useState([]);
   const [failLog,  setFailLog]  = useState([]);
   const [threads,  setThreads]  = useState([]);
@@ -219,7 +244,12 @@ function App() {
     setSession(s => ({ ...s, authed: false }));
   }, []);
 
-  const active = templates.find(t => t.name === picked) || null;
+  // Matched on name AND language: two variants share the option list's `name`,
+  // and matching on name alone would silently adopt whichever one happened to
+  // be first. Falls back to a name-only match while pickedLang has not caught
+  // up yet (the instant after loadTemplates sets one and before the other).
+  const active = templates.find(t => t.name === picked && t.language === pickedLang)
+              || (!pickedLang && templates.find(t => t.name === picked)) || null;
 
   // {{1}}, {{2}}… in the selected template's approved body. These are the only
   // parts of an approved message Meta lets you change without a new review.
@@ -248,16 +278,29 @@ function App() {
     () => (vars.length ? api.post('/api/params', { paramValues: params }) : Promise.resolve()),
     [vars.length, params]);
 
-  const loadTemplates = useCallback(async prefer => {
+  const loadTemplates = useCallback(async (preferName, preferLang) => {
     const r = await api.get('/api/templates').catch(() => ({ error: 'Network error' }));
     if (r.error) { setTmplErr(r.error); return; }
     setTmplErr(null);
     setTemplates(r.templates);
-    setPicked(cur => {
-      const want = prefer || cur;
-      if (want && r.templates.some(t => t.name === want)) return want;
-      return (r.templates.find(t => t.status === 'APPROVED') || r.templates[0] || {}).name || '';
-    });
+    const wantName = preferName || pickedRef.current;
+    // A caller that names no language (the 15s poll, the socket refresh)
+    // means "keep what is on screen" — pickedLangRef.current — not "any
+    // language", which would silently switch a deliberately-picked variant
+    // back to whichever one happens to sort first under this name.
+    const wantLang = preferLang !== undefined ? preferLang : pickedLangRef.current;
+    // Exact name+language first; a name match under any OTHER language next
+    // (keeps the selection alive when the preferred language is not the one
+    // on screen); the previous default — first approved, else first — last.
+    const t = (wantName && r.templates.find(x => x.name === wantName && x.language === wantLang))
+           || (wantName && r.templates.find(x => x.name === wantName))
+           || r.templates.find(x => x.status === 'APPROVED') || r.templates[0] || null;
+    // Two plain sets, not one nested inside the other's updater: reading
+    // `picked` via `pickedRef` up front means neither call needs to be a
+    // functional update, so neither is a side effect running inside React's
+    // own state-reducer pass for a DIFFERENT hook.
+    setPicked(t?.name || '');
+    setPickedLang(t?.language || '');
   }, []);
 
   useEffect(() => { reloadTmpl.current = loadTemplates; }, [loadTemplates]);
@@ -288,7 +331,7 @@ function App() {
     api.get('/api/state').then(s => {
       setSS(s);
       if (s.total > 0) setContacts(x => ({ ...x, count: s.total }));
-      loadTemplates(s.config?.templateName);
+      loadTemplates(s.config?.templateName, s.config?.templateLanguage);
     }).catch(() => loadTemplates());
 
     api.get('/api/faillog').then(d => setFailLog(d || [])).catch(() => {});
@@ -297,9 +340,26 @@ function App() {
   }, [session.authed, loadTemplates, loadInbox]);
 
   // Tell the server which template to send, and let it count the variables.
+  // Language rides along (contract C2) so two variants of one name adopt the
+  // right body rather than whichever Graph happened to return first.
   useEffect(() => {
-    if (picked && session.authed) api.get(`/api/validate-template?name=${encodeURIComponent(picked)}`).catch(() => {});
-  }, [picked, session.authed]);
+    if (!picked || !session.authed) return;
+    // A quick second pick before the first request resolves put two fetches
+    // in flight; if the FIRST one's response arrived last it overwrote the
+    // second pick's correct lock state with its own stale one. The cleanup
+    // below runs when this effect re-fires (React calls the PREVIOUS run's
+    // cleanup before the new one starts), so a response landing after its own
+    // pick has moved on is dropped rather than applied.
+    let stale = false;
+    const q = `name=${encodeURIComponent(picked)}${pickedLang ? `&language=${encodeURIComponent(pickedLang)}` : ''}`;
+    // ok:false here is only ever the C4 lock — a campaign sending a different
+    // template right now — since every other outcome (found, not found, a
+    // fetch error) has no `ok` field at all.
+    api.get(`/api/validate-template?${q}`)
+      .then(r => { if (!stale) setTmplLockMsg(r && r.ok === false ? r.error : null); })
+      .catch(() => {});
+    return () => { stale = true; };
+  }, [picked, pickedLang, session.authed]);
 
   // Poll Meta while anything in the list is still under review.
   useEffect(() => {
@@ -315,20 +375,31 @@ function App() {
     // The server's error is already a sentence — a parse failure names the row,
     // and a refusal because a campaign is still running names the campaign.
     // Prefixing it with "Could not read that CSV" made the second one a lie.
-    if (!r.ok) return alert(r.error || 'Could not read that CSV');
+    // Kept on screen as a persistent Alert in Step 1 rather than an alert():
+    // a modal the operator dismisses is gone the moment they reach for the
+    // dropzone again, and a parse failure is exactly the kind of thing worth
+    // re-reading before trying a second file.
+    if (!r.ok) { setContacts(c => ({ ...c, uploadError: r.error || 'Could not read that CSV' })); return; }
     // The breakdown answers "my file has 971 rows, why does this say 775?"
     // without making the operator dig through the Live log: duplicates are
     // merged (one person, one message), unreadable rows are reported, and
-    // "new" is how many numbers this server had never seen.
+    // "new" is how many numbers this server had never seen. guessedCountry and
+    // guessedPhone (contract C3) are guesses the parser made rather than facts
+    // read off a header, so the same breakdown says which ones were guessed.
+    // shortPlus (item 6b) rides beside guessedCountry the same way — a number
+    // this likely to be wrong is worth a second look even though it was never
+    // rewritten.
     setContacts({ count: r.count, sample: r.sample, file: file.name,
                   breakdown: { duplicates: r.duplicates || 0, skipped: r.skipped || 0,
-                               newCount: r.newCount ?? null } });
+                               newCount: r.newCount ?? null, guessedCountry: r.guessedCountry || 0,
+                               guessedPhone: r.guessedPhone || null, shortPlus: r.shortPlus || 0 } });
     setFailLog([]);
   }, []);
 
   const ctx = {
     api, session, signOut, dark, setDark, connected,
     ss, account, contacts, setContacts, templates, setTemplates, picked, setPicked,
+    pickedLang, setPickedLang, tmplLockMsg,
     params, setParams, tmplErr, logs, setLogs, failLog, setFailLog,
     threads, setThreads, active, vars, flushParams, loadTemplates, loadInbox, uploadCSV,
   };

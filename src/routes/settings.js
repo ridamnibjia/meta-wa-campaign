@@ -5,16 +5,27 @@ const { S, log } = require('../state');
 const { buildState, broadcast } = require('../services/status');
 const { fetchAccountInfo } = require('../services/graph');
 const { CONTACT_FIELDS } = require('../services/campaign');
-const { W, saveWarmup, warmupCap, warmupStep, graduated } = require('../services/warmup');
+const { W, saveWarmup, warmupCap, warmupStep, graduated, adoptQuality } = require('../services/warmup');
 const { missingParams } = require('../services/campaign');
 const diagnostics = require('../services/diagnostics');
 const { replayUnprocessed } = require('../services/ingest');
+const { templateLocked } = require('../services/templates');
 
 const router = express.Router();
 
 router.post('/config', (req, res) => {
   const { phoneNumberId, accessToken, wabaId, templateName, templateLanguage,
           templateCategory, delaySec, dailyCap, prices } = req.body;
+  // A campaign reads S.config.templateName/templateLanguage on every send, so
+  // switching either while one is running sends the rest of the list a
+  // different message. templateLocked is vacuously null when neither field is
+  // present (a request that only touches, say, dailyCap), so this is safe to
+  // call unconditionally. Checked FIRST, before anything below is written —
+  // spec 6.1 is "a refused request mutates nothing", and accessToken/
+  // phoneNumberId/wabaId used to be assigned above this check, so a request
+  // refused for its template half had already landed its credential half.
+  const templateLockMsg = templateLocked(templateName, templateLanguage);
+  if (templateLockMsg) return res.json({ ok: false, error: templateLockMsg });
   if (phoneNumberId)    CFG.phoneNumberId    = phoneNumberId;
   if (accessToken)      CFG.accessToken      = accessToken;
   if (wabaId)           CFG.wabaId           = wabaId;
@@ -105,7 +116,7 @@ router.post('/params', (req, res) => {
 router.get('/account-info', async (req, res) => {
   try {
     const info = await fetchAccountInfo();
-    if (info.qualityRating) S.quality = info.qualityRating;
+    adoptQuality(info.qualityRating);   // 'UNKNOWN' is shown, never adopted — it would lift a held rung
     res.json(info);
   } catch (e) { res.json({ error: e.message }); }
 });

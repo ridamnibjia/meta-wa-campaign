@@ -1,13 +1,51 @@
 'use strict';
 const { db } = require('../lib/db');
 const { S, flags, campaignActive, log } = require('../state');
-const { explainError, skipDisposition } = require('../lib/errors');
+const { explainError, skipDisposition, SENDER_LEVEL, disableReasonFor } = require('../lib/errors');
 
-// An unknown ID means a message this server never sent — traffic from another
-// tool on the same number, or a status for a message from before the SQL store.
-// Log it rather than swallow it.
+// An unknown ID is usually a message this server never sent — traffic from
+// another tool on the same number, or a status from before the SQL store. But
+// not always: Meta's status webhook can beat the send API's own response, and
+// the row only exists once recordOutbound runs, after the send's awaits. A
+// status dropped in that window was lost for good — the envelope is stamped
+// processed either way — and a lost `failed` is a contact the retry ladder
+// never sees. So it is HELD, keyed on its wamid, and recordOutbound claims it.
+//
+// The envelope still being marked processed is deliberate: leaving it
+// unprocessed would strand every foreign tool's statuses in the replay queue
+// forever, and a held status needs no replay — its own send claims it.
+//
+// ponytail: in memory, newest 500 wamids. A restart or an eviction loses only
+// what was already logged here as unknown — the outcome before the hold
+// existed — and a table would keep nothing useful: a send cut off mid-await is
+// never recorded, so nothing would ever claim its status. Evicting one that
+// WOULD be claimed takes 500 other unknown wamids inside one send's round
+// trip; if a second tool on the number is ever that busy, evict by age instead
+// of by count.
+const HELD_MAX = 500;
+const held = new Map();   // wamid → [status, …] in arrival order, one per status value
+
 function onUnknownStatus(status) {
-  log('warn', `status "${status.status}" for unknown message ${status.id} — ignored`);
+  log('warn', `status "${status.status}" for unknown message ${status.id} — held in case its send is still being recorded`);
+  // One entry per status value, the latest winning: a redelivered failure can
+  // carry a better error code, and a redelivery must not grow the list.
+  const list = (held.get(status.id) || []).filter(s => s.status !== status.status);
+  list.push(status);
+  held.delete(status.id);            // re-inserted, so "oldest" means least recently heard
+  held.set(status.id, list);
+  if (held.size > HELD_MAX) held.delete(held.keys().next().value);
+}
+
+// Applies whatever arrived for this wamid before its row did, in arrival order.
+// applyStatus's own rank guards make the order safe either way. Returns the
+// failure descriptor when one of them was the transition into 'failed'.
+function claimHeld(wamid) {
+  const early = held.get(wamid);
+  if (!early) return null;
+  held.delete(wamid);
+  let failure = null;
+  for (const s of early) failure = applyStatus(s) || failure;
+  return failure;
 }
 
 // Meta redelivers statuses and does not promise order, so a `delivered` can land
@@ -73,7 +111,12 @@ function applyStatus(status) {
   const row = exists.get(id);
   if (!row) return onUnknownStatus(status);
 
-  const now = Date.now();
+  // Meta's own clock, not ours — the same idiom the inbound path uses. The
+  // server clock dated a Diagnostics replay's every delivery and failure to
+  // the day of the replay, and a redelivered failure drifted forward each
+  // time, in the run report and the CSV that shows them. The rank guards make
+  // an out-of-order timestamp harmless either way.
+  const now = Number(status.timestamp) ? Number(status.timestamp) * 1000 : Date.now();
 
   if (st === 'failed') {
     // A device that has acknowledged delivery cannot un-receive the message.
@@ -203,16 +246,42 @@ function countsForRun(runId) {
 // window, are not marketing, and Meta does not count them against the messaging
 // tier this cap exists to stay under — so answering a customer must not spend a
 // campaign's allowance. Campaign sends and test sends are the 'template' rows.
-const sentSinceQ = db.prepare(`
+//
+// Exported as a string so test.js asserts the plan of the statement this app
+// actually runs — once per message sent, on idx_messages_cap (src/lib/db.js).
+const SENT_SINCE_SQL = `
   SELECT count(*) AS n FROM (
       SELECT wa_id FROM messages
        WHERE dir = 'out' AND type = 'template' AND at >= ?
        GROUP BY wa_id
       HAVING sum(CASE WHEN status = 'failed' THEN 0 ELSE 1 END) > 0
   )
-`);
+`;
+const sentSinceQ = db.prepare(SENT_SINCE_SQL);
 
 const sentSince = at => sentSinceQ.get(at).n || 0;
+
+// When the next counted contact leaves the rolling 24 hours — the loop's park
+// deadline while the warm-up rung is the cap (warmup.js:capWindow). A contact
+// stays counted while ANY non-failed template send of theirs is inside the
+// window, sentSince's rule above, so they leave at their LATEST such send + 24h;
+// the earliest of those is the next free slot. The extra second lands the wake
+// strictly past the boundary, so the re-check cannot count the same contact
+// again and park for nothing. Asked at every cap park, which in a rolling window
+// is once per freed slot, so it is sentSince's range seek on idx_messages_cap —
+// never a read of the whole message history.
+const SLOT_FREES_SQL = `
+  SELECT min(last) AS at FROM (
+      SELECT max(at) AS last FROM messages
+       WHERE dir = 'out' AND type = 'template' AND at >= ? AND status IS NOT 'failed'
+       GROUP BY wa_id)`;
+const slotFreesQ = db.prepare(SLOT_FREES_SQL);
+const WINDOW_MS = 86400000;
+// `now` is a parameter for the same reason nextPending's is.
+const slotFreesAt = (now = Date.now()) => {
+  const at = slotFreesQ.get(now - WINDOW_MS).at;
+  return at == null ? null : at + WINDOW_MS + 1000;
+};
 
 // Which IST days this number actually sent on, as 'YYYY-MM-DD'. The warm-up
 // ladder counts sending days, and it used to know about them only from
@@ -245,7 +314,10 @@ const sendingDays = () => sendingDaysQ.all().map(r => r.day);
 // webhook is one Meta redelivers, which is a problem that fixes itself.
 const insertEvent = db.prepare('INSERT INTO webhook_events (received_at, body) VALUES (?, ?)');
 const stampEvent  = db.prepare('UPDATE webhook_events SET processed_at = ? WHERE id = ?');
-const countUnprocessed = db.prepare('SELECT count(*) AS n FROM webhook_events WHERE processed_at IS NULL');
+// Exported so test.js asserts the plan of this exact string: /health asks it on
+// every probe, and it must stay on idx_webhook_unprocessed (src/lib/db.js).
+const UNPROCESSED_COUNT_SQL = 'SELECT count(*) AS n FROM webhook_events WHERE processed_at IS NULL';
+const countUnprocessed = db.prepare(UNPROCESSED_COUNT_SQL);
 
 // Throws on failure by design. The route turns that throw into a 500.
 function recordEnvelope(rawText) {
@@ -256,9 +328,10 @@ function markEnvelopeProcessed(id) {
   stampEvent.run(Date.now(), id);
 }
 
-// Nothing in this app replays webhook_events yet — this is the only signal
-// that it needs to. Surfaced on /health (F5) rather than left to a log line in
-// the 500-entry ring buffer that /api/start wipes.
+// Unprocessed rows are the replay queue — Diagnostics → Replay
+// (services/ingest.js:replayUnprocessed) drains it, and this count is the
+// signal to press it. Surfaced on /health (F5) rather than left to a log line
+// in the 500-entry ring buffer that /api/start wipes.
 function unprocessedWebhookCount() {
   return countUnprocessed.get().n;
 }
@@ -321,6 +394,12 @@ const upsertOutThread = db.prepare(`
     last_at = max(threads.last_at, excluded.last_at)
 `);
 
+// Returns what applyStatus returns on the transition into 'failed' — or null —
+// for a status that arrived before this send was recorded (see onUnknownStatus
+// above). The CALLER hands that to services/campaign.js:handleDeliveryFailure,
+// exactly as services/ingest.js would have: what to do about a failure is a
+// campaign decision, and this module does not import the loop. Claimed after
+// the COMMIT, so the row the held status is about already exists.
 function recordOutbound({ wamid, waId, name, type = 'template', body = null, at = Date.now(), runId = null }) {
   db.exec('BEGIN');
   try {
@@ -331,7 +410,16 @@ function recordOutbound({ wamid, waId, name, type = 'template', body = null, at 
     db.exec('ROLLBACK');
     throw e;
   }
+  return claimHeld(wamid);
 }
+
+// The number an outbound message was sent TO, in the form the campaign dialed
+// it. An opt-out tap answers a template and carries that template's wamid as
+// context.id — and the wa_id the tap comes FROM is not always the same string
+// (services/ingest.js names the countries). A primary-key lookup, so asking it
+// for every tap costs nothing.
+const dialedQ = db.prepare("SELECT wa_id FROM messages WHERE wamid = ? AND dir = 'out'");
+const waIdForWamid = wamid => dialedQ.get(wamid)?.wa_id ?? null;
 
 // ── The send queue ─────────────────────────────────────────────────────────────
 // Written when a CSV is uploaded, walked when the campaign runs. The resume
@@ -362,20 +450,29 @@ const insertRecipient = db.prepare(`
 // adds one only for an untried row (a due retry is already inside `attempted`
 // as `retrying`), and the disabled branch preserves the ladder's last error
 // code — neither can work if the column stays behind in the table.
-const nextUntriedQ = db.prepare(`
-  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code FROM run_recipients
+// ladder_code and ladder_attempts travel for the same reason: this row is what
+// scheduleRetry is handed, and without them every contact reads as on the first
+// rung of whatever code failed them last — a ladder that never ends.
+//
+// Exported as the exact strings prepared here, because test.js asserts each
+// half's QUERY PLAN. A copy retyped into the test stays green while the shipped
+// statement drifts off its index, which is the one regression that test is for.
+const NEXT_UNTRIED_SQL = `
+  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code,
+         ladder_code, ladder_attempts FROM run_recipients
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason IS NULL
-   ORDER BY seq LIMIT 1
-`);
+   ORDER BY seq LIMIT 1`;
+const nextUntriedQ = db.prepare(NEXT_UNTRIED_SQL);
 
 // Ordered by DEADLINE, not by seq: within the ladder the honest queue is "whose
 // turn came up first", and idx_run_recipients_retry is (run_id, retry_after) so
 // this is the same seek that answers nextRetryAtQ.
-const nextDueRetryQ = db.prepare(`
-  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code FROM run_recipients
+const NEXT_DUE_RETRY_SQL = `
+  SELECT phone, name, seq, attempts, retry_after, skipped_reason, error_code,
+         ladder_code, ladder_attempts FROM run_recipients
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason = 'retry' AND retry_after <= ?
-   ORDER BY retry_after LIMIT 1
-`);
+   ORDER BY retry_after LIMIT 1`;
+const nextDueRetryQ = db.prepare(NEXT_DUE_RETRY_SQL);
 
 // The soonest a row waiting on backoff becomes sendable, or null when none are.
 // This is what tells a drained-but-not-finished run to wait rather than declare
@@ -384,6 +481,19 @@ const nextRetryAtQ = db.prepare(`
   SELECT min(retry_after) AS at, count(*) AS n FROM run_recipients
    WHERE run_id = ? AND wamid IS NULL AND skipped_reason = 'retry'
 `);
+
+// The loop's park deadline for a throttle on the sending NUMBER (lib/errors.js
+// SENDER_LEVEL): the latest live rung any contact on this run is waiting out for
+// such a code. Derived from the rows BOTH ladder entrances already write —
+// scheduleRetry at send time, requeueAfterDelivery from the webhook — so the
+// park needs no state of its own, survives a restart, and a replayed webhook
+// cannot extend it (the requeue is wamid-guarded). Asked before every send, so
+// it is exactly idx_run_recipients_retry's predicate plus a range on its key.
+const SENDER_THROTTLE_SQL = `
+  SELECT max(retry_after) AS until FROM run_recipients
+   WHERE run_id = ? AND skipped_reason = 'retry' AND wamid IS NULL
+     AND retry_after > ? AND error_code IN (${[...SENDER_LEVEL].join(',')})`;
+const senderThrottleQ = db.prepare(SENDER_THROTTLE_SQL);
 
 // skipped_reason and retry_after are cleared on success: a row that failed
 // once, waited, and then went out is a SENT row, not a sent-and-also-retrying
@@ -403,10 +513,25 @@ const markSkipped = db.prepare(`
 // attempts is incremented in SQL rather than read-modify-written in JS: the row
 // is the only place the count lives, and a crash between the read and the write
 // would otherwise hand the contact a free extra attempt on every restart.
+//
+// Two counts, because a contact can be on more than one ladder in a run.
+// `attempts` is the TOTAL — what "tried N×" and the report CSV render — and it
+// never resets. `ladder_attempts` is the rung on the ladder of `ladder_code`,
+// and restarts at 1 when a different code fails them: three network blips must
+// not spend 131049's three day-spaced rungs. The CASE compares against
+// ladder_code and never error_code — markSent nulls error_code on every accept,
+// and a webhook failure arrives after the accept, so a CASE on error_code would
+// restart at 1 on every rung and the ladder would never end. Every SET term
+// reads the row as it was before this UPDATE, so the CASE sees the OLD
+// ladder_code. The code is bound twice, positionally (node:sqlite cannot mix
+// ? with ?N).
+const LADDER_SET = `ladder_attempts = CASE WHEN ladder_code IS ? THEN ladder_attempts + 1 ELSE 1 END,
+         ladder_code = ?`;
 const markRetry = db.prepare(`
   UPDATE run_recipients
      SET skipped_reason = 'retry', error_code = ?, attempted_at = ?,
-         retry_after = ?, attempts = attempts + 1
+         retry_after = ?, attempts = attempts + 1,
+         ${LADDER_SET}
    WHERE run_id = ? AND phone = ?
 `);
 
@@ -422,15 +547,22 @@ const markRetry = db.prepare(`
 // a wamid the row no longer carries matches nothing. It also protects against
 // the out-of-order case — a stale failure for attempt two arriving after
 // attempt three has already gone out must not un-send attempt three.
+// The per-code count is the same two terms markRetry sets, for the same reason:
+// this is 131049's usual entrance, and the row it meets has had error_code
+// nulled by the accept.
 const requeueAfterDelivery = db.prepare(`
   UPDATE run_recipients
      SET wamid = NULL, skipped_reason = 'retry', error_code = ?,
-         attempted_at = ?, retry_after = ?, attempts = attempts + 1
+         attempted_at = ?, retry_after = ?, attempts = attempts + 1,
+         ${LADDER_SET}
    WHERE run_id = ? AND phone = ? AND wamid = ?
 `);
 
+// ladder_code / ladder_attempts: handleDeliveryFailure reads the rung off this
+// row, exactly as scheduleRetry reads it off nextPending's.
 const recipientQ = db.prepare(
-  'SELECT phone, name, seq, wamid, skipped_reason, error_code, attempts, retry_after '
+  'SELECT phone, name, seq, wamid, skipped_reason, error_code, attempts, retry_after, '
+  + 'ladder_code, ladder_attempts '
   + 'FROM run_recipients WHERE run_id = ? AND phone = ?');
 
 // `disabled` is broken out from `skipped` because it is the only skip that
@@ -519,7 +651,12 @@ const funnelQ = db.prepare(`
 function bucketOf(raw, code) {
   if (raw === 'read')   return 'delivered';
   if (raw !== 'gaveUp') return raw;
-  return skipDisposition(code) === 'permanent' ? 'unreachable' : 'failed';
+  if (skipDisposition(code) !== 'permanent') return 'failed';
+  // A permanent code that is the person's own choice (131050) is an opt-out,
+  // not an undeliverable number — the same split BUCKET_CASE makes for the
+  // never-attempted half through c.disabled_reason, and from the same answer
+  // suppressIfPermanent wrote there, so the two halves cannot disagree.
+  return disableReasonFor(code) === 'opt_out' ? 'optedOut' : 'unreachable';
 }
 
 const ZERO_FUNNEL = {
@@ -532,7 +669,8 @@ const ZERO_FUNNEL = {
 // "not on WhatsApp". It gathers both halves of that fact: someone disabled by an
 // EARLIER run's hard failure and never attempted here, and someone attempted
 // here who came back 131026. Which codes count is lib/errors.js:skipDisposition,
-// not a list kept twice.
+// not a list kept twice — and 131050, permanent but the person's own choice,
+// goes to optedOut beside the people who asked us to stop (bucketOf above).
 function funnelForRun(runId) {
   const f = { ...ZERO_FUNNEL };
   if (runId == null) return f;
@@ -664,18 +802,20 @@ const recordRecipientSkipped = (runId, phone, reason, errorCode = null) =>
   markSkipped.run(reason, errorCode, Date.now(), runId, phone);
 
 // Puts a contact back in the queue at a stated time instead of dropping them.
+// errorCode three times: error_code, then the two LADDER_SET terms.
 const recordRecipientRetry = (runId, phone, errorCode, retryAfter) =>
-  markRetry.run(errorCode, Date.now(), retryAfter, runId, phone);
+  markRetry.run(errorCode, Date.now(), retryAfter, errorCode, errorCode, runId, phone);
 
 // Same, for a send Meta accepted and then failed hours later. True when the row
 // was actually put back — false means the webhook was a redelivery, or was
 // about an attempt this contact has already moved past.
 const requeueFailedRecipient = (runId, phone, wamid, errorCode, retryAfter) =>
   (runId == null || !wamid ? false
-    : requeueAfterDelivery.run(errorCode, Date.now(), retryAfter, runId, phone, wamid).changes > 0);
+    : requeueAfterDelivery.run(errorCode, Date.now(), retryAfter, errorCode, errorCode,
+                               runId, phone, wamid).changes > 0);
 
-// One queue row, or null. The caller needs `attempts` to know which rung of the
-// ladder this contact is on, and `wamid` to know the webhook is not stale.
+// One queue row, or null. The caller needs the ladder columns to know which
+// rung this contact is on, and `wamid` to know the webhook is not stale.
 const recipientFor = (runId, phone) =>
   (runId == null ? null : recipientQ.get(runId, phone) || null);
 
@@ -685,6 +825,11 @@ function nextRetryForRun(runId) {
   const r = nextRetryAtQ.get(runId);
   return r && r.n ? { at: r.at, count: r.n } : null;
 }
+
+// When a throttle on the sending number lifts, or null when none is in force.
+// `now` is a parameter for the same reason nextPending's is.
+const senderThrottleUntil = (runId, now = Date.now()) =>
+  (runId == null ? null : (senderThrottleQ.get(runId, now).until ?? null));
 
 function progressForRun(runId) {
   if (runId == null) {
@@ -886,6 +1031,14 @@ function statusForRun(runId, pending) {
 // ponytail: LIMIT 100, no cursor. One campaign per CSV upload means a hundred
 // rows is a year of history for one business. If it ever needs paging, the
 // cursor is (started_at, id) and never started_at alone — timestamps tie.
+//
+// ponytail: also N+1 — progressForRun, countsForRun and funnelForRun below
+// each run once PER RETURNED RUN, so a hundred runs is ~300 queries where one
+// would do. Fine at the hundreds-of-recipients-per-run scale this app ships
+// at (measured cost only shows up in the hundred-thousand range); the upgrade
+// path is the same rule funnelForRun already applies to a single run's
+// BUCKET_CASE, just grouped by run_id (and bucket, code) so it answers every
+// run in this list in one pass instead of one query per run per aggregate.
 function listRuns({ limit = 100 } = {}) {
   return runsQ.all(Math.min(Math.max(Number(limit) || 100, 1), 500))
     // A run staged and never started has no recipients. It is noise, not history.
@@ -934,6 +1087,8 @@ module.exports = {
   startRun, recordOutbound,
   buildRun, nextPending, recordRecipientSent, recordRecipientSkipped,
   recordRecipientRetry, requeueFailedRecipient, recipientFor, runExists, discardUnstartedRun,
-  nextRetryForRun, lastRunSummary, sentSince, sendingDays, strandedWork,
+  nextRetryForRun, lastRunSummary, sentSince, slotFreesAt, SLOT_FREES_SQL, sendingDays, strandedWork,
   progressForRun, funnelForRun, bucketOf, skippedForRun, recipientsForRun, billableForRun,
+  waIdForWamid, UNPROCESSED_COUNT_SQL, SENT_SINCE_SQL,
+  senderThrottleUntil, SENDER_THROTTLE_SQL, NEXT_UNTRIED_SQL, NEXT_DUE_RETRY_SQL,
 };

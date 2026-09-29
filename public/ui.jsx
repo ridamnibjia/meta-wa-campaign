@@ -179,11 +179,18 @@ const Stat = ({ label, value, tone, hint }) => (
   </Card>
 );
 
-const Progress = ({ value, className }) => (
-  <div className={cn('h-2 w-full overflow-hidden rounded-full bg-secondary', className)}>
-    <div className="h-full rounded-full bg-primary transition-all duration-500" style={{ width: `${Math.min(100, Math.max(0, value))}%` }} />
-  </div>
-);
+const Progress = ({ value, className }) => {
+  // One clamp, read by both the bar's width and its own aria-valuenow — a
+  // caller passing an out-of-range value (150, -10) must not report an
+  // aria-valuenow outside aria-valuemin/max while the bar itself reads 100%/0%.
+  const pct = Math.min(100, Math.max(0, value));
+  return (
+    <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)}
+         className={cn('h-2 w-full overflow-hidden rounded-full bg-secondary', className)}>
+      <div className="h-full rounded-full bg-primary transition-all duration-500" style={{ width: `${pct}%` }} />
+    </div>
+  );
+};
 
 // ── Where every contact in the list ended up ───────────────────────────────────
 // The stat tiles on the dashboard and in History answer "how is it going". This
@@ -227,8 +234,20 @@ const FUNNEL_ROWS = [
     hint: 'Either every attempt was used, or the code was one the app never retries. Open the list — each row says which, and how many times it was tried. Nothing was billed.' },
   { key: 'unreachable', label: 'Cannot receive messages', tone: 'text-destructive',
     hint: 'Meta reports the number as undeliverable — usually not on WhatsApp. Switched off automatically, so later runs skip them.' },
+  // No longer only the never-attempted half: a contact messaged in THIS run
+  // who answered with 131050 (turned marketing off inside WhatsApp, mid-run)
+  // lands here too, and that one WAS attempted — "never attempted" would be
+  // wrong for them specifically, not just imprecise.
   { key: 'optedOut',    label: 'Opted out or switched off',
-    hint: 'Never attempted. Tapped “Stop promotions”, or you disabled them.' },
+    // Not "sent this message and opted out in response" — that would also be
+    // true of someone WhatsApp delivered this run's message to who then opted
+    // out, and that contact stays in `delivered` (bucketOf never rewrites a
+    // resolved wamid). Three populations land here: disabled before the queue
+    // reached them (nothing sent), disabled before a queued retry could go out
+    // (an earlier attempt was refused), and refused THIS run with 131050
+    // (attempted, and WhatsApp refused it). "Before anything went out" is false
+    // for the last two, so the hint says only what all three share.
+    hint: 'Tapped “Stop promotions” earlier, turned your marketing off inside WhatsApp, or switched off by you. Either nothing was sent to them, or WhatsApp refused the send — none of them received this run\'s message.' },
 ];
 
 // How many times this contact was actually put on the wire. `attempts` counts
@@ -446,7 +465,7 @@ function Funnel({ funnel, recipients, title, live = true }) {
           return (
             <div key={r.key} className={cn('rounded-md', isOpen && 'border border-border', !n && 'opacity-45')}>
               {canOpen ? (
-                <button type="button"
+                <button type="button" aria-expanded={isOpen}
                   onClick={() => { setOpen(isOpen ? null : r.key); setQ(''); }}
                   className="flex w-full items-baseline gap-3 rounded-md px-2 py-1.5 text-left hover:bg-accent">
                   {body}

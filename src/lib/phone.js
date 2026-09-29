@@ -4,38 +4,82 @@
 // Anything already carrying a country code passes through untouched — which is
 // why CSV-FORMAT.md tells people to always include one. The bare-10-digit branch
 // below has to guess a country, and it guesses India.
-function normalizePhone(raw) {
+//
+// Returns { d, guessed, shortPlus } rather than a bare string — `guessed` is
+// true only for the two branches below that ASSUMED India (bare 10 digits, or
+// a leading zero, prefix or not). `shortPlus` is true for the one case that is
+// flagged but never corrected: an explicit "+" in front of exactly 10 digits
+// shaped like an Indian mobile. parseCSV sums both into `guessedCountry` and
+// `shortPlus` and the upload route says so out loud (routes/contacts.js),
+// because a guess — or an unfixed number this likely to be wrong — must not be
+// silent. normalizePhone stays the public, digit-string-or-null contract every
+// other caller in src/ already relies on; neither flag leaves this file except
+// through parseCSV's counts.
+function normalize(raw) {
   if (!raw) return null;
-  let d = String(raw).trim().replace(/\D/g, '');
+  const s = String(raw).trim();
+  let d = s.replace(/\D/g, '');
   if (!d || d.length < 7) return null;
-  if (/^1(800|860|900)/.test(d)) return null;   // toll-free numbers
-  if (d.length === 10)                  d = '91' + d;        // 10-digit Indian
-  if (d.length === 11 && d[0] === '0') d = '91' + d.slice(1); // 0xxxxxxxxxx
-  if (d.length < 11 || d.length > 15) return null;
-  return d;
+  // 00 is the international access prefix European and Gulf exports dial
+  // instead of +. No real E.164 country code starts with 0, so a number long
+  // enough to still hold a country code after two digits are stripped is
+  // always the access prefix, never part of the number.
+  const strippedZeroZero = d.length > 11 && d.startsWith('00');
+  if (strippedZeroZero) d = d.slice(2);
+  // An explicit + or a stripped 00 means the digits that are left ARE the
+  // whole E.164 number, country code included — there is nothing left here
+  // for the bare 10-digit India guess to improve on. Without this, a Danish
+  // "+45 1234 5678" is 10 raw digits, the same length as a bare Indian
+  // mobile, and the d.length === 10 branch below prepended 91 onto a number
+  // that already named its own country: 914512345678, a wrong number nobody
+  // owns, not Denmark and not India either.
+  //
+  // Two exceptions, both about a prefix that turned out not to be real:
+  //  · a leading zero survives an explicit prefix (below) — no E.164 country
+  //    code starts with 0, so "+0…" or "00…" in front of one never named a
+  //    country at all, and the Indian trunk-zero reading is the only one left.
+  //  · "+" in front of exactly 10 digits shaped like an Indian mobile
+  //    (shortPlus, below) is not re-guessed — the same shape is a real
+  //    Singapore, New Zealand or Maldives number — but is flagged for the
+  //    operator, because it is also the single most common way the 91 goes
+  //    missing: the phone's own dialer wants "+" then the local number, and
+  //    the country code is the part that gets forgotten.
+  const explicitPrefix = /^\+/.test(s) || strippedZeroZero;
+  // Two toll-free rules, independent of each other. This one is raw-digit
+  // pattern matching and only trustworthy when the country is UNKNOWN — an
+  // explicit + means it is not: +1 860 is Hartford, Connecticut, a real area
+  // code that collides with the Indian 1860 service-line prefix in bare digits.
+  // Stays ahead of the guess below: a bare number shaped like this is rejected
+  // before it is ever considered for a 91 prefix.
+  if (!/^\+/.test(s) && /^1(800|860|900)/.test(d)) return null;
+  // Read off `d` before either guess below can change its length — see
+  // shortPlus's own paragraph above.
+  const shortPlus = /^\+/.test(s) && !strippedZeroZero && d.length === 10 && /^[6-9]/.test(d);
+  let guessed = false;
+  if (!explicitPrefix && d.length === 10) { d = '91' + d; guessed = true; }          // 10-digit Indian
+  if (d.length === 11 && d[0] === '0')    { d = '91' + d.slice(1); guessed = true; } // 0xxxxxxxxxx, prefix or not
+  // The Indian toll-free/shared-cost lines this rule actually exists for,
+  // however they are written — checked AFTER the guess, against the number as
+  // it will actually be dialled. Checked against the pre-guess digits instead,
+  // a bare 10-digit mobile that merely STARTS with "91" + 1800/1860/1900 as raw
+  // digits (9118001234, say — no country code yet, just a coincidence of
+  // digits) was misread as the +91 1800 line, while the same person written
+  // with a leading zero (09118001234: strip the 0, prefix 91 — the OTHER guess
+  // branch) reached this same final number and was untouched — one person, two
+  // spellings, two answers. Once we are looking at the guessed/explicit
+  // result, country code 91 is no longer in doubt, so a leading + still does
+  // not exempt it.
+  if (/^91(1800|1860|1900)/.test(d)) return null;
+  // 11 is a floor sized for the guessed branches: a 10-digit Indian mobile
+  // plus the 91 this function just prepended. It is the wrong floor for a
+  // number that named its own (shorter) country code and was never guessed
+  // at — E.164's own bound is a two-digit country code plus as few as six
+  // subscriber digits, eight total, so that is the floor once the prefix was
+  // explicit rather than assumed.
+  if (d.length < (explicitPrefix ? 8 : 11) || d.length > 15) return null;
+  return { d, guessed, shortPlus };
 }
-
-// RFC 4180 fields. Splitting on a bare comma was wrong in a way that never
-// announced itself: a quoted name like "Doe, John" shifted every column to its
-// right, the phone index landed on a name fragment, and the row was dropped
-// with no error anywhere. A quoted field may contain commas, and a doubled
-// quote inside one is a literal quote.
-function splitCsvLine(line) {
-  const out = [];
-  let field = '', quoted = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (quoted) {
-      if (c !== '"') { field += c; continue; }
-      if (line[i + 1] === '"') { field += '"'; i++; continue; }
-      quoted = false;
-    } else if (c === '"') quoted = true;
-    else if (c === ',')   { out.push(field); field = ''; }
-    else field += c;
-  }
-  out.push(field);
-  return out.map(f => f.trim());
-}
+const normalizePhone = raw => normalize(raw)?.d ?? null;
 
 // Excel's "Unicode CSV" and several CRM exports are UTF-16 with a BOM. Decoded
 // as UTF-8 every character grows a NUL neighbour, no header check can match,
@@ -126,16 +170,21 @@ const isPhoneHeader = h => /phone|mobile|whatsapp/i.test(h) || /contact\s*(no\b|
 // broken export goes unnoticed for a whole campaign.
 //
 // Also returned: `headers` (what the file actually called its columns, so a
-// refusal can name them instead of shrugging) and `guessedPhone` (non-null when
+// refusal can name them instead of shrugging), `guessedPhone` (non-null when
 // no header named a phone and the numbers were found by their VALUES — a guess
-// the operator is told about, because the preview is where they can check it).
+// the operator is told about, because the preview is where they can check it),
+// `guessedCountry` (how many numbers carried no country code and were assumed
+// +91 — a second, independent guess: a file can have a perfectly named phone
+// column and still be full of bare 10-digit numbers), and `shortPlus` (how
+// many carried a "+" and exactly 10 digits shaped like an Indian mobile —
+// dialled as written, never guessed, but just as worth a second look).
 function parseCSV(buffer) {
   const text = decodeCsv(buffer);
   const rows = tokenizeCsv(text, sniffDelimiter(text));
   // The same keys as the normal return: the route destructures all of them, and
   // an empty file that omits `duplicates` threw a TypeError AFTER a fresh empty
   // run had already been staged and made current.
-  if (!rows.length) return { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null };
+  if (!rows.length) return { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0, shortPlus: 0 };
 
   let hdr = rows[0];
   let start = 1;
@@ -194,6 +243,7 @@ function parseCSV(buffer) {
   // file that lost 25 rows to a broken export and one that lists 25 dealers
   // twice look identical from the outside, and only one of them is fine.
   const contacts = [], skipped = [], duplicates = [], seen = new Map();
+  let guessedCountry = 0, shortPlus = 0;
   for (let i = start; i < rows.length; i++) {
     const p = rows[i];
     // A modern Google export splits the name across two columns; an older one
@@ -209,19 +259,30 @@ function parseCSV(buffer) {
     for (const col of phoneCols) {
       const raw = p[col] || '';
       if (!raw) continue;
-      const d = normalizePhone(raw);
-      if (!d) continue;
+      // normalize() rather than normalizePhone() here, because this loop is the
+      // one place that can say WHICH rows the +91 guess actually fired for.
+      const norm = normalize(raw);
+      if (!norm) continue;
+      const { d, guessed, shortPlus: isShortPlus } = norm;
       usable = true;                       // the row had a number; a duplicate
       if (seen.has(d)) {                   // is not a row that failed to parse
         duplicates.push({ row: i + 1, name, dialStr: d, firstRow: seen.get(d) });
         continue;
       }
       seen.set(d, i + 1);
+      // Counted here, not above: two different spellings of the same number
+      // (a bare 10-digit and a leading-zero one, say) can both trigger the
+      // guess, and only the first becomes a contact. Counting the duplicate too
+      // would let guessedCountry exceed contacts.length, and the upload route's
+      // "N of TOTAL numbers" log line would stop making sense. Same rule for
+      // shortPlus, for the same reason.
+      if (guessed) guessedCountry++;
+      if (isShortPlus) shortPlus++;
       contacts.push({ name, phone: raw, dialStr: d, fields });
     }
     if (!usable) skipped.push({ row: i + 1, name, reason: 'no usable phone number in this row' });
   }
-  return { contacts, skipped, duplicates, headers: hdr, guessedPhone };
+  return { contacts, skipped, duplicates, headers: hdr, guessedPhone, guessedCountry, shortPlus };
 }
 
 // One CSV field on the way OUT, for the directory export. The name column is a
@@ -239,4 +300,4 @@ function csvField(v) {
   return /[",]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
-module.exports = { normalizePhone, parseCSV, splitCsvLine, csvField };
+module.exports = { normalizePhone, parseCSV, csvField };

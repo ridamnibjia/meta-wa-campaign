@@ -13,6 +13,19 @@ process.env.WA_UPLOAD_DIR = require('path').join(
 process.env.WA_MEDIA_DIR = require('path').join(
   require('os').tmpdir(), `wa-media-${process.pid}-${Date.now()}`);
 
+// Runtime state — campaign.json, warmup.json, opt-outs.json, inbox.json,
+// msg-index.json — goes to a throwaway directory too, for the same reason as
+// the two stores above. WA_DATA_DIR used to be blanked below (Object.assign),
+// which falls back to ROOT (src/config.js): every run of this suite left a
+// live campaign.json in the checkout, and running it in the owner's real
+// checkout would silently overwrite their actual campaign state. Unlike the
+// two stores above, store.js's writeJSON does not mkdir its target, and
+// several tests below write FILES.campaign/warmup directly — so the
+// directory has to exist before ./server (and its config) loads.
+process.env.WA_DATA_DIR = require('path').join(
+  require('os').tmpdir(), `wa-data-${process.pid}-${Date.now()}`);
+require('fs').mkdirSync(process.env.WA_DATA_DIR, { recursive: true });
+
 // The free-space floor defaults to 2 GB, which makes every media test a
 // referendum on how full the developer's laptop is. The floor is exercised
 // deliberately, in its own test, by raising it — so the default here is zero.
@@ -23,6 +36,102 @@ process.env.WA_MEDIA_MIN_FREE_BYTES = '0';
 // which is a suite that passes or hangs depending on the wall clock. The gate's
 // own arithmetic is tested directly, against fixed timestamps, further down.
 process.env.WA_QUIET_HOURS = '0';
+
+// Hermetic credentials. dotenv never overrides a variable that is already set —
+// not even one set to '' — so these win over whatever .env sits in the checkout.
+// The suite used to pass only on a machine whose .env held a live token: five
+// tests failed anywhere else (a fresh clone, a worktree, CI), and a test that
+// ever forgot to stub fetch would have spent that token on the real Graph API.
+// The fakes are just enough to get past "credentials not configured" to the
+// behaviour under test; everything secret is blanked, as on a clean install.
+Object.assign(process.env, {
+  ACCESS_TOKEN: 'test-token', PHONE_NUMBER_ID: 'test-phone',
+  WABA_ID: '', BUSINESS_ID: '', APP_ID: '', APP_SECRET: '', APP_PASSWORD: '',
+  WEBHOOK_VERIFY_TOKEN: '', CLAMAV_ADDRESS: '', FRONTEND_URL: '',
+  BIND_HOST: '', RENDER: '',
+});
+
+// Dozens of tests below (and server.js's own singleton, required next) spin up
+// a real HTTP server with http.createServer(...).listen(0, …) and tear it down
+// with a bare server.close(). Two separate ways that lets a LATER test's
+// listen(0) inherit a connection an EARLIER, already-closed server's client
+// (Node's global fetch, i.e. undici) still considers good, once the OS
+// recycles the ephemeral port — with ~20 such servers created and closed
+// across one `npm test` run, that recycling happens often enough to matter:
+//
+// 1. server.close() stops accepting NEW connections but leaves already-open
+//    (idle keep-alive) sockets running until the OTHER side gives them up.
+//    closeAllConnections() (Node >=18.2, within this app's >=22.5 floor)
+//    forces every socket a server holds shut immediately on close, so there
+//    is nothing already-open left for a later test to find.
+// 2. Even with (1), undici still POOLS a keep-alive connection the moment a
+//    response finishes without saying otherwise — so a socket opened and
+//    used by test A can sit in the pool, unused but not yet closed, for the
+//    entire gap until test A's teardown runs. A later test B whose server
+//    happens to reuse that port before undici has noticed the old socket is
+//    gone can have its fetch() reuse it, landing on whatever test A's server
+//    (or nothing at all) answers with instead of test B's own server — this
+//    is what produced a real 200 where a password-gated route must answer
+//    401, on a test that has nothing to do with authentication itself.
+//    Telling every response `Connection: close` (Node caps 'connection' on
+//    the REQUEST as a forbidden fetch header, so this has to be the SERVER's
+//    response header) stops undici from ever pooling the socket in the first
+//    place — closing (2) at the source rather than racing to clean up after
+//    it like (1) does.
+//
+// Patched once here, on the http module every createServer call below shares
+// — rather than editing every one of the dozens of individual test-server
+// call sites — and covers server.js's own singleton (required next; torn down
+// via io.close(), which closes this same instance) for free, installed before
+// requiring ./server for exactly that reason.
+{
+  const http = require('http');
+  const realCreateServer = http.createServer.bind(http);
+  http.createServer = (...args) => {
+    // http.createServer([options], [requestListener]) — every call site below
+    // passes exactly one function (an Express app or a raw handler). Popped
+    // off and re-attached as a SECOND 'request' listener, after our own: both
+    // fire for every request (http.Server's requestListener is just its first
+    // 'request' listener), in registration order, so ours setting the header
+    // always runs before the real handler has a chance to already have sent
+    // one — a route that answers synchronously will otherwise have flushed
+    // its headers before a listener added after it could touch them.
+    const listener = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+    const srv = realCreateServer(...args);
+    srv.on('request', (req, res) => res.setHeader('Connection', 'close'));
+    if (listener) srv.on('request', listener);
+    // listen(0) with no host binds the WILDCARD address (`::`/`0.0.0.0`).
+    // On BSD/Darwin a DIFFERENT process's bind to the SPECIFIC address
+    // 127.0.0.1:P is allowed to coexist with our wildcard bind on the same
+    // port P, and an incoming connection to 127.0.0.1:P is routed to the
+    // MORE SPECIFIC socket — not ours, even though our own listen(0)
+    // succeeded and .address().port says P. That is how a request this
+    // suite sends to its own freshly-bound port came back "Healthy" or
+    // "404 page not found": an unrelated local process (an IDE language
+    // server, confirmed with lsof/curl — see flake-report.md) already held
+    // 127.0.0.1 specifically on that port. Binding 127.0.0.1 ourselves
+    // removes the ambiguity: the OS can never hand listen(0) a port already
+    // held specifically on 127.0.0.1, so fetch()'s 127.0.0.1:P always
+    // reaches this server. Only the exact `listen(0, …)` shape the call
+    // sites below use is rewritten, to (0, '127.0.0.1', …) — anything that
+    // already names a host is left alone.
+    const realListen = srv.listen.bind(srv);
+    srv.listen = (...listenArgs) => {
+      if (listenArgs[0] === 0 && (listenArgs.length === 1 || typeof listenArgs[1] === 'function')) {
+        listenArgs.splice(1, 0, '127.0.0.1');
+      }
+      return realListen(...listenArgs);
+    };
+    const realClose = srv.close.bind(srv);
+    // closeAllConnections() is a no-op when nothing is open, so it is always
+    // safe to call before close() rather than only when something might be —
+    // defense in depth alongside Connection: close above, not a duplicate of
+    // it: this covers a socket that never got to send a response at all (a
+    // request still in flight when a test's finally block runs).
+    srv.close = (...closeArgs) => { srv.closeAllConnections(); return realClose(...closeArgs); };
+    return srv;
+  };
+}
 
 // Run: node test.js
 // ponytail: no framework, no fixtures. Pure functions only — nothing here
@@ -35,7 +144,7 @@ const {
   warmupStep, warmupCap, effectiveCap, todayKey, WARMUP_PLAN, W, graduated, dailyCount,
   sentSince, funnelForRun, startOfIstDay, nextIstMidnight, suppressIfPermanent,
   nextPending, recordRecipientRetry, deferPastQuietHours, USER_PAUSE, progressForRun,
-  strandedWork, sweepWebhookEvents, WEBHOOK_RETENTION_DAYS, RATE_LIMIT_RETRIES,
+  strandedWork, sweepWebhookEvents, WEBHOOK_RETENTION_DAYS, RATE_LIMIT_RETRIES, SWEEP_EVERY_MS,
   applyStatus, countsForRun, missingParams, resizeParamValues,
   rateFor, billableCount, estimateCost, spentCost, formatMoney,
   isWindowOpen, recordInbound, describeInbound, inboxSummary,
@@ -193,11 +302,26 @@ test('validateTemplateInput buttons — accepts a legal mix, enforces per-type c
   assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: false, buttons: [...qr(2), ...url(2), ...tel(1)] }), [], 'accepts a legal mix');
   assert.match(validateTemplateInput({ ...okBase, buttons: url(3) }).join(), /at most 2 URL/i, 'rejects 3 URL buttons');
   assert.match(validateTemplateInput({ ...okBase, buttons: tel(2) }).join(), /at most 1 (phone|call)/i, 'rejects 2 phone buttons');
-  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(3) }).join(), /at most 3 quick/i, 'the opt-out button counts toward the 3 quick-reply ceiling');
+  assert.match(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(10) }).join(), /at most 10 quick/i, 'the opt-out button counts toward the 10 quick-reply ceiling');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop' }] }).join(), /needs a URL/i, 'rejects a URL button with no url');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', text: 'Shop', url: 'javascript:alert(1)' }] }).join(), /https?:/i, 'rejects a non-http URL');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'URL', url: 'https://example.com' }] }).join(), /label/i, 'rejects a button with no label');
   assert.match(validateTemplateInput({ ...okBase, buttons: [{ type: 'COPY_CODE', text: 'x' }] }).join(), /button type/i, 'rejects an unknown button type');
+});
+
+test('validateTemplateInput buttons — 10 quick replies are current Meta policy, not the old 3', () => {
+  assert.deepEqual(validateTemplateInput({ ...okBase, addOptOut: true, buttons: qr(9) }), [],
+    '10 total (the opt-out plus 9 more) must be accepted, not just 3');
+});
+
+test('validateTemplateInput buttons — quick replies must sit together, opt-out included', () => {
+  const mixed = validateTemplateInput({ ...okBase, addOptOut: true, buttons: [url(1)[0], qr(1)[0]] }).join();
+  assert.match(mixed, /sit together/i,
+    'the opt-out (index 0) and the operator\'s own QUICK_REPLY (index 2) are split by a URL button — Meta rejects that order');
+
+  assert.deepEqual(
+    validateTemplateInput({ ...okBase, addOptOut: true, buttons: [...qr(2), ...url(1)] }),
+    [], 'both quick replies are contiguous with the opt-out — grouped, so this is fine');
 });
 
 test('the opt-out button is emitted first, before the operator\'s own', () => {
@@ -216,10 +340,10 @@ test('a blank sample slot is caught positionally, not by counting non-blanks els
     "['', 'Asha'] passed the old count-based check and Meta reviewed the 'there' fallback instead of the operator's word");
 });
 
-test('an empty CSV still answers with all three keys', () => {
+test('an empty CSV still answers with every key the route destructures', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
-  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null });
+  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0, shortPlus: 0 });
 });
 
 test('csvField — defuses formulas, strips control chars, quotes, and round-trips', () => {
@@ -246,6 +370,68 @@ testAsync('an empty template name never matches the whole WABA', async () => {
   assert.deepEqual(await validateTemplate(''),   { found: false, name: '' });
   assert.deepEqual(await validateTemplate('  '), { found: false, name: '  ' });
 });
+
+console.log('\nfetchTemplates — pagination');
+{
+  const { fetchTemplates } = require('./server');
+  testAsync('follows paging.next so a large WABA is not silently truncated', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-paging';
+    const real = global.fetch;
+    const urls = [];
+    global.fetch = async url => {
+      urls.push(String(url));
+      return urls.length === 1
+        ? { ok: true, status: 200, json: async () => ({
+            data: [{ name: 'a', status: 'APPROVED', category: 'MARKETING', language: 'en' }],
+            paging: { next: 'https://graph.facebook.com/v23.0/test-waba-paging/message_templates?after=CURSOR' },
+          }) }
+        : { ok: true, status: 200, json: async () => ({
+            data: [{ name: 'b', status: 'APPROVED', category: 'MARKETING', language: 'en' }],
+          }) };
+    };
+    try {
+      const r = await fetchTemplates();
+      assert.equal(urls.length, 2, 'a second page must be fetched');
+      assert.equal(urls[1], 'https://graph.facebook.com/v23.0/test-waba-paging/message_templates?after=CURSOR',
+        'the second call must follow paging.next, not repeat the first page');
+      assert.deepEqual(r.templates.map(t => t.name), ['a', 'b'], "both pages' templates must be returned, not just the first");
+    } finally { global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers — a wedged
+  // connection here would hold up the templates picker or a delete for minutes.
+  testAsync('fetchTemplates carries graphMs on every page', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-timeout';
+    const { TIMEOUTS } = require('./src/config');
+    const realTimeout = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return realTimeout(ms); };
+    const real = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    try {
+      await fetchTemplates();
+      assert.deepEqual(seen, [TIMEOUTS.graphMs]);
+    } finally { AbortSignal.timeout = realTimeout; global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+
+  testAsync('deleteTemplate carries graphMs', async () => {
+    const { deleteTemplate } = require('./server');
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-del-timeout';
+    const { TIMEOUTS } = require('./src/config');
+    const realTimeout = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return realTimeout(ms); };
+    const real = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ success: true }) });
+    try {
+      await deleteTemplate('some_template');
+      assert.deepEqual(seen, [TIMEOUTS.graphMs]);
+    } finally { AbortSignal.timeout = realTimeout; global.fetch = real; CFG.accessToken = savedToken; CFG.wabaId = savedWaba; }
+  });
+}
 
 console.log('\ntemplate row memory');
 test('a saved template row round-trips its header asset link', () => {
@@ -308,7 +494,346 @@ console.log('\nadopting a template — the attachment picked this session surviv
       'a session pick belongs to the template it was picked for');
   });
 
+  test('adoptTemplate refuses to switch template while a campaign is active', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.phase = 'waiting';
+    try {
+      const r = adoptTemplate('promo_b', shapedFor('promo_b'));
+      assert.deepEqual(r, { ok: false, error: 'A campaign is sending “promo_a” right now — stop it before switching templates.' },
+        'the remaining contacts of a live run must get the message the operator started');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { S.phase = savedPhase; }
+  });
+
+  test('adoptTemplate still allows re-validating the SAME template mid-campaign', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.phase = 'waiting';
+    try {
+      const r = adoptTemplate('promo_a', shapedFor('promo_a'));
+      assert.equal(r, undefined, 'a status refresh of the template already sending must not be refused');
+      assert.equal(S.config.templateStatus, 'APPROVED');
+    } finally { S.phase = savedPhase; }
+  });
+
+  // The name half of the lock is covered above by a different-name switch,
+  // which leaves `language` undefined on both calls and so is vacuously true
+  // for sameLang regardless of what that clause does — deleting `sameLang`
+  // entirely from templateLocked would not fail that test. This one holds
+  // the name fixed and only changes the language, which only a real sameLang
+  // check can catch.
+  test('adoptTemplate refuses a language switch even when the name stays the same', () => {
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo_a';
+    S.config.templateLanguage = 'en';
+    S.phase = 'waiting';
+    const variants = { found: true, templates: [
+      { name: 'promo_a', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}', headerFormat: null, headerText: null, buttons: [] },
+      { name: 'promo_a', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy', headerFormat: null, headerText: null, buttons: [] },
+    ] };
+    try {
+      const r = adoptTemplate('promo_a', variants, 'hi');
+      assert.deepEqual(r, { ok: false, error: 'A campaign is sending “promo_a” right now — stop it before switching templates.' },
+        'the same name under a different language is still a different outbound message');
+      assert.equal(S.config.templateLanguage, 'en', 'nothing is mutated by a refused language switch');
+    } finally { S.phase = savedPhase; }
+  });
+
+  test('Meta header shape wins over a stale row — no header on Meta clears both fields', () => {
+    saveTemplateRow({ name: 'adopt_stale_header', displayName: 'Stale', headerFormat: 'DOCUMENT',
+                      headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
+    S.config.templateName = '';
+    adoptTemplate('adopt_stale_header', { found: true, templates: [{
+      name: 'adopt_stale_header', status: 'APPROVED', category: 'MARKETING', language: 'en',
+      bodyText: 'Hi {{1}}', headerFormat: null, headerText: null, buttons: [],
+    }] });
+    assert.equal(S.config.headerFormat, null,
+      'Meta\'s current copy has no header — the row remembering DOCUMENT must not resurrect one');
+    assert.equal(S.config.headerAssetId, null, 'nothing to send a file for once there is no header');
+  });
+
+  test('Meta DOCUMENT header with a row still supplies which file', () => {
+    saveTemplateRow({ name: 'adopt_doc_header', displayName: 'Doc', headerFormat: 'DOCUMENT',
+                      headerAssetId: approvedAsset, bodyText: 'Hi {{1}}', varCount: 1, status: 'APPROVED' });
+    S.config.templateName = '';
+    adoptTemplate('adopt_doc_header', { found: true, templates: [{
+      name: 'adopt_doc_header', status: 'APPROVED', category: 'MARKETING', language: 'en',
+      bodyText: 'Hi {{1}}', headerFormat: 'DOCUMENT', headerText: null, buttons: [],
+    }] });
+    assert.equal(S.config.headerFormat, 'DOCUMENT', 'Meta decides the shape');
+    assert.equal(S.config.headerAssetId, approvedAsset, 'and the row still says which file for that shape');
+  });
+
   Object.assign(S.config, before);   // adoptTemplate writes broadly; leave S as found
+}
+
+console.log('\nadoptTemplate — language variants');
+{
+  const { adoptTemplate } = require('./server');
+  const before = JSON.parse(JSON.stringify(S.config));
+  const variants = { found: true, templates: [
+    { name: 'promo', language: 'en', status: 'REJECTED', category: 'MARKETING', bodyText: 'Hi {{1}}, en copy.', headerFormat: null, headerText: null },
+    { name: 'promo', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy.', headerFormat: null, headerText: null },
+  ] };
+
+  test('an explicit language adopts that variant, not whichever came first', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants, 'hi');
+    assert.equal(S.config.templateLanguage, 'hi');
+    assert.equal(S.config.templateStatus, 'APPROVED');
+    assert.equal(S.config.templateBody, 'Hi {{1}}, hi copy.');
+  });
+
+  test('no language given prefers the APPROVED variant over whichever Graph listed first', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants);
+    assert.equal(S.config.templateLanguage, 'hi', 'hi is APPROVED and en (listed first) is REJECTED');
+    assert.equal(S.config.templateStatus, 'APPROVED');
+  });
+
+  test('an explicit language Meta has no variant for is NOT_FOUND, not a silent fallback to another', () => {
+    S.config.templateName = '';
+    adoptTemplate('promo', variants, 'fr');
+    assert.equal(S.config.templateStatus, 'NOT_FOUND',
+      'sending under "fr" when only en/hi exist would be worse than silently sending a different language');
+  });
+
+  test('exact name beats a fuzzy match — a differently-named entry is never selected', () => {
+    const withDecoy = { found: true, templates: [
+      ...variants.templates,
+      // Graph's own &name= filter would never return this for name=promo;
+      // kept to prove the local selection does not trust an unfiltered
+      // result either. APPROVED, so a filter that forgot the name check
+      // would wrongly prefer it over BOTH real "promo" variants.
+      { name: 'promo_2', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'decoy', headerFormat: null, headerText: null },
+    ] };
+    S.config.templateName = '';
+    adoptTemplate('promo', withDecoy);
+    assert.equal(S.config.templateLanguage, 'hi', 'still the APPROVED promo variant, never promo_2');
+    assert.notEqual(S.config.templateBody, 'decoy');
+  });
+
+  // GET /api/validate-template?name=<running template> with no ?language= is
+  // exactly what the 15s status poll sends. With two APPROVED variants, "no
+  // language given" used to fall into the same "prefer APPROVED" branch as a
+  // fresh pick and could adopt whichever variant Meta's list happened to list
+  // first — switching the language of a campaign already sending, mid-run,
+  // from a request that only meant to ask "is it still approved".
+  test('a bare re-validate of the running template does not switch its language', () => {
+    // hi listed FIRST and en running: "prefer first APPROVED" (the no-language
+    // branch used by a genuinely fresh pick) would adopt hi here if the running
+    // identity were not checked first — the order below is what makes this
+    // test able to fail.
+    const bothApproved = { found: true, templates: [
+      { name: 'promo', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy.', headerFormat: null, headerText: null },
+      { name: 'promo', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, en copy.', headerFormat: null, headerText: null },
+    ] };
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo';
+    S.config.templateLanguage = 'en';
+    S.phase = 'waiting';
+    try {
+      adoptTemplate('promo', bothApproved);   // no third argument at all
+      assert.equal(S.config.templateLanguage, 'en', 'the campaign is sending en; a bare re-validate must stay on en');
+      assert.equal(S.config.templateBody, 'Hi {{1}}, en copy.');
+    } finally { S.phase = savedPhase; }
+  });
+
+  Object.assign(S.config, before);
+}
+
+console.log('\nadoptTemplate — named-variable templates are refused, not sent empty');
+{
+  const { adoptTemplate } = require('./server');
+  const before = JSON.parse(JSON.stringify(S.config));
+  const shapedBody = (name, bodyText, headerText = null) => ({ found: true, templates: [{
+    name, status: 'APPROVED', category: 'MARKETING', language: 'en',
+    bodyText, headerFormat: headerText ? 'TEXT' : null, headerText, buttons: [],
+  }] });
+
+  test('a body with a named variable sets templateUnsupported, naming the fix', () => {
+    S.config.templateName = '';
+    adoptTemplate('named_body', shapedBody('named_body', 'Hi {{first_name}}, welcome.'));
+    assert.match(S.config.templateUnsupported, /named variables/,
+      'the sentence must say why /start has to refuse this template rather than sending it empty');
+  });
+
+  test('a header with a named variable also sets templateUnsupported', () => {
+    S.config.templateName = '';
+    adoptTemplate('named_header', shapedBody('named_header', 'Hi {{1}}, welcome.', 'Sale {{promo_code}}'));
+    assert.match(S.config.templateUnsupported, /named variables/, 'a named header variable is just as unfillable as a named body one');
+  });
+
+  test('a positional-only body clears a stale templateUnsupported', () => {
+    S.config.templateName = '';
+    S.config.templateUnsupported = 'stale from a previous template';
+    adoptTemplate('positional', shapedBody('positional', 'Hi {{1}}, welcome.'));
+    assert.equal(S.config.templateUnsupported, null,
+      'switching to a {{1}}, {{2}}… template must clear the sentence left by the last one');
+  });
+
+  Object.assign(S.config, before);
+}
+
+console.log('\ntemplate routes — identity locked mid-campaign');
+{
+  // http/express are required locally: the module-level const of the same name
+  // further down the file is in the temporal dead zone at this point in the
+  // file's own top-to-bottom execution.
+  const http    = require('http');
+  const express = require('express');
+
+  const startTemplateServer = () => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/templates'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  };
+  const startSettingsServer = () => {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/settings'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  };
+
+  testAsync('/validate-template refuses a different template mid-campaign, and adopts nothing', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/validate-template?name=promo_b`)).json();
+      assert.equal(r.ok, false, 'the remaining contacts of a live run must get the message the operator started');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; }
+  });
+
+  testAsync('/validate-template still lets the same template re-validate mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName, savedToken = CFG.accessToken;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    // No token: fetchTemplates answers 'Access Token not set' rather than hitting
+    // the network. Getting THAT sentence back (not the lock's) is what proves the
+    // request reached the Graph call instead of being refused up front.
+    CFG.accessToken = '';
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/validate-template?name=promo_a`)).json();
+      assert.equal(r.error, 'Access Token not set', 'a same-template refresh reaches the Graph call rather than being refused by the lock');
+      assert.notEqual(r.ok, false, 'a same-template refresh must not read as a lock refusal');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; CFG.accessToken = savedToken; }
+  });
+
+  testAsync('POST /api/config refuses a templateName change mid-campaign, unchanged', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ templateName: 'promo_b' }),
+      })).json();
+      assert.equal(r.ok, false, '/config {templateName} must be refused while a campaign is sending promo_a');
+      assert.equal(S.config.templateName, 'promo_a', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; }
+  });
+
+  testAsync('POST /api/config refuses a templateLanguage change even with the same templateName, mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName, savedLang = S.config.templateLanguage;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a'; S.config.templateLanguage = 'en';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ templateName: 'promo_a', templateLanguage: 'hi' }),
+      })).json();
+      assert.equal(r.ok, false, 'the same template under a different language is still a different outbound message');
+      assert.equal(S.config.templateLanguage, 'en', 'nothing is mutated by a refused switch');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; S.config.templateLanguage = savedLang; }
+  });
+
+  testAsync('POST /api/config refuses before touching credentials, not just after, when the same request also switches templates mid-campaign', async () => {
+    // accessToken/phoneNumberId/wabaId used to be written unconditionally
+    // before the template-lock check below them in the handler, so a request
+    // refused for its templateName half had already landed its credential
+    // half — a refusal is supposed to mean "nothing happened", not "the part
+    // I checked first didn't happen".
+    const savedPhase = S.phase, savedName = S.config.templateName, savedToken = CFG.accessToken;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    CFG.accessToken = 'token-before';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ accessToken: 'token-after', templateName: 'promo_b' }),
+      })).json();
+      assert.equal(r.ok, false, 'the template half of this request is refused mid-campaign');
+      assert.equal(CFG.accessToken, 'token-before', 'a refused request must mutate nothing, including fields the lock does not itself guard');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; CFG.accessToken = savedToken; }
+  });
+
+  testAsync('POST /api/template/create still submits to Meta but does not adopt, mid-campaign', async () => {
+    const savedPhase = S.phase, savedName = S.config.templateName;
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-id';
+    const real = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).startsWith('http://127.0.0.1')) return real(url, opts);
+      return { ok: true, status: 200, json: async () => ({ id: 'meta-tpl-1', status: 'PENDING' }) };
+    };
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/template/create`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: 'Promo B Lock', bodyText: 'Hi {{1}}, our range is live.', sampleValues: ['Asha'] }),
+      })).json();
+      assert.equal(r.ok, false, 'C4: create still submits but does not adopt mid-campaign');
+      assert.equal(r.adopted, false);
+      assert.equal(S.config.templateName, 'promo_a', 'the live run keeps sending what it started with');
+      assert.ok(getTemplateRow('promo_b_lock'), 'Meta accepted the submission, so the local row still remembers it');
+    } finally {
+      global.fetch = real; s.close();
+      S.phase = savedPhase; S.config.templateName = savedName;
+      CFG.accessToken = savedToken; CFG.wabaId = savedWaba;
+    }
+  });
+
+  // /template/create adopts a successful submission by writing S.config
+  // directly rather than calling adoptTemplate (its row is Meta's own reply,
+  // not a fetched list to select from) — so the named-variable check has to
+  // be asked here too, or a template composed with {{first_name}} would read
+  // as sendable until the next unrelated re-validation happened to catch it.
+  testAsync('POST /api/template/create sets templateUnsupported for a named-variable body it still adopts', async () => {
+    const savedToken = CFG.accessToken, savedWaba = CFG.wabaId, savedUnsupported = S.config.templateUnsupported;
+    CFG.accessToken = 'test-token'; CFG.wabaId = 'test-waba-named';
+    const real = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).startsWith('http://127.0.0.1')) return real(url, opts);
+      return { ok: true, status: 200, json: async () => ({ id: 'meta-tpl-named', status: 'PENDING' }) };
+    };
+    const s = await startTemplateServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/template/create`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: 'Named Var', bodyText: 'Hi {{first_name}}, welcome.' }),
+      })).json();
+      assert.equal(r.ok, true, 'Meta accepts named variables — this app only cannot fill them later');
+      assert.match(S.config.templateUnsupported, /named variables/,
+        'adopting outside adoptTemplate must not skip the same unsupported check');
+    } finally {
+      global.fetch = real; s.close();
+      CFG.accessToken = savedToken; CFG.wabaId = savedWaba; S.config.templateUnsupported = savedUnsupported;
+    }
+  });
 }
 
 console.log('\nbuildParams');
@@ -400,6 +925,69 @@ test('normalizePhone — prefixes 91, strips zero and formatting, rejects toll-f
   assert.equal(normalizePhone('18001234567'), null, 'rejects toll-free numbers');
   assert.equal(normalizePhone('12345'), null, 'rejects numbers that are too short');
   assert.equal(normalizePhone(''), null, 'rejects empty input');
+});
+test('normalizePhone reads the 00 international prefix', () => {
+  assert.equal(normalizePhone('0044 20 7946 0958'), '442079460958', 'no country code starts with 0 — sending 0044… always fails');
+  assert.equal(normalizePhone('00971 50 123 4567'), '971501234567');
+});
+test('an explicit international prefix is trusted as the whole number — no India guess on top of it', () => {
+  // A Danish "+45 1234 5678" is 10 raw digits once formatting is stripped —
+  // the same length as a bare Indian mobile — so the d.length === 10 branch
+  // used to prepend 91 onto a number that already named its own country,
+  // producing 914512345678: not Denmark, not India, a wrong number nobody
+  // owns rather than either of the two real candidates.
+  assert.equal(normalizePhone('+45 1234 5678'), '4512345678', 'an explicit + names the country; there is nothing left here to guess');
+  assert.equal(normalizePhone('0045 1234 5678'), '4512345678', 'a stripped 00 access prefix is just as explicit as a +');
+  // Regression guards: this fix is scoped to "an explicit prefix was given",
+  // not "skip the guess always" — an explicit +91 number was never broken,
+  // and a number with no prefix at all must still fall back to the guess.
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'an explicit +91 number is unaffected');
+  assert.equal(normalizePhone('9000000001'), '919000000001', 'no prefix at all still falls back to the India guess');
+});
+test('toll-free rules: explicit + is trusted, Indian service lines are not', () => {
+  assert.equal(normalizePhone('+1 860 555 1234'), '18605551234', 'Hartford, Connecticut is a real area code');
+  assert.equal(normalizePhone('1860 123 4567'), null, 'a bare 1860 line is an Indian service number');
+  assert.equal(normalizePhone('+91 1800 123 4567'), null, 'the Indian toll-free the rule exists for, written the way CSV-FORMAT.md asks');
+  assert.equal(normalizePhone('91 1800 123 4567'), null);
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'an ordinary Indian mobile is untouched');
+});
+test('the Indian toll-free rule is checked against the number AFTER the +91 guess, not the bare digits', () => {
+  // Checking the pre-guess digits misread this bare 10-digit mobile as the
+  // +91 1800 line, because the raw string "9118001234" starts with "91" +
+  // "1800" by coincidence — a country code that did not exist yet, since
+  // nothing had prefixed one. The same person written with a leading zero
+  // took the OTHER branch (strip the 0, prefix 91) and was untouched by the
+  // rule either way, so one person got two different answers depending on
+  // which spelling they used.
+  assert.equal(normalizePhone('9118001234'), '919118001234', 'a bare mobile, not the toll-free line it coincidentally starts with');
+  assert.equal(normalizePhone('09118001234'), '919118001234', 'the same person, written with a leading zero, must agree with the bare form');
+});
+
+// Item 6 (b81ba20) found ONE row in the operator's real list broken by its own
+// fix: a stray "+" in front of a 10-digit Indian mobile with no "91" at all
+// used to guess India (correct) and, after that fix, was trusted as a
+// complete E.164 number instead — a malformed foreign number nobody owns, and
+// the real person silently missed the campaign. These two amendments narrow
+// the explicit-prefix rule back down without reopening the Danish/+45 case.
+test('no E.164 country code starts with 0, so a leading zero overrules an explicit prefix', () => {
+  // "+0…" and "00…" both carry no real country code — the prefix was stray —
+  // so the Indian trunk-zero reading is the only one left, unlike the plain
+  // 10-digit guess just above it, which an explicit prefix still skips.
+  assert.equal(normalizePhone('+0 98765 43210'), '919876543210', 'the + is stray; read as a bare Indian mobile with its own leading zero');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+0 98765 43210\n')).guessedCountry, 1,
+    'still a guess, so guessedCountry counts it the same as any other assumed-Indian number');
+});
+test('a "+" in front of exactly 10 digits shaped like an Indian mobile is dialled as written, and flagged', () => {
+  // The shape (a leading 6-9) is ALSO a real Singapore, New Zealand or
+  // Maldives number, so it is never re-guessed — only said out loud, the same
+  // one-per-contact rule as guessedCountry, for the operator to check.
+  assert.equal(normalizePhone('+98765 43210'), '9876543210', 'dialled exactly as written, not turned into a 12-digit +91 guess');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+98765 43210\n')).shortPlus, 1,
+    'counted once, the same one-per-contact rule as guessedCountry');
+  assert.equal(normalizePhone('+45 1234 5678'), '4512345678', 'unaffected — first digit 4 is not the shape of an Indian mobile');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+45 1234 5678\n')).shortPlus, 0);
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'unaffected — a real country code is already there, 12 digits not 10');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+91 90000 00001\n')).shortPlus, 0);
 });
 
 console.log('\nparseCSV');
@@ -525,6 +1113,30 @@ test('the value sniff never runs when a real phone header exists', () => {
   assert.equal(contacts.length, 1);
   assert.equal(contacts[0].dialStr, '919000000001', 'the account id stays an account id');
   assert.equal(guessedPhone, null);
+});
+test('parseCSV counts how many numbers were assumed Indian for lacking a country code', () => {
+  const csv = 'name,phone\nAsha,9000000001\nRahul,+91 90000 00002\n';
+  assert.equal(parseCSV(Buffer.from(csv)).guessedCountry, 1,
+    'one of the two rows carried no country code and was assumed +91 — the operator needs the count, not just a loaded file');
+});
+test('a fully +-written file guesses no country at all', () => {
+  const csv = 'name,phone\nAsha,+919000000001\nRahul,+919000000002\n';
+  assert.equal(parseCSV(Buffer.from(csv)).guessedCountry, 0);
+});
+test('guessedCountry never exceeds the contacts it describes, even when a guessed duplicate collapses away', () => {
+  // Two different spellings of the same number — one bare 10-digit, one with a
+  // leading zero — both need the +91 guess, and both normalize to one contact.
+  const csv = 'name,phone\nAsha,9000000001\nRahul,09000000001\n';
+  const { contacts, guessedCountry } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts.length, 1, 'the two rows collapse to one contact');
+  assert.equal(guessedCountry, 1,
+    'a guessed row that turns out to be a duplicate must not inflate the count past what "N of TOTAL numbers" can mean');
+});
+test('guessedCountry still counts a bare 10-digit number that collides with the toll-free digit pattern', () => {
+  const csv = 'name,phone\nAsha,9118001234\n';
+  const { contacts, guessedCountry } = parseCSV(Buffer.from(csv));
+  assert.equal(contacts[0].dialStr, '919118001234');
+  assert.equal(guessedCountry, 1, 'still a guess — the toll-free rule only rejects it once a 91 country code is actually in the number');
 });
 
 console.log('\nverifySignature');
@@ -657,6 +1269,25 @@ console.log('\nwarm-up ladder');
     // a finished ladder plus no cap of your own is no cap at all
     setup(new Array(50).fill(0).map((_, i) => 'd' + i)); S.config.dailyCap = 0;
     assert.equal(effectiveCap(), null);
+  });
+
+  // The day-start log announces the window the cap in force counts over.
+  // capWindow() says which: a rolling 24 hours while the rung governs, the IST
+  // day once your own lower cap does. The log named "any 24 hours"
+  // unconditionally, which is exactly wrong when your own cap is the one
+  // actually counting the calendar day instead.
+  test('the day-start log says "today" when your own lower cap governs, not "any 24 hours"', () => {
+    const { markWarmupDay, capWindow } = require('./server');
+    setup([]); S.config.dailyCap = 0;               // nothing of your own: the rung governs, rolling
+    markWarmupDay();
+    assert.equal(capWindow(), '24h', 'precondition: the rung is the cap in force');
+    assert.match(S.logs[S.logs.length - 1].msg, /at most 20 people in any 24 hours/);
+
+    setup([]); S.config.dailyCap = 5;                // below day 1's rung of 20: your own cap governs
+    markWarmupDay();
+    assert.equal(capWindow(), 'day', 'precondition: your own lower cap is the one counting');
+    assert.match(S.logs[S.logs.length - 1].msg, /at most 20 people today/,
+      'your own cap counts the IST day, not a rolling 24 hours, and the log must say so');
   });
   // The shipped default, read from a pristine copy of the module rather than
   // from the S every other test has been writing to. It was 1000, and a number
@@ -858,6 +1489,79 @@ console.log("\ntoday's send count — refused sends give the slot back");
     assert.equal(applyStatus({ id: 'day-6', status: 'failed', errors: [{ code: 131049 }] }), undefined);
     assert.equal(db.prepare('SELECT status FROM messages WHERE wamid = ?').get('day-6').status, 'read');
   });
+
+  // ── Meta's window is rolling, and so is the rung's ─────────────────────────
+  // Meta counts its messaging limit over a ROLLING 24 hours. While the warm-up
+  // rung is the cap in force — a new number, the one with no track record — a
+  // calendar-day count let a batch at 23:00 and another at 00:05 put twice the
+  // rung inside one rolling window. The operator's own cap is a daily number
+  // they chose, so it keeps counting the IST day. Last in this block: the rows
+  // below are dated after BASE, and the assertions above count from BASE.
+  const DAY = 86400000;
+  const { capCount, capWindow, slotFreesAt, SLOT_FREES_SQL } = require('./server');
+  const withLadder = (fn) => {
+    const saved = { days: [...W.days], enabled: W.enabled, cap: S.config.dailyCap, quality: S.quality };
+    try { fn(); } finally {
+      Object.assign(W, { days: saved.days, enabled: saved.enabled });
+      S.config.dailyCap = saved.cap; S.quality = saved.quality;
+    }
+  };
+
+  test('the rung counts a rolling 24 hours; your own lower cap counts the IST day', () => withLadder(() => {
+    Object.assign(W, { enabled: true, days: ['2026-01-01'] }); S.quality = 'GREEN';
+    S.config.dailyCap = 0;
+    assert.equal(capWindow(), '24h', 'day 2 with no cap of your own: the warm-up rung is the cap in force');
+    assert.equal(capCount(), sentSince(Date.now() - DAY), 'so the count is asked over the last 24 hours');
+    S.config.dailyCap = 10;                       // below day 2's rung of 50
+    assert.equal(capWindow(), 'day', 'your own lower cap is a daily number you chose — it counts the IST day');
+    assert.equal(capCount(), dailyCount(), 'which is exactly today\'s count');
+    S.config.dailyCap = 0; W.enabled = false;
+    assert.equal(capWindow(), 'day', 'no ceiling of any kind has nothing rolling to count');
+  }));
+
+  test('a send 24 hours and a second old has left the rolling count; one a minute inside it has not', () => withLadder(() => {
+    Object.assign(W, { enabled: true, days: ['2026-01-01'] }); S.quality = 'GREEN'; S.config.dailyCap = 0;
+    const before = capCount();
+    out({ wamid: 'roll-old', waId: '919600000021', name: 'Asha', body: 'x', at: Date.now() - DAY - 1000, runId: run });
+    assert.equal(capCount(), before, 'a send outside Meta\'s window must not hold one of the rung\'s slots');
+    try {
+      out({ wamid: 'roll-in', waId: '919600000022', name: 'Rahul', body: 'x', at: Date.now() - DAY + 60000, runId: run });
+      assert.equal(capCount(), before + 1, 'one still inside it does, whichever IST day it fell on');
+    } finally {
+      // Gone once asserted: 'roll-in' leaves the real window a minute from now,
+      // and a slot freeing mid-suite would decide how long a later test's loop
+      // parks at the ceiling.
+      db.prepare("DELETE FROM messages WHERE wamid IN ('roll-old', 'roll-in')").run();
+      db.prepare("DELETE FROM threads WHERE wa_id IN ('919600000021', '919600000022')").run();
+    }
+  }));
+
+  // When the next counted contact leaves the window. A contact stays counted
+  // while ANY non-failed send of theirs is inside it, so they leave at their
+  // LATEST send + 24h, and the earliest of those is the next free slot. Asked
+  // at a fixed instant later than every other row in this shared database.
+  test('slotFreesAt — the earliest-leaving contact, at their latest send + 24h + 1s', () => {
+    const T = Date.parse('2035-01-01T12:00:00Z'), H = 3600000;
+    assert.equal(slotFreesAt(T), null, 'nothing inside the window, nothing to wait for');
+    out({ wamid: 'slot-a1', waId: '919600000031', name: 'Asha', body: 'x', at: T - 23 * H, runId: run });
+    out({ wamid: 'slot-a2', waId: '919600000031', name: 'Asha', body: 'x', at: T - 2 * H, runId: run });
+    assert.equal(sentSince(T - DAY), 1, 'two sends to one person are one of the rung\'s slots');
+    assert.equal(slotFreesAt(T), T - 2 * H + DAY + 1000,
+      'and it frees at their LATER send — the earlier one leaving the window frees nothing');
+    out({ wamid: 'slot-b', waId: '919600000032', name: 'Rahul', body: 'x', at: T - 10 * H, runId: run });
+    assert.equal(slotFreesAt(T), T - 10 * H + DAY + 1000, 'the earliest of the contacts\' latest sends is the next free slot');
+    out({ wamid: 'slot-c', waId: '919600000033', name: 'Marco', body: 'x', at: T - 20 * H, runId: run });
+    applyStatus({ id: 'slot-c', status: 'failed', errors: [{ code: 131049, title: 'refused' }] });
+    assert.equal(slotFreesAt(T), T - 10 * H + DAY + 1000,
+      'a refused send holds no slot, so it cannot be the one that frees next');
+  });
+
+  test('the next free slot is a seek on the cap index — it is asked at every cap park', () => {
+    const d = openDb(':memory:');
+    const plan = d.prepare('EXPLAIN QUERY PLAN ' + SLOT_FREES_SQL).all(0).map(r => r.detail).join(' | ');
+    assert.match(plan, /idx_messages_cap/, 'the last 24 hours are a range on the covering cap index');
+    assert.doesNotMatch(plan, /SCAN messages/, 'never a read of the whole message history');
+  });
 }
 
 console.log('\nthe funnel — every contact in exactly one bucket');
@@ -982,6 +1686,30 @@ console.log('\nthe funnel — every contact in exactly one bucket');
     assert.equal(sums(f), f.total);
   });
 
+  // An ATTEMPTED contact reaches optedOut only through bucketOf — the half of the
+  // rule SQL cannot express — so 131050 is exactly where the card and the list
+  // behind it could disagree, if one asked bucketOf and the other did not.
+  test('a contact who turned marketing off is an opt-out in the counts and the list alike', () => {
+    const run = openRun('funnel-131050');
+    const p = who(3);
+    buildRun(run, p);
+    recordRecipientSkipped(run, p[0].dialStr, 'failed', 131050);             // met at send time
+    recordRecipientSent(run, p[1].dialStr, 'fo-1');                           // accepted, refused by webhook
+    out({ wamid: 'fo-1', waId: p[1].dialStr, name: p[1].name, body: 'x', runId: run });
+    applyStatus({ id: 'fo-1', status: 'failed', errors: [{ code: 131050, title: 'x' }] });
+    recordRecipientSkipped(run, p[2].dialStr, 'skipped', 131026);           // a number that cannot receive
+
+    const f = funnelForRun(run);
+    assert.equal(f.optedOut, 2, 'both entrances file a 131050 with the opt-outs');
+    assert.equal(f.unreachable, 1, 'only the number Meta cannot deliver to is unreachable');
+    assert.equal(sums(f), f.total, 'and the buckets still sum to the list');
+    const counted = {};
+    for (const r of M.recipientsForRun(run)) counted[r.bucket] = (counted[r.bucket] || 0) + 1;
+    for (const k of ['delivered', 'sent', 'pending', 'retrying', 'failed', 'unreachable', 'optedOut']) {
+      assert.equal(counted[k] || 0, f[k], `the "${k}" list has ${counted[k] || 0} contacts but the card says ${f[k]}`);
+    }
+  });
+
   // A delivery failure the webhook put back on the ladder un-stamps the wamid.
   // The contact is owed another attempt, so they read as retrying rather than as
   // the send Meta already refused.
@@ -1026,6 +1754,67 @@ console.log('\nundeliverable numbers switch themselves off');
     assert.equal(suppressIfPermanent(phone, 999999, 'Unknown'), false);
     assert.equal(M.contacts.isDisabled(phone), false);
   });
+
+  // Meta sometimes puts the real reason in error_subcode under a generic code —
+  // 100 "invalid parameter" carrying 131026. The skip branch matched on the
+  // subcode but reported the CODE, so everything downstream saw 100, which
+  // skipDisposition calls 'fix': the number was never switched off, the next run
+  // paid to try it again, and the report told the operator to re-check the
+  // template.
+  testAsync('a skip signalled by subcode is acted on by the code that matched', async () => {
+    const phone = '919400000011';
+    await withLoop(async () => graphErr({ code: 100, error_subcode: 131026, message: 'x' }), async h => {
+      const r = await M.sendTemplate({ name: 'Marco', dialStr: phone });
+      assert.equal(r.skip, true, 'the subcode is a skippable code, so this is a skip');
+      assert.equal(r.errorCode, 131026,
+        'the code acted on is the code that matched — reporting 100 files a dead number under "fix the template"');
+      assert.match(r.hint || '', /not on WhatsApp/, 'and the hint explains that code, not the generic one');
+
+      const run = h.stage([{ dialStr: phone, name: 'Marco' }], 'subcode-skip');
+      h.start();
+      await h.until(() => h.M.S.phase === 'done');
+      assert.equal(M.contacts.isDisabled(phone), true,
+        'switched off like any other 131026 — or every later run pays to try it again');
+      assert.equal(h.row(run, phone).error_code, 131026, 'and the queue row carries the code the report explains');
+    });
+  });
+
+  // 131050 is the person turning marketing from this business off inside
+  // WhatsApp. Switched off by the same one decision, but as an OPT-OUT: filed
+  // with the people who asked us to stop, never with the numbers that cannot
+  // receive messages — and still off when the next run is staged.
+  testAsync('a 131050 at send time switches the contact off as an opt-out, not as unreachable', async () => {
+    const phone = '919400000031';
+    await withLoop(async () => graphErr({ code: 131050, message: 'Unable to deliver message: the user has stopped marketing messages' }), async h => {
+      const run = h.stage([{ dialStr: phone, name: 'Asha' }], 'optout-send');
+      h.start();
+      await h.until(() => h.M.S.phase === 'done');
+      assert.equal(M.contacts.getRow(phone)?.disabled_reason, 'opt_out',
+        'they asked to stop — "not on WhatsApp" would be the report inventing a fact about their number');
+      const f = M.funnelForRun(run);
+      assert.equal(f.optedOut, 1, 'counted with the people who asked us to stop');
+      assert.equal(f.unreachable, 0, 'and not as a number Meta cannot deliver to');
+      assert.equal(f.delivered + f.sent + f.pending + f.retrying + f.failed + f.unreachable + f.optedOut, f.total,
+        'the buckets still sum to the list');
+      assert.equal(h.row(run, phone).skipped_reason, 'skipped',
+        'a skip, like 131026 — an opt-out is not a failure the operator can fix');
+      assert.equal(h.M.S.failLog.some(x => x.phone === phone), false, 'so it stays out of the failure list');
+
+      const next = h.M.stageRun([{ dialStr: phone, name: 'Asha' }], 'optout-next');
+      assert.equal(h.row(next, phone).skipped_reason, 'disabled', 'the next run stages them already switched off');
+      assert.equal(M.funnelForRun(next).optedOut, 1, 'and counts them as an opt-out there too');
+    });
+  });
+
+  // The subcode case 3.6 fixed for 131026 applies here too: under a generic 100
+  // the person would be filed as "fix the template" and messaged again next run.
+  testAsync('a 131050 signalled by subcode is still the person opting out', async () => {
+    await withLoop(async () => graphErr({ code: 100, error_subcode: 131050, message: 'x' }), async () => {
+      const r = await M.sendTemplate({ name: 'Rahul', dialStr: '919400000032' });
+      assert.equal(r.skip, true, 'about the recipient, so a skip');
+      assert.equal(r.errorCode, 131050, 'acted on by the code that matched, which is what switches them off as an opt-out');
+    });
+  });
 }
 
 console.log('\nstatus');
@@ -1043,6 +1832,12 @@ const seedOut = (wamid, waId = '911', runId = null, status = 'accepted') => {
         .run(wamid, waId, status, runId);
 };
 const statusOf = wamid => testDb.prepare('SELECT status, error_code, error_title FROM messages WHERE wamid = ?').get(wamid);
+// A run of the test's own, taken from the sequence. These tests used fixed ids
+// (7, 9, 10, 11), which only held while no earlier test happened to create that
+// many runs: one more run anywhere above, and run 9 was a funnel test's run with
+// its own messages, counted into these assertions.
+const freshRun = () => Number(testDb.prepare('INSERT INTO campaign_runs (started_at) VALUES (?)')
+  .run(Date.now()).lastInsertRowid);
 
 test('status advances sent to delivered to read', () => {
   seedOut('m1');
@@ -1060,9 +1855,10 @@ test('a late delivered after read is ignored', () => {
   assert.equal(statusOf('m2').status, 'read');
 });
 test('a read with no preceding delivered counts as delivered', () => {
-  seedOut('m3', '911', 7);
+  const run = freshRun();
+  seedOut('m3', '911', run);
   applyStatus({ id: 'm3', status: 'read' });
-  assert.equal(countsForRun(7).delivered, 1);
+  assert.equal(countsForRun(run).delivered, 1);
 });
 test('an unknown status value is ignored', () => {
   seedOut('m4', '911', null, 'sent');
@@ -1097,37 +1893,129 @@ test('a status for an unknown wamid changes nothing and does not throw', () => {
   assert.doesNotThrow(() => applyStatus({ id: 'never-sent', status: 'read' }));
   assert.equal(statusOf('never-sent'), undefined);
 });
+// Meta stamps every status with the moment it happened. status_at used to be
+// the server's clock at processing time, so a Diagnostics replay days after a
+// parser fix re-dated every delivery and failure to the replay day — and that
+// is the time runDetail and the downloadable report show.
+test('a status keeps the time Meta says it happened, not the time it was processed', () => {
+  const statusAt = wamid => testDb.prepare('SELECT status_at FROM messages WHERE wamid = ?').get(wamid).status_at;
+  const t0 = 1700000000;   // seconds, the way Meta sends it
+  seedOut('ts-deliv'); seedOut('ts-fail'); seedOut('ts-none');
+  applyStatus({ id: 'ts-deliv', status: 'delivered', timestamp: String(t0) });
+  applyStatus({ id: 'ts-fail', status: 'failed', timestamp: String(t0 + 60),
+                errors: [{ code: 131049, title: 'x' }] });
+  assert.equal(statusAt('ts-deliv'), t0 * 1000, 'replay must not re-date history to the replay day');
+  assert.equal(statusAt('ts-fail'), (t0 + 60) * 1000, 'nor a failure — its time is in the report too');
+
+  const before = Date.now();
+  applyStatus({ id: 'ts-none', status: 'sent' });
+  assert.ok(statusAt('ts-none') >= before, 'a status with no timestamp is still stamped — with the moment it was seen');
+});
 test('countsForRun sums per-contact statuses', () => {
-  seedOut('r1', '9111', 9); seedOut('r2', '9112', 9); seedOut('r3', '9113', 9); seedOut('r4', '9114', 9);
+  const run = freshRun();
+  seedOut('r1', '9111', run); seedOut('r2', '9112', run); seedOut('r3', '9113', run); seedOut('r4', '9114', run);
   applyStatus({ id: 'r1', status: 'read' });
   applyStatus({ id: 'r2', status: 'delivered' });
   applyStatus({ id: 'r3', status: 'failed', errors: [{ code: 1, title: 'x' }] });
-  assert.deepEqual(countsForRun(9), { accepted: 4, delivered: 2, read: 1, failed: 1 });
+  assert.deepEqual(countsForRun(run), { accepted: 4, delivered: 2, read: 1, failed: 1 });
 });
 // The counts are about people, not rows. A contact the retry ladder reaches on
 // a second attempt has TWO outbound rows in one run, and counting rows reported
 // three accepted on a run of two while leaving the recovered contact inside
 // `failed` beside their own `delivered`.
+const laterRun = freshRun();          // shared with the test after this one
 test('a contact reached on a later attempt is delivered, not accepted twice and not still failed', () => {
-  seedOut('r5a', '9115', 10); seedOut('r6', '9116', 10);
+  seedOut('r5a', '9115', laterRun); seedOut('r6', '9116', laterRun);
   applyStatus({ id: 'r5a', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
   applyStatus({ id: 'r6', status: 'delivered' });
-  assert.deepEqual(countsForRun(10), { accepted: 2, delivered: 1, read: 0, failed: 1 },
+  assert.deepEqual(countsForRun(laterRun), { accepted: 2, delivered: 1, read: 0, failed: 1 },
     'while the retry is still pending the contact is honestly a failure');
 
-  seedOut('r5b', '9115', 10);                       // the retry goes out
+  seedOut('r5b', '9115', laterRun);                 // the retry goes out
   applyStatus({ id: 'r5b', status: 'delivered' });
-  assert.deepEqual(countsForRun(10), { accepted: 2, delivered: 2, read: 0, failed: 0 },
+  assert.deepEqual(countsForRun(laterRun), { accepted: 2, delivered: 2, read: 0, failed: 0 },
     'two people were on this run, and both of them heard from us');
 });
 test('a contact whose every attempt failed stays failed', () => {
-  seedOut('r7a', '9117', 11); seedOut('r7b', '9117', 11);
+  const run = freshRun();
+  seedOut('r7a', '9117', run); seedOut('r7b', '9117', run);
   applyStatus({ id: 'r7a', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
   applyStatus({ id: 'r7b', status: 'failed', errors: [{ code: 131049, title: 'cap' }] });
-  assert.deepEqual(countsForRun(11), { accepted: 1, delivered: 0, read: 0, failed: 1 });
+  assert.deepEqual(countsForRun(run), { accepted: 1, delivered: 0, read: 0, failed: 1 });
 });
 test('countsForRun on an empty run returns zeros, not nulls', () => {
   assert.deepEqual(countsForRun(999), { accepted: 0, delivered: 0, read: 0, failed: 0 });
+});
+// Meta's status webhook can beat the send API's own response, and the message
+// row only exists once recordOutbound runs — after the send's awaits. A status
+// landing in that window used to be logged and dropped, with the envelope
+// stamped processed, so not even Replay could bring it back.
+// Below the tests above on purpose: they bind run ids 7–11 by hand, and an
+// auto-numbered run made before them could take one of those ids.
+const newRunRow = label => Number(testDb
+  .prepare('INSERT INTO campaign_runs (started_at, label) VALUES (?, ?)').run(Date.now(), label).lastInsertRowid);
+test('a status that beats its own send is applied when the send is recorded', () => {
+  const runId = newRunRow('race');
+  applyStatus({ id: 'wamid.RACE', status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)),
+                errors: [{ code: 131049, title: 'x' }], recipient_id: '919000004301' });
+  assert.equal(statusOf('wamid.RACE'), undefined, 'nothing to update yet — the send has not been recorded');
+
+  const f = recordOutbound({ wamid: 'wamid.RACE', waId: '919000004301', name: 'Asha', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE').status, 'failed', 'the early status is applied, not lost');
+  assert.deepEqual(f, { failed: true, waId: '919000004301', runId, wamid: 'wamid.RACE', code: 131049, title: 'x' },
+    'and handed back in the shape handleDeliveryFailure takes — a failure the ladder never sees is a contact never retried');
+
+  assert.equal(recordOutbound({ wamid: 'wamid.CALM', waId: '919000004302', name: 'Rahul', body: 'x', runId }), null,
+    'a send nothing raced returns null, so the caller has nothing to hand on');
+  applyStatus({ id: 'wamid.EARLY-SENT', status: 'sent' });
+  assert.equal(recordOutbound({ wamid: 'wamid.EARLY-SENT', waId: '919000004303', name: 'Marco', body: 'x', runId }), null,
+    'an early status that is not a failure is applied quietly — there is nothing to retry');
+  assert.equal(statusOf('wamid.EARLY-SENT').status, 'sent');
+});
+// The hold keeps one entry PER STATUS VALUE, not one per wamid (onUnknownStatus
+// above) — a send that raced two DIFFERENT statuses before this server had
+// recorded it at all has to replay both, in arrival order, when recordOutbound
+// finally claims them. Nothing above isolates this: every race test so far
+// holds exactly one status ahead of the row.
+test('two different statuses held for one wamid are both replayed, in order', () => {
+  const runId = newRunRow('race-multi');
+  applyStatus({ id: 'wamid.RACE2', status: 'sent' });
+  applyStatus({ id: 'wamid.RACE2', status: 'failed', errors: [{ code: 131049, title: 'x' }] });
+  assert.equal(statusOf('wamid.RACE2'), undefined, 'still nothing to update — the send has not been recorded');
+
+  const f = recordOutbound({ wamid: 'wamid.RACE2', waId: '919000004305', name: 'Asha', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE2').status, 'failed',
+    'both held statuses are replayed in arrival order — sent, then the failure that followed it');
+  assert.deepEqual(f, { failed: true, waId: '919000004305', runId, wamid: 'wamid.RACE2', code: 131049, title: 'x' },
+    'the descriptor from the SECOND held status is still handed back, so the ladder sees the failure');
+});
+test('a held failure survives a stale held status that arrived after it', () => {
+  const runId = newRunRow('race-stale');
+  applyStatus({ id: 'wamid.RACE3', status: 'failed', errors: [{ code: 131049, title: 'x' }] });
+  applyStatus({ id: 'wamid.RACE3', status: 'delivered' });      // Meta redelivers and promises no order
+  assert.equal(statusOf('wamid.RACE3'), undefined);
+
+  const f = recordOutbound({ wamid: 'wamid.RACE3', waId: '919000004306', name: 'Rahul', body: 'x', runId });
+  assert.equal(statusOf('wamid.RACE3').status, 'failed',
+    'a device cannot un-receive a message — the stale held "delivered" must not overwrite the failure');
+  assert.deepEqual(f, { failed: true, waId: '919000004306', runId, wamid: 'wamid.RACE3', code: 131049, title: 'x' },
+    'claimHeld must not let the later no-op status (the || in its loop) erase the earlier failure descriptor');
+});
+test('the early-status hold is bounded — statuses nobody claims cannot grow it forever', () => {
+  // Another tool sending from the same number produces a status for every
+  // message it sends, and none of them will ever be claimed. The hold keeps the
+  // newest 500. Muted and restored: 501 identical warnings say nothing, and a
+  // full ring buffer would break every later test that reads S.logs.
+  const logs = S.logs.slice(), out = console.log;
+  console.log = () => {};
+  try {
+    for (let i = 0; i <= 500; i++) applyStatus({ id: `wamid.FLOOD${i}`, status: 'delivered' });
+  } finally { console.log = out; S.logs.splice(0, S.logs.length, ...logs); }
+
+  recordOutbound({ wamid: 'wamid.FLOOD0', waId: '919000004304', name: 'Sarah', body: 'x' });
+  assert.equal(statusOf('wamid.FLOOD0').status, 'accepted', 'the oldest was let go — the hold is capped, not a leak');
+  recordOutbound({ wamid: 'wamid.FLOOD500', waId: '919000004304', name: 'Sarah', body: 'x' });
+  assert.equal(statusOf('wamid.FLOOD500').status, 'delivered', 'while the newest is still there to be claimed');
 });
 
 
@@ -1518,6 +2406,72 @@ test('a destroyed session stops validating', () => {
   assert.equal(validSession(t), false);
 });
 
+console.log('\nconfig — where the app listens and where it writes');
+{
+  // A pristine config for one environment, without disturbing the singleton
+  // every other module already holds.
+  const configWith = env => {
+    const id = require.resolve('./src/config');
+    const held = require.cache[id];
+    const saved = {};
+    for (const [k, v] of Object.entries(env)) {
+      saved[k] = process.env[k];
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    delete require.cache[id];
+    try { return require('./src/config'); }
+    finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      require.cache[id] = held;
+    }
+  };
+
+  test('the server binds loopback unless told otherwise', () => {
+    assert.equal(configWith({ BIND_HOST: '', RENDER: '' }).CFG.bindHost, '127.0.0.1',
+      'a caller who reaches the port directly can spoof X-Forwarded-For past trust proxy 1 — the login limiter keys on it');
+    assert.equal(configWith({ BIND_HOST: '', RENDER: 'true' }).CFG.bindHost, '0.0.0.0',
+      'Render routes to 0.0.0.0 — loopback there is an app nobody can reach');
+    assert.equal(configWith({ BIND_HOST: '10.0.0.5', RENDER: 'true' }).CFG.bindHost, '10.0.0.5',
+      'an explicit BIND_HOST always wins');
+  });
+
+  test('WA_DATA_DIR moves every file the app writes, and unset changes nothing', () => {
+    const pathx = require('path');
+    const plain = configWith({ WA_DATA_DIR: '', WA_UPLOAD_DIR: undefined, WA_MEDIA_DIR: undefined });
+    assert.equal(plain.DATA_DIR, plain.ROOT, 'every existing deployment keeps its files exactly where they are');
+    assert.equal(plain.FILES.db, pathx.join(plain.ROOT, 'wa.db'));
+    const boxed = configWith({ WA_DATA_DIR: '/data', WA_UPLOAD_DIR: undefined, WA_MEDIA_DIR: undefined });
+    assert.equal(boxed.FILES.campaign, '/data/campaign.json',
+      'state files follow the volume, or an image update forgets a mid-run campaign');
+    assert.equal(boxed.FILES.db, '/data/wa.db');
+    assert.equal(boxed.MEDIA_DIR, '/data/media');
+    assert.equal(boxed.UPLOAD_DIR, '/data/uploads');
+    assert.equal(boxed.PUBLIC_DIR, pathx.join(boxed.ROOT, 'public'), 'the code the app serves does not move');
+  });
+
+  test('the suite itself writes state files outside the checkout, not just when boxed', () => {
+    // This checks the LIVE config the whole suite runs against (the module
+    // require('./server') already loaded at the top of this file), not a
+    // pristine configWith() re-require. The hermetic block used to set
+    // WA_DATA_DIR to '', which falls back to ROOT — every run of this suite
+    // then left a real campaign.json (and warmup.json) in the checkout root,
+    // and running the suite in the owner's actual checkout would silently
+    // overwrite their live campaign state.
+    const { FILES, ROOT } = require('./src/config');
+    assert.ok(!FILES.campaign.startsWith(ROOT), 'campaign.json must land in a throwaway dir during tests, not the checkout');
+    assert.ok(!FILES.warmup.startsWith(ROOT), 'warmup.json must land in a throwaway dir during tests, not the checkout');
+  });
+
+  test('every Meta call has a timeout, and byte transfers get longer than JSON calls', () => {
+    const { TIMEOUTS } = require('./src/config');
+    assert.ok(TIMEOUTS.graphMs > 0 && TIMEOUTS.graphMs <= 60_000,
+      'one wedged connection must not hold the single send loop for minutes');
+    assert.ok(TIMEOUTS.transferMs > TIMEOUTS.graphMs, 'a 100 MB upload is not a JSON call');
+  });
+}
+
 console.log('\ndb');
 test('nodeVersionOk — 22.5 and above accepted, anything below rejected', () => {
   assert.equal(nodeVersionOk('22.5.0'), true);
@@ -1537,10 +2491,10 @@ test('the schema creates every table', () => {
 test('the schema creates the thread and run indexes', () => {
   const d = openDb(':memory:');
   const names = d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name").all().map(r => r.name);
-  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_cap', 'idx_messages_out_at',
+  assert.deepEqual(names, ['idx_contacts_enabled', 'idx_messages_asset', 'idx_messages_cap',
                            'idx_messages_run', 'idx_messages_thread',
                            'idx_run_recipients_pending', 'idx_run_recipients_retry',
-                           'idx_run_recipients_seq']);
+                           'idx_run_recipients_seq', 'idx_webhook_unprocessed']);
 });
 // The two indexes the loop's per-message queries actually need, asserted on the
 // PLAN rather than on the schema — an index that exists but is not chosen is
@@ -1557,27 +2511,71 @@ test('the two per-message queries are answered by an index, not by a scan', () =
   // own clean seek. Merged into one disjunction they were neither: the WHERE
   // implied no index's predicate, so SQLite fell back to the primary key plus a
   // temp b-tree sort — a full scan of the run, once per message sent.
-  const untried = plan('SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL '
-    + 'AND skipped_reason IS NULL ORDER BY seq LIMIT 1');
+  //
+  // The SQL EXPLAINed is the SQL the app prepares, exported for the purpose. A
+  // copy retyped here stays green while the shipped statement drifts off its
+  // index — the one regression this test exists to catch.
+  const { NEXT_UNTRIED_SQL, NEXT_DUE_RETRY_SQL } = require('./server');
+  const untried = plan(NEXT_UNTRIED_SQL);
   assert.match(untried, /idx_run_recipients_pending/,
     'the untried half must seek the run rather than scan it — this is once per message sent');
   assert.doesNotMatch(untried, /TEMP B-TREE/,
     'and the index must supply the ORDER BY, or every send sorts the whole queue again');
 
-  const due = plan("SELECT phone FROM run_recipients WHERE run_id = ? AND wamid IS NULL "
-    + "AND skipped_reason = 'retry' AND retry_after <= ? ORDER BY retry_after LIMIT 1");
+  const due = plan(NEXT_DUE_RETRY_SQL);
   assert.match(due, /idx_run_recipients_retry/,
     'and the ladder half must use its own partial index, on (run_id, retry_after)');
   assert.doesNotMatch(due, /TEMP B-TREE/,
     'which orders by the deadline for free — a sort here means the index was not chosen');
 
-  const cap = plan("SELECT count(*) AS n FROM (SELECT wa_id FROM messages WHERE dir = 'out' "
-    + "AND type = 'template' AND at >= ? GROUP BY wa_id "
-    + "HAVING sum(CASE WHEN status = 'failed' THEN 0 ELSE 1 END) > 0)");
+  // The statement sentSince() actually runs, not a retyped copy of it: a copy
+  // keeps passing while the shipped query drifts off its index, which is the
+  // exact regression this assertion exists to catch.
+  const cap = plan(require('./server').SENT_SINCE_SQL);
   assert.match(cap, /idx_messages_cap/,
     "today's send count must be answered from today's rows — the scan it replaces grew with all history, forever");
   assert.doesNotMatch(cap, /SCAN messages/,
     'a full table scan here is once per message sent, on a synchronous driver, blocking webhook ingestion');
+});
+// Two lookups that had no index at all. The Storage page counts the sent
+// messages that use each library file — a full scan of the message history
+// per file, measured at a second for sixty files — and /health, outside the
+// password gate, counted unprocessed envelopes by scanning ninety days of them
+// on every probe.
+test('the storage and replay lookups are answered by an index, not by a scan', () => {
+  const d = openDb(':memory:');
+  const plan = sql => d.prepare('EXPLAIN QUERY PLAN ' + sql).all().map(r => r.detail).join(' | ');
+
+  // assetRefCounts is private to services/storage.js, so its SQL is read out of
+  // the source rather than retyped here: a retyped copy keeps passing while the
+  // statement the app actually runs drifts away from it.
+  const storageSrc = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, 'src', 'services', 'storage.js'), 'utf8');
+  const refs = /const assetRefCounts = db\.prepare\(`([\s\S]*?)`\)/.exec(storageSrc)?.[1];
+  assert.ok(refs, 'assetRefCounts moved — point this test at the statement the Storage page runs');
+  assert.match(plan(refs), /SEARCH m USING COVERING INDEX idx_messages_asset/,
+    'each library file must seek its sends, not scan every message ever sent');
+
+  const { UNPROCESSED_COUNT_SQL } = require('./server');
+  assert.match(plan(UNPROCESSED_COUNT_SQL), /idx_webhook_unprocessed/,
+    'an unauthenticated probe must read an index that is empty in steady state, not the whole envelope table');
+});
+// SCHEMA is all IF NOT EXISTS, so deleting a CREATE from it removes nothing
+// from a database that already has the index — and an index no query chooses
+// still costs a write on every outbound message, forever.
+test('idx_messages_out_at is dropped from a database that already has it', () => {
+  const f = require('node:path').join(require('node:os').tmpdir(), `wa-dropidx-${process.pid}-${Date.now()}.db`);
+  try {
+    const old = openDb(f);
+    old.exec("CREATE INDEX IF NOT EXISTS idx_messages_out_at ON messages(at) WHERE dir = 'out'");
+    old.close();
+    const d = openDb(f);
+    const has = d.prepare("SELECT 1 AS hit FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_out_at'").get();
+    d.close();
+    assert.equal(has, undefined, 'chosen by no query since idx_messages_cap took sentSince, so it goes at the next boot');
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) { try { require('node:fs').unlinkSync(f + suffix); } catch {} }
+  }
 });
 test('opening twice does not throw', () => {
   const d = openDb(':memory:');
@@ -1600,6 +2598,48 @@ console.log('\nschema — media + template tables');
   const fsx   = require('fs');
   const pathx = require('path');
   const cols  = (d, t) => d.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+
+  test('run_recipients remembers which ladder a contact is on; assets remember their handle age', () => {
+    const d = openDb(':memory:');
+    assert.ok(cols(d, 'run_recipients').includes('ladder_code'),
+      'per-code ladders need the code the attempts belong to — error_code is cleared on every accept');
+    assert.ok(cols(d, 'run_recipients').includes('ladder_attempts'), 'and a per-ladder count no success clears');
+    assert.ok(cols(d, 'media_assets').includes('meta_handle_at'), 'an upload handle expires, so its age must be known');
+    d.close();
+  });
+
+  test('a retry row parked before ladder_code existed is backfilled from error_code/attempts, once', () => {
+    const f = require('node:path').join(require('node:os').tmpdir(), `wa-ladderbackfill-${process.pid}-${Date.now()}.db`);
+    try {
+      const d1 = openDb(f);
+      d1.prepare('INSERT INTO campaign_runs (id, started_at) VALUES (1, 1)').run();
+      // No ladder_code / ladder_attempts given — exactly the row a deploy of
+      // this column pair finds: mid-ladder, error_code already there (markRetry
+      // has always written it), the new pair still at its column default.
+      d1.prepare(`INSERT INTO run_recipients (run_id, phone, name, seq, skipped_reason, error_code, attempts)
+                  VALUES (1, '9000000001', 'Asha', 1, 'retry', 131049, 2)`).run();
+      d1.close();
+
+      const readRow = d => d.prepare(
+        'SELECT ladder_code, ladder_attempts FROM run_recipients WHERE run_id = 1 AND phone = ?'
+      ).get('9000000001');
+
+      const d2 = openDb(f);   // the boot that ships the backfill
+      const after1 = readRow(d2);
+      assert.equal(after1.ladder_code, 131049, 'the code already failing this contact seeds ladder_code');
+      assert.equal(after1.ladder_attempts, 2,
+        'total tries so far seed the rung — it can only shorten what is left on that ladder, never extend it');
+      d2.close();
+
+      const d3 = openDb(f);   // a later boot must leave an already-backfilled row alone
+      const after2 = readRow(d3);
+      assert.equal(after2.ladder_code, 131049, 'ladder_code is no longer NULL, so the WHERE guard makes a second boot a no-op');
+      assert.equal(after2.ladder_attempts, 2, 'and must not re-copy attempts on top of it either');
+      d3.close();
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) { try { require('node:fs').unlinkSync(f + suffix); } catch {} }
+    }
+  });
 
   test('campaign_runs carries the run-time template snapshot columns', () => {
     const d = openDb(':memory:');
@@ -1796,6 +2836,76 @@ console.log('\nmedia — saveUpload');
     assert.match(d.error, /outside the uploads directory/);
   });
 
+  test('saveUpload refuses to dedupe through a stored path that escapes UPLOAD_DIR', () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const bytes = Buffer.from(`%PDF-1.7 escape-dedupe ${Math.random()}`);
+    const first = saveUpload(file(bytes, 'legit.pdf', 'application/pdf'));
+    assert.equal(first.ok, true, first.error);
+
+    // A real file outside UPLOAD_DIR — if the dedupe/restore write went
+    // through, this is exactly what a crafted `path` column would let it
+    // overwrite.
+    const name = `wa-escape-dedupe-${process.pid}-${Date.now()}.txt`;
+    const outside = pathx.join(UPLOAD_DIR, '..', name);
+    fsx.writeFileSync(outside, 'sentinel-untouched');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', name), first.asset.id);
+
+    try {
+      // Same bytes → same sha256 → the dedupe branch, not a fresh insert.
+      const again = saveUpload(file(bytes, 'legit-copy.pdf', 'application/pdf'));
+      assert.equal(again.ok, false, 'a corrupted row must refuse, not write through it');
+      assert.match(again.error, /outside the uploads directory/);
+      assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched',
+        'nothing may be written to whatever the escaped path points at');
+    } finally { fsx.unlinkSync(outside); }
+  });
+
+  test('saveUpload refuses to revive a tombstoned row through a stored path that escapes UPLOAD_DIR', () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const bytes = Buffer.from(`%PDF-1.7 escape-revive ${Math.random()}`);
+    const first = saveUpload(file(bytes, 'legit2.pdf', 'application/pdf'));
+    assert.equal(first.ok, true, first.error);
+
+    const name = `wa-escape-revive-${process.pid}-${Date.now()}.txt`;
+    const outside = pathx.join(UPLOAD_DIR, '..', name);
+    fsx.writeFileSync(outside, 'sentinel-untouched-2');
+    // Tombstoned AND escaping in one update — the revive branch is reached
+    // only once existing.deleted_at is set, and it writes unconditionally,
+    // with no existsSync gate, making it the more dangerous of the two.
+    db.prepare('UPDATE media_assets SET path = ?, deleted_at = ? WHERE id = ?')
+      .run(pathx.join('..', name), Date.now(), first.asset.id);
+
+    try {
+      const again = saveUpload(file(bytes, 'legit2-copy.pdf', 'application/pdf'));
+      assert.equal(again.ok, false, 'reviving through a corrupted row must refuse, not write through it');
+      // Not escapedMsg's sentence: its remedy — "delete it from the Storage
+      // page and upload the file again" — is impossible for a TOMBSTONED row.
+      // deleteAsset refuses outright once deleted_at is set (line ~287) and
+      // listAssets() does not even show a tombstone to click delete on, so
+      // that sentence sends the operator looking for a button that does not
+      // exist. A row this corrupted cannot be repaired by re-uploading either
+      // — only a different file gets them unstuck.
+      assert.doesNotMatch(again.error, /delete it from the Storage page/,
+        'that remedy does not exist for a tombstoned row — the Storage page offers no delete for one');
+      assert.match(again.error, /corrupted/i, 'still names the row as the problem, not the file');
+      assert.match(again.error, /pick a different file|pick another/i, 'and points at the one thing the operator actually can do');
+      assert.equal(fsx.readFileSync(outside, 'utf8'), 'sentinel-untouched-2',
+        'the revive write must never reach a path the row does not legitimately own');
+    } finally { fsx.unlinkSync(outside); }
+  });
+
+  test('an originalname with a NUL byte in its extension never throws', () => {
+    // path.extname does not validate characters — a NUL byte survives into the
+    // filename fs.writeFileSync is given, and Node refuses any path containing
+    // one. extOf drops anything outside [a-z0-9] from the extension instead.
+    const r = saveUpload(file(Buffer.from(`%PDF-1.7 nul-ext ${Math.random()}`), 'x.a\u0000b', 'application/pdf'));
+    assert.equal(typeof r, 'object');
+    assert.equal(r.ok, true, r.error);
+  });
+
   test('kindFor maps each accepted type to its kind', () => {
     assert.equal(kindFor('image/png'), 'image');
     assert.equal(kindFor('video/mp4'), 'video');
@@ -1902,6 +3012,25 @@ testAsync('when the write fails the route answers 500, never 200, and stores not
   assert.equal(res.status, 500);
   const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
   assert.equal(after, before, 'the failed write must leave no phantom row');
+});
+testAsync('GET /webhook echoes the challenge as text/plain, and a wrong token is refused', async () => {
+  const savedToken = CFG.webhookVerifyToken;
+  CFG.webhookVerifyToken = 'tok';
+  const server = await startWebhookServer();
+  try {
+    const port = server.address().port;
+    const r = await fetch(`http://127.0.0.1:${port}/webhook?hub.mode=subscribe&hub.verify_token=tok&hub.challenge=%3Cb%3Ex`);
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type'), /^text\/plain/,
+      'an attacker-supplied string must never come back as HTML on the origin holding the session');
+    assert.equal(await r.text(), '<b>x', 'the raw challenge is echoed, not re-encoded');
+
+    const bad = await fetch(`http://127.0.0.1:${port}/webhook?hub.mode=subscribe&hub.verify_token=tox&hub.challenge=zz`);
+    assert.equal(bad.status, 403, 'a wrong token is refused and nothing is echoed');
+  } finally {
+    server.close();
+    CFG.webhookVerifyToken = savedToken;
+  }
 });
 
 console.log('\nreply');
@@ -2150,6 +3279,36 @@ test('an outbound send to a thread that replied leaves the window intact', () =>
 });
 
 console.log('\nstate snapshot');
+// buildState() costs more as a run grows — about a third of a second at 100k
+// contacts — while the broadcast window was a fixed 250 ms. Once one rebuild
+// outlasts the window, rebuilding state is all the event loop does, and webhook
+// acknowledgements queue behind it. Driven through the real coalescer with a
+// rebuild the test controls, rather than by seeding a run big enough to be slow.
+testAsync('broadcast — a slow rebuild stretches the window to 4× its cost, and the last state still lands', async () => {
+  const { coalesce, coalesceDelay } = require('./src/services/status');
+  assert.equal(coalesceDelay(10), 250, 'a cheap rebuild keeps the 250 ms floor, so one event still feels instant');
+  assert.equal(coalesceDelay(300), 1200, 'rebuilds may never take more than about a quarter of the event loop');
+
+  const BUILD = 70;                            // 4 × 70 = 280 ms — past the floor
+  const sent = [];
+  let state = 0;
+  const fire = coalesce(() => {
+    const t = performance.now();
+    while (performance.now() - t < BUILD) {}   // synchronous, as buildState is
+    sent.push({ state, at: performance.now() });
+  });
+  state = 1; fire();                           // leading edge: sent at once
+  state = 2; fire();                           // inside the window: deferred…
+  state = 3; fire();                           // …and folded into the same trailing send
+  assert.equal(sent.length, 1, 'the leading edge is not delayed — a single event still arrives at once');
+
+  const until = Date.now() + 3000;
+  while (sent.length < 2 && Date.now() < until) await new Promise(r => setTimeout(r, 20));
+  assert.equal(sent.length, 2, 'three calls inside one window cost two rebuilds, not three');
+  assert.ok(sent[1].at - sent[0].at >= 4 * BUILD,
+    `sent ${Math.round(sent[1].at - sent[0].at)} ms apart — the window must stretch with the cost of a rebuild`);
+  assert.equal(sent[1].state, 3, 'and the trailing edge carries the LAST state: deferred, never dropped');
+});
 test('displayed counters are derived from the current run', () => {
   const runId = startRun('snapshot-run');
   recordOutbound({ wamid: 'snap-1', waId: '919911000001', name: 'One', body: 'x', runId });
@@ -2228,6 +3387,27 @@ test('the snapshot still carries every key the frontend reads', () => {
                    'dailyCount','dailyCap','quality','warmup','pricing','inboxUnread','pauseReason','funnel',
                    'config','configured','currentContact','limits','disabledCount','contacts','optOutLabel']) {
     assert.ok(k in st, `buildState lost the "${k}" key`);
+  }
+});
+// Contract C1. The cap tile needs the count the cap IN FORCE is compared
+// against, and which window it counts over — while the warm-up rung governs that
+// is the last 24 hours, not today, and `dailyCount` (the IST day, "today" on
+// screen) is a different number. The tile must not reconstruct either.
+test('the snapshot publishes the count the cap in force is compared against, and its window', () => {
+  const { capCount } = require('./server');
+  const saved = { days: [...W.days], enabled: W.enabled, cap: S.config.dailyCap, quality: S.quality };
+  try {
+    Object.assign(W, { enabled: true, days: ['2026-01-01'] }); S.config.dailyCap = 0; S.quality = 'GREEN';
+    let st = buildState();
+    assert.equal(st.capWindow, '24h', 'the rung is the cap, so the tile has to say "in the last 24 hours"');
+    assert.equal(st.capCount, capCount(), 'the number the loop compares against, not a second derivation');
+    S.config.dailyCap = 10;
+    st = buildState();
+    assert.equal(st.capWindow, 'day');
+    assert.equal(st.capCount, st.dailyCount, 'under your own cap the count IS today\'s');
+  } finally {
+    Object.assign(W, { days: saved.days, enabled: saved.enabled });
+    S.config.dailyCap = saved.cap; S.quality = saved.quality;
   }
 });
 
@@ -2309,6 +3489,20 @@ console.log('\ncontacts — enable / disable');
     assert.equal(C.getRow(p).first_seen, first, 'but the contact is not newly seen');
   });
 
+  test('a manual rename survives a numbers-only re-upload; a brand-new row still gets "Contact"', () => {
+    const p1 = phone(), p2 = phone();
+    C.upsertFromCsv(parseCSV(Buffer.from(`${p1}\n`)).contacts, {});
+    assert.equal(C.rename(p1, 'Asha Rao').ok, true);
+
+    // Re-upload the same headerless, numbers-only file — which parses p1's
+    // name back to the 'Contact' placeholder — alongside a number never seen
+    // before.
+    C.upsertFromCsv(parseCSV(Buffer.from(`${p1}\n${p2}\n`)).contacts, {});
+    assert.equal(C.getRow(p1).name, 'Asha Rao',
+      'the placeholder from a numbers-only re-upload must not overwrite a real name');
+    assert.equal(C.getRow(p2).name, 'Contact', 'a genuinely new row with no name is still the placeholder');
+  });
+
   test('extra CSV columns are stored verbatim for a later phase to read', () => {
     const p = phone();
     const file = Buffer.from(`Name,Mobile Phone,City\nAsha,${p},Pune\n`);
@@ -2367,6 +3561,92 @@ console.log('\ncontacts — enable / disable');
   });
 }
 
+console.log('\ncontacts routes — /upload-csv reports the country guess (contract C3)');
+{
+  // Mirrors startMediaServer: the router mounted bare, so the JSON shape and
+  // the log line are exercised without the auth gate or the rest of the app.
+  function startContactsServer() {
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/contacts'));
+    const s = http.createServer(a);
+    return new Promise(r => s.listen(0, () => r(s)));
+  }
+
+  let seq = 0;
+  // Bare 10 digits, no country code — same shape as this suite's other
+  // fixtures (9000000001+), but counter-based like the other contacts test
+  // sections' phone()/nextPhone() generators, so a hard-coded literal here
+  // can never collide with a number some other test already seeded into the
+  // shared in-memory database.
+  const bareNum = () => `900000${String(++seq).padStart(4, '0')}`;
+
+  testAsync('the response and the log both name how many numbers were assumed Indian', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';                     // campaignBlocker must see no run in the way
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = `name,phone\nAsha,${bareNum()}\nRahul,+91 ${bareNum()}\n`;
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+      const before = S.logs.length;
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.guessedCountry, 1, 'contract C3 — B7 reads this straight off the response, not out of a log line');
+
+      const warned = S.logs.slice(before).some(l => l.level === 'warn' && /assumed Indian/.test(l.msg));
+      assert.ok(warned, 'a guess this large must be said out loud, the same way the guessed-column warning already is');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+
+  testAsync('a fully +-written upload guesses nothing, and the response says so', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = `Name,Mobile Phone\nAsha,+91 ${bareNum()}\n`;
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.guessedCountry, 0);
+      assert.equal(res.guessedPhone, null, 'a named header column is not a guess — contract C3 keeps both fields on every response');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+
+  // Item 6b: a bare "+" with only 10 digits is dialled exactly as written, not
+  // turned into a guess — so it must be reported beside guessedCountry, never
+  // folded into it, the same way guessedPhone and guessedCountry are already
+  // kept apart.
+  testAsync('a "+" with only 10 digits is reported as shortPlus, not folded into guessedCountry', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = `name,phone\nAsha,+${bareNum()}\n`;
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+      const before = S.logs.length;
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.shortPlus, 1, 'a bare "+" with 10 digits is dialled as written, not re-guessed as Indian');
+      assert.equal(res.guessedCountry, 0, 'nothing here was changed before sending, so it is not a guess');
+
+      const warned = S.logs.slice(before).some(l => l.level === 'warn' && /only 10 digits/.test(l.msg));
+      assert.ok(warned, 'said out loud beside the guessedCountry warning, the same way that guess already is');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+}
+
 console.log('\ncontacts — opt-outs.json import');
 {
   const C = require('./server').contacts;
@@ -2380,6 +3660,32 @@ console.log('\ncontacts — opt-outs.json import');
     assert.equal(C.getRow('919777700001').disabled_reason, 'opt_out');
     assert.ok(!fsx.existsSync(f), 'the source is renamed so a later boot has nothing to find');
     assert.ok(fsx.existsSync(`${f}.migrated`));
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
+  test('an entry the parser could not read is named in the warn log, not just missing from the count', () => {
+    const f = tmp();
+    fsx.writeFileSync(f, JSON.stringify(['919777700003', 'not-a-number']));
+    const before = S.logs.length;
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 1, 'the one parseable entry still imports');
+    const warned = S.logs.slice(before).some(l => l.level === 'warn' && /not-a-number/.test(l.msg));
+    assert.ok(warned, 'the count alone cannot say WHICH opt-out did not carry over — the entry has to be named');
+    fsx.rmSync(`${f}.migrated`, { force: true });
+  });
+
+  test('a long list of unreadable entries is capped in the log, not printed in full', () => {
+    const f = tmp();
+    const bad = Array.from({ length: 12 }, (_, i) => `bad-entry-${i}`);
+    fsx.writeFileSync(f, JSON.stringify(['919777700005', ...bad]));
+    const before = S.logs.length;
+    const r = C.migrateOptOuts({ optOuts: f });
+    assert.equal(r.imported, 1);
+    const warned = S.logs.slice(before).find(l => l.level === 'warn' && /could not be read/.test(l.msg));
+    assert.ok(warned, 'still warns even when the list is long');
+    assert.match(warned.msg, /^12 entries/, 'the count in the sentence is the true total, matching routes/contacts.js\'s skipped/duplicates reporting');
+    assert.ok(warned.msg.includes('…'), 'the list itself is capped at 10, same as skipped/duplicates rows');
+    assert.ok(!warned.msg.includes('bad-entry-11'), 'only the first 10 are named — a hundred-entry file must not become a hundred-name log line');
     fsx.rmSync(`${f}.migrated`, { force: true });
   });
 
@@ -2577,6 +3883,31 @@ console.log('\nskipDisposition — the classifier the report groups by');
   test('a code the table has never seen is unclassified, not guessed', () => {
     assert.equal(skipDisposition(999999), 'unclassified',
       'a new Meta code must not silently cost re-sends, nor silently write someone off');
+  });
+
+  // 131050 is the person choosing, inside WhatsApp, to stop marketing from this
+  // business. Permanent — no retry changes their mind — but it is an opt-out,
+  // not a number that cannot receive messages, and the two are switched off
+  // with different reasons so the report files them apart.
+  test('131050 is permanent and switches the contact off as an opt-out', () => {
+    const { disableReasonFor, explainError: explain } = require('./server');
+    assert.equal(skipDisposition(131050), 'permanent', 'retrying someone who turned marketing off is messaging them against their wish');
+    assert.equal(disableReasonFor(131050), 'opt_out', 'they asked to stop — they are not "not on WhatsApp"');
+    assert.equal(disableReasonFor(131026), 'failed_hard', 'every other permanent code is about the number');
+    assert.match(explain(131050) || '', /turned off marketing messages/, 'the report says what the person did');
+    assert.match(explain(131050), /opt back in/, 'and when re-enabling them is right');
+  });
+
+  // 130497 is a country-level block on this business — typically marketing to
+  // US numbers. A policy that can lift, so the number must not be written off,
+  // and every retry inside it fails the same way: reported, never retried.
+  test('130497 is explained, and neither retried nor written off', () => {
+    const { explainError: explain } = require('./server');
+    assert.equal(skipDisposition(130497), 'unclassified', 'not retried, and not a reason to switch a real customer off');
+    assert.match(explain(130497) || '', /country/, 'a sentence the operator can act on, not a bare number to look up');
+    const phone = '919400000021';
+    assert.equal(suppressIfPermanent(phone, 130497, 'Sarah'), false);
+    assert.equal(require('./server').contacts.isDisabled(phone), false, 'the country block can lift; the contact stays on the list');
   });
 }
 
@@ -2782,6 +4113,29 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       'the spam throttle backs off harder each time, never faster — hammering it feeds the signal that raised it');
   });
 
+  // Both entrances ask this one helper, so they cannot disagree about which rung
+  // a contact is on. The rung is counted per CODE; the ceiling over all of them
+  // is the total, and the total is what the report shows.
+  test('ladderPosition — the rung is per code, the ceiling is the total', () => {
+    const { ladderPosition, MAX_RETRIES_TOTAL } = M;
+    const fresh = ladderPosition({ attempts: 0, ladder_code: null, ladder_attempts: 0 }, 131049);
+    assert.deepEqual([fresh.made, fresh.exhausted], [0, false], 'a contact never retried is on the first rung');
+    assert.equal(fresh.ladder, M.backoffFor(131049), 'and the rungs are that code\'s own');
+
+    const afterBlips = ladderPosition({ attempts: 3, ladder_code: -1, ladder_attempts: 3 }, 131049);
+    assert.deepEqual([afterBlips.made, afterBlips.exhausted], [0, false],
+      'three network blips are rungs of the -1 ladder, not of 131049\'s');
+    const midway = ladderPosition({ attempts: 5, ladder_code: 131049, ladder_attempts: 2 }, 131049);
+    assert.deepEqual([midway.made, midway.exhausted], [2, false], 'the same code climbs its own ladder');
+    const spent = ladderPosition({ attempts: 6, ladder_code: 131049, ladder_attempts: 3 }, 131049);
+    assert.equal(spent.exhausted, true, 'three day-rungs is the whole 131049 ladder');
+    const ceiling = ladderPosition({ attempts: MAX_RETRIES_TOTAL, ladder_code: 131049, ladder_attempts: 1 }, -1);
+    assert.equal(ceiling.exhausted, true,
+      'past the total ceiling nothing retries, whatever ladder the next code starts — or two codes taking turns never end');
+    assert.equal(ladderPosition({ attempts: 1, ladder_code: '131049', ladder_attempts: 1 }, 131049).made, 1,
+      'a code read back as text is the same code');
+  });
+
   test('haltsCampaign — campaign-wide faults only, never one row\'s problem', () => {
     const M2 = require('./server');
     for (const code of [190, 131042, 132001, 132015, 133010, 131063]) {
@@ -2791,6 +4145,50 @@ console.log('\nrun_recipients — retrying a moment-based failure');
     for (const code of [131049, 131026, -1, 131009, 132005, 999999]) {
       assert.equal(M2.haltsCampaign(code), false, `${code} is one row's problem and must not stop the other nine hundred`);
     }
+  });
+
+  // 131048 is a throttle on the NUMBER — every send fails while it is in force —
+  // which is a different kind of fact from 131049's per-person cap. One set names
+  // such codes, beside haltsCampaign, and the query that parks the loop is built
+  // from it, so the two cannot disagree about which codes they are.
+  test('isSenderLevel — the spam throttle is about the number, the marketing cap is about one person', () => {
+    assert.equal(M.isSenderLevel(131048), true, 'every send fails while it is in force — walking on only feeds it');
+    for (const code of [131049, 131026, -1, 130429, 131042, 999999]) {
+      assert.equal(M.isSenderLevel(code), false, `${code} does not fail every send, so it must not park the whole list`);
+    }
+    assert.equal(M.skipDisposition(131048), 'retry', 'the contact who met it is still retried, never written off');
+    assert.match(M.explainError(131048), /pauses itself/,
+      'the hint says what the app now does — "let the campaign retry on its own" described the walk this replaces');
+  });
+
+  test('the throttle deadline is read off the queue: only a live 131048 rung parks the loop', () => {
+    const run = newRun();
+    const p = people(4);
+    buildRun(run, p);
+    assert.equal(M.senderThrottleUntil(run), null, 'a queue nobody has been refused on parks nothing');
+    recordRecipientRetry(run, p[0].dialStr, 131048, Date.now() - 1);
+    assert.equal(M.senderThrottleUntil(run), null,
+      'an expired rung is not a throttle — the next contact is the probe that finds out whether it lifted');
+    recordRecipientRetry(run, p[1].dialStr, 131049, Date.now() + 24 * HOUR_MS);
+    assert.equal(M.senderThrottleUntil(run), null,
+      '131049 is one person\'s cap; the rest of the list is sendable and must not wait on it');
+    const early = Date.now() + 4 * HOUR_MS, late = Date.now() + 12 * HOUR_MS;
+    recordRecipientRetry(run, p[2].dialStr, 131048, early);
+    recordRecipientRetry(run, p[3].dialStr, 131048, late);
+    assert.equal(M.senderThrottleUntil(run), late,
+      'the LATEST live rung — probing before it would be the walk this exists to stop');
+    recordRecipientSent(run, p[3].dialStr, 'wamid.throttle.sent');
+    assert.equal(M.senderThrottleUntil(run), early,
+      'a rung whose retry already went out is no longer evidence of a throttle');
+    assert.equal(M.senderThrottleUntil(null), null, 'no run, no park — and never a throw');
+  });
+
+  test('the throttle check is a seek on the ladder index — it is asked before every send', () => {
+    const d = openDb(':memory:');
+    const plan = d.prepare('EXPLAIN QUERY PLAN ' + M.SENDER_THROTTLE_SQL).all(1, 0).map(r => r.detail).join(' | ');
+    assert.match(plan, /idx_run_recipients_retry/,
+      'once per message sent, so it must seek the run\'s live rungs rather than read the run');
+    assert.doesNotMatch(plan, /SCAN run_recipients/, 'a scan here grows with the list, once per send');
   });
 
   test('with WA_QUIET_HOURS=0 the stored deadline is exactly the backoff — the opt-out reaches the ladder too', () => {
@@ -2923,6 +4321,308 @@ console.log('\nrun_recipients — retrying a moment-based failure');
       if (hadFile) fsc.writeFileSync(cfile, fileWas);
       else if (fsc.existsSync(cfile)) fsc.unlinkSync(cfile);
     }
+  });
+
+  // ── The warm-up ceiling, as the loop meets it ───────────────────────────────
+  // capCount and slotFreesAt are pinned in "today's send count"; these drive the
+  // real loop into the cap branch, because the sentence it parks with and the
+  // moment it wakes are the loop's own — a loop still comparing today's count
+  // would pass every one of those unit tests.
+  //
+  // atTheRung puts the ladder on a fresh day at the smallest rung above what this
+  // shared database has already sent inside the last 24 hours, then fills the
+  // window to exactly that rung: every seat `fillerAge` old except the last,
+  // which is sent at `lastAt` — so the test decides when the next slot frees.
+  // fillerAge defaults to an hour, which is what every call site used before it
+  // became a parameter. The rows are removed afterwards; later tests count this
+  // window too.
+  const ROLL_DAY = 86400000;
+  const atTheRung = (lastAt, fillerAge = 3600000) => {
+    const already = M.sentSince(Date.now() - ROLL_DAY);
+    const k = M.WARMUP_PLAN.findIndex(r => r > already);
+    W.enabled = true; S.quality = 'GREEN'; S.config.dailyCap = 0;
+    W.days = Array.from({ length: k }, (_, i) => `2001-01-${String(i + 1).padStart(2, '0')}`);
+    const ins = db.prepare("INSERT INTO messages (wamid, wa_id, dir, type, body, at, status) VALUES (?, ?, 'out', 'template', 'x', ?, 'accepted')");
+    const wamids = [];
+    for (let i = 0; i < M.WARMUP_PLAN[k] - already; i++) {
+      const wamid = `rung-seat.${Date.now()}.${i}`;
+      ins.run(wamid, `9190001${String(i).padStart(5, '0')}`, i === 0 ? lastAt : Date.now() - fillerAge);
+      wamids.push(wamid);
+    }
+    return { rung: M.WARMUP_PLAN[k], day: k + 1,
+             remove: () => wamids.forEach(w => db.prepare('DELETE FROM messages WHERE wamid = ?').run(w)) };
+  };
+  const istClock = ms => new Date(ms).toLocaleTimeString('en-IN',
+    { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+
+  testAsync('at the warm-up ceiling the loop parks, and says when a seat leaves the last 24 hours', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.rung.${++sends}`), async h => {
+      const seats = atTheRung(Date.now() - 3600000);
+      try {
+        assert.equal(M.capWindow(), '24h', 'precondition: the rung is the cap in force');
+        h.stage([{ dialStr: '919000034101', name: 'Asha' }], 'rung-park');
+        h.start();
+        await h.until(() => S.phase === 'paused');
+        const slot = M.slotFreesAt();
+        // When IST midnight comes first the new day's rung may have room sooner,
+        // and the sentence says so rather than promising the later time.
+        const sooner = M.nextIstMidnight() < slot ? ' — sooner if the new day\'s rung is higher' : '';
+        assert.equal(S.pauseReason,
+          `Warm-up ceiling: ${seats.rung} people in the last 24 hours (day ${seats.day}). Next send at ${istClock(slot)}${sooner}.`,
+          'the sentence names the ceiling, the window it counts, and when the earliest counted contact leaves it — '
+          + 'not IST midnight, which is when a calendar day would have freed the slots');
+        assert.equal(sends, 0, 'nobody is messaged while Meta\'s window is full');
+      } finally { seats.remove(); }
+    });
+  });
+
+  // A rolling window frees yesterday's contacts as far apart as they were sent —
+  // seconds, at campaign pace. The loop parks once per freed slot, and announcing
+  // each of those is the slowdown CLAUDE.md records for the retry ladder: 340
+  // announcements for 549 sends, each a log line, a phase flap and a broadcast.
+  testAsync('a slot that frees within the minute is waited for silently, then used', async () => {
+    let sends = 0, sentAt = null;
+    await withLoop(async () => { sentAt = Date.now(); return graphOk(`wamid.rungq.${++sends}`); }, async h => {
+      // The seat's OWN free time (capCount()'s raw 24h boundary, sentSince's
+      // `at >= now - DAY_MS`) is 24h after its `at`, with no grace — the extra
+      // second only lives in slotFreesAt()'s answer, as the wake deadline. A
+      // margin of 50ms between "seat placed" and that raw boundary used to be
+      // the whole safety net against the real delay before the loop's first
+      // capCount() check — plain JS and in-memory SQLite normally, but under
+      // real CPU/disk contention (seen right after `npm ci`) that gap can run
+      // into the hundreds of ms. Once it beat 50ms the seat had already left
+      // the window by the loop's first look, the cap never appeared full, the
+      // send went out immediately, and `sentAt >= frees` failed — about 1 run
+      // in 17 under load. 700ms is generous against that delay while the total
+      // wait (about 1.7s) is still comfortably "within the minute".
+      const seats = atTheRung(Date.now() - ROLL_DAY + 700);
+      const savedLogs = S.logs;
+      S.logs = [];
+      try {
+        const frees = M.slotFreesAt();
+        assert.ok(frees - Date.now() < 2000, 'precondition: the next slot frees within the minute');
+        h.stage([{ dialStr: '919000034111', name: 'Rahul' }], 'rung-quiet');
+        const phases = new Set();
+        h.start();
+        // Sampled only while the wait lasts: once the send goes out the run is
+        // over and the phase moves on to 'done', as it should. The outer
+        // budget is generous relative to the ~1.7s nominal wait for the same
+        // reason the margin above is — headroom against real timer jitter
+        // under load, not a wait anything here expects to spend in full.
+        await h.until(() => { if (sends === 0) phases.add(S.phase); return sends > 0; }, 8000);
+        assert.equal(sends, 1, 'once a contact has left the window, the slot is used');
+        assert.ok(sentAt >= frees, 'and not before — the ceiling held until then');
+        assert.deepEqual([...phases], ['running'], 'a wait this short is slept silently — no pause flashed on screen');
+        assert.equal(S.logs.filter(l => /Warm-up ceiling/.test(l.msg)).length, 0, 'and nothing announced in the log');
+      } finally { seats.remove(); S.logs = savedLogs; }
+    });
+  });
+
+  // The rung itself moves at IST midnight — a new sending day climbs one, and
+  // graduation lifts it after the top rung — but a rolling park slept until a
+  // seat freed, up to 24 hours: a window filled at 20:00 slept to 20:00 the next
+  // day while the new rung had room from midnight. The park wakes at whichever
+  // comes first, and the wake re-derives the cap. The new day is emulated
+  // through W.days, which is what rawStep reads (todayKey() reads new Date(),
+  // which a Date.now stub does not move); the clock is moved by an offset so it
+  // keeps running, and the row the send writes, dated on that clock, is removed.
+  testAsync('a rolling park wakes at IST midnight when that comes first, and the new rung sends', async () => {
+    const realNow = Date.now;
+    let sends = 0;
+    await withLoop(async url => {
+      if (String(url).includes('quality_rating')) return qualityIs('GREEN')(url);
+      return graphOk(`wamid.rungday.${++sends}`);
+    }, async h => {
+      // Every seat sent at real `now`, not an hour ago: the earliest a fresh
+      // seat can free is a full 24h + 1s away, which nextIstMidnight() (at
+      // most a day plus its own two-minute slack away) is all but guaranteed
+      // to beat. Seats an hour old used to make the seat free in 23 hours —
+      // between roughly 00:00 and 01:02 IST that is EARLIER than midnight, so
+      // the test silently exercised the seat wake below instead of the
+      // midnight wake it exists to prove. The precondition assertion right
+      // after is the net for the sliver of time (the ~two minutes right after
+      // midnight) this still cannot rule out by construction alone.
+      const seats = atTheRung(realNow(), 0);
+      try {
+        assert.ok(M.nextIstMidnight() < M.slotFreesAt(),
+          'precondition: midnight must be the earlier of the two, or this test is not exercising the midnight wake it is named for');
+        h.stage([{ dialStr: '919000038001', name: 'Rahul' }], 'rung-midnight');
+        h.start();
+        await h.until(() => S.phase === 'paused');
+        const slot = M.slotFreesAt(), midnight = M.nextIstMidnight();
+        assert.ok(S.pauseReason.includes(`Next send at ${istClock(slot)}`), 'the sentence still names when a seat frees');
+        assert.equal(sends, 0);
+
+        W.days.push('2001-02-01');                         // the day turned: one more sending day behind the number
+        const cap = M.effectiveCap();
+        assert.ok(cap === null || cap > seats.rung, 'precondition: the new day\'s rung has room');
+        const jump = Math.min(slot, midnight) + 1000 - realNow();
+        Date.now = () => realNow() + jump;                 // just past min(slot, midnight)
+        await h.until(() => sends === 1, 4000);
+        assert.equal(sends, 1, 'woken at the earlier of the two, the loop re-derives the cap and sends on the new rung');
+      } finally {
+        Date.now = realNow;
+        seats.remove();
+        db.prepare("DELETE FROM messages WHERE wamid LIKE 'wamid.rungday.%'").run();
+      }
+    });
+  });
+
+  // ── Quality is re-read when a cap park ends ──────────────────────────────────
+  // The rung climbs only while quality holds, and the rating the loop had was
+  // read at /start — or whenever someone last opened Settings. A campaign parked
+  // overnight on the cap woke into a new day and climbed on a rating that could
+  // have turned RED hours earlier. The status webhook is the primary source; this
+  // is the loop asking for itself before it re-derives the cap.
+  const qualityIs = rating => async url => (String(url).includes('quality_rating')
+    ? { ok: true, json: async () => ({ quality_rating: rating, messaging_limit_tier: 'TIER_1K' }) }
+    : graphOk('wamid.quality.unused'));
+
+  testAsync('refreshQuality takes the rating Meta reports now', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'GREEN';
+    global.fetch = qualityIs('RED');
+    try {
+      await M.refreshQuality();
+      assert.equal(S.quality, 'RED', 'a RED rating holds the rung back, so it has to reach the ladder before the next send');
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  testAsync('a re-read that fails keeps the last rating, and says so', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'YELLOW';
+    try {
+      const failures = [
+        async () => { throw new Error('ECONNRESET'); },
+        async () => ({ ok: false, json: async () => ({ error: { message: 'Invalid OAuth access token' } }) }),
+      ];
+      for (const failing of failures) {
+        global.fetch = failing;
+        const before = S.logs[S.logs.length - 1];
+        await M.refreshQuality();                     // must not throw: the loop awaits it
+        assert.equal(S.quality, 'YELLOW', 'no answer is not a GREEN answer — the rating the ladder last saw stands');
+        const said = S.logs[S.logs.length - 1];
+        assert.notEqual(said, before, 'the failure is logged');
+        assert.match(said.msg, /quality rating/, 'and the line says what could not be checked');
+      }
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  // graph.js reports a missing rating as 'UNKNOWN' for the screen, and every
+  // writer took whatever came back — so an answer without a rating LIFTED a
+  // YELLOW or RED hold on the rung, climbing it on no evidence at all. Only
+  // GREEN, YELLOW and RED are adopted, through one helper every door uses.
+  test('adoptQuality takes only a real rating', () => {
+    const saved = S.quality;
+    try {
+      S.quality = 'RED';
+      for (const junk of ['UNKNOWN', null, undefined, '', 'green', 'NA']) {
+        assert.equal(M.adoptQuality(junk), false);
+        assert.equal(S.quality, 'RED', `${junk} is not a rating — the hold on the rung stands`);
+      }
+      assert.equal(M.adoptQuality('YELLOW'), true, 'a real rating is adopted, and says it changed');
+      assert.equal(M.adoptQuality('YELLOW'), false, 'the same rating again is no change');
+      assert.equal(S.quality, 'YELLOW');
+    } finally { S.quality = saved; }
+  });
+
+  const unrated = async () => ({ ok: true, json: async () => ({ messaging_limit_tier: 'TIER_1K' }) });
+
+  testAsync('a re-read with no rating in it keeps a RED hold', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'RED';
+    global.fetch = unrated;
+    try {
+      await M.refreshQuality();
+      assert.equal(S.quality, 'RED', 'an answer without a rating must not lift the hold on the rung');
+      assert.match(S.logs[S.logs.length - 1].msg, /quality rating/, 'and the log says the rating could not be read');
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  testAsync('the account screen keeps a RED hold when Meta\'s answer has no rating', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'RED';
+    global.fetch = unrated;
+    try {
+      const info = await callRoute('get', '/account-info', {}, './src/routes/settings');
+      assert.equal(info.qualityRating, 'UNKNOWN', 'the screen is still told what Meta said');
+      assert.equal(S.quality, 'RED', 'but the ladder keeps the last real rating');
+    } finally { global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  // The loop awaits the re-read while flags.running is true, and campaignBlocker()
+  // refuses every Start and upload until the loop exits — so a Stop pressed while
+  // Meta is slow to answer must still be answered within a second, not after the
+  // 30-second Graph timeout. The answer that arrives afterwards is not used.
+  testAsync('a Stop during a slow quality re-read is answered within a second', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'GREEN';
+    global.fetch = () => new Promise(r => setTimeout(() => r({ ok: true,
+      json: async () => ({ quality_rating: 'RED' }) }), 2000));      // not unref'd: the suite must wait for it
+    try {
+      const t0 = Date.now();
+      const refreshing = M.refreshQuality();
+      setTimeout(() => { M.flags.stopFlag = true; }, 50);
+      await refreshing;
+      assert.ok(Date.now() - t0 < 1000, `answered in ${Date.now() - t0} ms — a Stop must not wait out Meta`);
+      assert.equal(S.quality, 'GREEN', 'an answer nobody waited for is not adopted');
+    } finally { M.flags.stopFlag = false; global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  // A Pause is not a Stop: it is resumable, and the whole point of asking Meta
+  // again at a cap-park wake is to have the freshest rating ready for when
+  // Resume derives the next day's rung. Giving up on a Pause exactly like a
+  // Stop dropped a late RED on the floor — S.quality stayed at whatever it was
+  // before the Pause, and Resume could then climb a rung on a stale GREEN.
+  testAsync('a Pause during a slow quality re-read still adopts the late answer', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality };
+    S.quality = 'GREEN';
+    global.fetch = () => new Promise(r => setTimeout(() => r({ ok: true,
+      json: async () => ({ quality_rating: 'RED' }) }), 200));
+    try {
+      const refreshing = M.refreshQuality();
+      setTimeout(() => { M.flags.pauseFlag = true; }, 50);
+      await refreshing;
+      assert.equal(S.quality, 'RED',
+        'only Stop may abandon the re-read — a Pause must still let the answer land so Resume sees it');
+    } finally { M.flags.pauseFlag = false; global.fetch = saved.fetch; S.quality = saved.quality; }
+  });
+
+  // The wake itself, through the real loop: parked on your own cap until IST
+  // midnight, the clock is moved past the deadline, and the loop asks Meta for
+  // the rating as it wakes. One seat is dated two days ahead so the count stays
+  // at the cap on the moved clock too — the loop parks again rather than
+  // sending anything dated tomorrow into this shared database.
+  testAsync('the loop re-reads quality when a cap park ends', async () => {
+    const realNow = Date.now;
+    let sends = 0;
+    await withLoop(async url => {
+      if (String(url).endsWith('/messages')) sends++;
+      return qualityIs('RED')(url);
+    }, async h => {
+      const seat = `quality-seat.${realNow()}`;
+      db.prepare("INSERT INTO messages (wamid, wa_id, dir, type, body, at, status) VALUES (?, '919000036001', 'out', 'template', 'x', ?, 'accepted')")
+        .run(seat, realNow() + 2 * ROLL_DAY);
+      try {
+        S.quality = 'GREEN';
+        S.config.dailyCap = 1;                        // your own cap: the IST-day window, parked until midnight
+        h.stage([{ dialStr: '919000036002', name: 'Marco' }], 'quality-wake');
+        h.start();
+        await h.until(() => S.phase === 'paused');
+        assert.match(S.pauseReason || '', /^Daily cap reached \(1\/day\)\. Resumes at .+\.$/, 'parked on the day cap');
+        assert.equal(S.quality, 'GREEN', 'nothing asked yet — the park has not ended');
+
+        const jump = M.nextIstMidnight(realNow()) - realNow() + 1000;
+        Date.now = () => realNow() + jump;            // past the deadline the loop is sleeping to
+        await h.until(() => S.quality === 'RED', 4000);
+        assert.equal(S.quality, 'RED', 'the rating Meta reports at the wake is the one the next rung is decided on');
+        assert.equal(sends, 0, 'and nothing was sent on the moved clock');
+      } finally {
+        Date.now = realNow;
+        db.prepare('DELETE FROM messages WHERE wamid = ?').run(seat);
+      }
+    });
   });
 
   test('the last campaign is still readable after a reset drops the current run', () => {
@@ -3088,6 +4788,25 @@ console.log('\ndelivery failures that arrive over the webhook');
     assert.equal(progressForRun(run).pending, 0);
   });
 
+  // Meta mostly reports 131050 this way — accepted, then refused — and it is the
+  // same fact as at send time: the person turned marketing off. Switched off as
+  // an opt-out by the same one decision, never requeued.
+  test('a 131050 by webhook switches the contact off as an opt-out, never retried', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    C.upsertFromCsv(p, {});
+    accepted(run, p[0], 'w.optout');
+
+    assert.equal(webhook('w.optout', 131050), 'permanent');
+    assert.equal(C.getRow(p[0].dialStr).disabled_reason, 'opt_out',
+      'filed with the people who asked us to stop, not with the numbers that cannot receive messages');
+    assert.equal(rowFor(run, p[0].dialStr).wamid, 'w.optout', 'no ladder changes their mind — the row stays resolved');
+    const f = M.funnelForRun(run);
+    assert.equal(f.optedOut, 1, 'counted as an opt-out');
+    assert.equal(f.unreachable, 0, 'and not as "not on WhatsApp"');
+  });
+
   test('a code nobody has ruled on is reported, not retried', () => {
     const run = newRun();
     const p = people(1);
@@ -3113,6 +4832,88 @@ console.log('\ndelivery failures that arrive over the webhook');
       + 'the run must be allowed to close');
     assert.equal(progressForRun(run).pending, 0, 'and the campaign is finally allowed to be finished');
     assert.equal(countsForRun(run).failed, 1, 'reported as a failure, which is what it is');
+  });
+
+  // ── One ladder per code, and a ceiling over all of them ─────────────────────
+  // The ladder a contact is on is the ladder of the code that failed them, and
+  // its position used to be read off `attempts` — the TOTAL. A contact who had
+  // burned three network blips (-1) was already "three rungs up" when their
+  // first 131049 arrived, so 131049's three day-spaced rungs were spent before
+  // one of them happened. The review's fix — count per code with a CASE on
+  // error_code — is wrong on this app: markSent nulls error_code on every
+  // accept, and the webhook failure arrives AFTER the accept, so that CASE
+  // restarts at 1 on every rung and the ladder never ends. Unbounded paid sends.
+  test('a contact with transient retries still gets every 131049 day-rung, and attempts stays the total', () => {
+    const run = newRun();
+    const p = people(1);
+    const phone = p[0].dialStr;
+    buildRun(run, p);
+    const savedPhase = S.phase;
+    S.phase = 'idle';                 // a 'done' phase left behind would make each requeue restart the loop
+    try {
+      for (let i = 0; i < 3; i++) M.recordRecipientRetry(run, phone, -1, Date.now() - 1);
+      for (let rung = 1; rung <= backoffFor(131049).length; rung++) {
+        accepted(run, p[0], `w.day${rung}`);
+        assert.equal(webhook(`w.day${rung}`, 131049), 'retrying',
+          `131049 rung ${rung} must happen — errors.js promises the operator up to three day-spaced retries, and three network blips earlier do not change that`);
+      }
+      accepted(run, p[0], 'w.day.last');
+      assert.equal(webhook('w.day.last', 131049), 'exhausted', 'and then the 131049 ladder ends, after its own three');
+      assert.equal(M.recipientFor(run, phone).attempts, 6,
+        'attempts stays the TOTAL — "tried N×" and the report CSV render it, and resetting it would understate how often someone was messaged');
+    } finally { S.phase = savedPhase; }
+  });
+
+  test('repeated webhook 131049s exhaust after three rungs — a count keyed on error_code never would', () => {
+    const run = newRun();
+    const p = people(1);
+    const phone = p[0].dialStr;
+    buildRun(run, p);
+    // The review's proposal, evaluated against the row each webhook actually meets.
+    const naive = db.prepare('SELECT CASE WHEN error_code IS ? THEN attempts + 1 ELSE 1 END AS n '
+      + 'FROM run_recipients WHERE run_id = ? AND phone = ?');
+    const rungs = backoffFor(131049).length;
+    for (let i = 0; i < rungs; i++) {
+      accepted(run, p[0], `w.naive${i}`);
+      assert.equal(rowFor(run, phone).error_code, null,
+        'every accept clears error_code — the webhook failure always arrives after it');
+      assert.equal(naive.get(131049, run, phone).n, 1,
+        `so a per-code count keyed on error_code restarts at 1 on rung ${i + 1}, and would on every rung after — a ladder that never ends is unbounded paid sends`);
+      assert.equal(webhook(`w.naive${i}`, 131049), 'retrying');
+      const row = M.recipientFor(run, phone);
+      assert.deepEqual([row.ladder_code, row.ladder_attempts], [131049, i + 1],
+        'the per-code count lives in ladder_code/ladder_attempts, which no success clears');
+    }
+    accepted(run, p[0], `w.naive${rungs}`);
+    assert.equal(webhook(`w.naive${rungs}`, 131049), 'exhausted',
+      'the regression the naive fix would have caused: the fourth refusal must end the ladder');
+  });
+
+  test('two codes taking turns stop at the total ceiling, not never', () => {
+    const run = newRun();
+    const p = people(1);
+    const phone = p[0].dialStr;
+    const contact = { name: p[0].name, dialStr: phone };
+    buildRun(run, p);
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    try {
+      // A network blip at send time, then an accepted retry Meta refuses over the
+      // webhook, then a blip again… Each code's own ladder restarts whenever the
+      // other one interrupts it, so only the total can end this.
+      let ended = null;
+      for (let step = 1; step <= 50 && !ended; step++) {
+        const row = M.nextPending(run, Date.now() + 99 * 3600000);   // the loop, once the rung is due
+        if (!M.scheduleRetry(contact, row, { errorCode: -1, error: 'blip' }, '[t]', run)) { ended = 'send'; break; }
+        accepted(run, p[0], `w.alt${step}`);
+        const r = webhook(`w.alt${step}`, 131049);
+        if (r !== 'retrying') ended = r;
+      }
+      assert.ok(ended, 'alternating two retryable codes must end — nothing else stops it');
+      assert.equal(M.MAX_RETRIES_TOTAL, 8, 'the default five plus 131049\'s three');
+      assert.equal(M.recipientFor(run, phone).attempts, M.MAX_RETRIES_TOTAL,
+        'every retry either ladder grants counts against one ceiling, and the run then closes');
+    } finally { S.phase = savedPhase; }
   });
 
   // A campaign finishes, the operator uploads a new CSV — which opens a new run
@@ -3207,6 +5008,87 @@ console.log('\ndelivery failures that arrive over the webhook');
       assert.equal(progressForRun(run).retrying, 1, 'the row still waits, for whenever it is started');
     } finally { S.phase = savedPhase; S.currentRunId = savedRun; M.flags.running = savedRunning; }
   });
+
+  // ── A fault that fails every send, arriving after the accept ────────────────
+  // Billing holds, paused templates and account restrictions mostly do not come
+  // back in the send response: Meta accepts, then refuses over the status
+  // webhook. The loop's halt only ever saw the send-time half, so a campaign
+  // walked on into a billing hold and every accepted send was refused minutes
+  // later — the whole list spent on one fact. The webhook entrance parks the
+  // campaign the same way. The park writes campaign.json and the loop's flags,
+  // both shared with every other test, so both are put back.
+  const withLiveCampaign = (phase, fn) => {
+    const fsc = require('node:fs');
+    const cfile = require('./src/config').FILES.campaign;
+    const fileWas = fsc.existsSync(cfile) ? fsc.readFileSync(cfile) : null;
+    const saved = { phase: S.phase, run: S.currentRunId, reason: S.pauseReason, pause: M.flags.pauseFlag };
+    S.phase = phase; S.pauseReason = null; M.flags.pauseFlag = false;
+    try { fn(); } finally {
+      Object.assign(S, { phase: saved.phase, currentRunId: saved.run, pauseReason: saved.reason });
+      M.flags.pauseFlag = saved.pause;
+      if (fileWas) fsc.writeFileSync(cfile, fileWas); else fsc.rmSync(cfile, { force: true });
+    }
+  };
+
+  test('an account-level failure that arrives by webhook pauses the live campaign', () => withLiveCampaign('running', () => {
+    const run = newRun();
+    const p = people(2);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.halt');
+
+    assert.equal(webhook('w.halt', 131042), 'halted');
+    assert.equal(M.flags.pauseFlag, true,
+      'the flag is what stops the loop at its next iteration, and what makes Resume the operator\'s to press once it is fixed');
+    assert.equal(S.phase, 'paused');
+    assert.match(S.pauseReason, /^Campaign paused — Billing not set up for this business — .+ \[131042\]$/,
+      'the same sentence the send-time halt gives: the fault, the fix, and the code');
+    assert.equal(rowFor(run, p[0].dialStr).wamid, 'w.halt',
+      'nothing is skipped or requeued — the refused send is already recorded as failed on its own row');
+    assert.equal(progressForRun(run).pending, 1, 'and the contact nobody has reached yet is still owed their message');
+  }));
+
+  test('the webhook park is for the live campaign only', () => {
+    withLiveCampaign('running', () => {
+      const old = newRun();
+      const p = people(1);
+      buildRun(old, p);
+      accepted(old, p[0], 'w.halt.old');
+      newRun();                                   // a later upload made another run current
+      assert.notEqual(webhook('w.halt.old', 131042), 'halted');
+      assert.equal(M.flags.pauseFlag, false,
+        'a failure from a run nothing walks any more must not stop the one that is being walked');
+      assert.equal(S.phase, 'running');
+    });
+    for (const phase of ['idle', 'done']) {
+      withLiveCampaign(phase, () => {
+        const run = newRun();
+        const p = people(1);
+        buildRun(run, p);
+        accepted(run, p[0], `w.halt.${phase}`);
+        assert.equal(webhook(`w.halt.${phase}`, 131042), 'fix', 'reported like any fault a human has to correct');
+        assert.equal(M.flags.pauseFlag, false,
+          `a campaign that is ${phase} has no loop to stop, and a flag left set would greet the next Start as a pause`);
+        assert.equal(S.phase, phase);
+      });
+    }
+  });
+
+  test('a second halt on a parked campaign is logged, never re-parked', () => withLiveCampaign('waiting', () => {
+    const run = newRun();
+    const p = people(1);
+    buildRun(run, p);
+    accepted(run, p[0], 'w.halt.twice');
+    const failure = applyStatus({ id: 'w.halt.twice', status: 'failed', errors: [{ code: 132015, title: 'Template paused' }] });
+    assert.equal(handleDeliveryFailure(failure), 'halted', 'a paused template fails every send, whichever phase the loop is in');
+    const reason = S.pauseReason, lastLog = S.logs[S.logs.length - 1];
+    assert.equal(handleDeliveryFailure(failure), 'halted');
+    assert.equal(S.pauseReason, reason, 'the park is not re-announced or repainted');
+    const said = S.logs.slice(S.logs.indexOf(lastLog) + 1);
+    assert.equal(said.length, 1, 'one line — a refusal absorbed in silence is one the operator never hears about');
+    assert.match(said[0].msg, /\[132015\].*already paused/, 'naming the code, and that nothing was re-parked');
+    assert.equal(webhook('w.halt.twice', 132015), 'ignored',
+      'and Meta\'s own redelivery never reaches it: the status was already failed');
+  }));
 }
 
 // ── Progress cannot exceed the list ───────────────────────────────────────────
@@ -3799,6 +5681,156 @@ console.log('\nwebhook replay');
   });
 }
 
+console.log('\nwebhook ingest — what an envelope means');
+{
+  const { processEnvelope } = require('./src/services/ingest');
+  const { setIO } = require('./src/state');
+  // No entry id on purpose: an envelope that carries one teaches CFG.wabaId,
+  // and that would leak into every template test that runs after this block.
+  const envelopeOf = (field, value) => ({
+    object: 'whatsapp_business_account', entry: [{ changes: [{ field, value }] }],
+  });
+  // Every socket event emitted while fn runs. The real io goes back afterwards
+  // whatever fn did, so a failing assertion cannot leave the app talking to a
+  // test double.
+  const listening = async fn => {
+    const heard = [];
+    setIO({ emit: (event, payload) => heard.push({ event, payload }) });
+    try { await fn(); } finally { setIO(require('./server').io); }
+    return heard;
+  };
+
+  // Meta pushes this when the number is flagged, unflagged, or changes tier.
+  // The warm-up gate re-derives its rung from S.quality on every send, and
+  // nothing refreshed that value while a campaign ran — only an operator opening
+  // a page, or the next Start — on a retry ladder that now spans days.
+  testAsync('a quality update re-reads the rating from Graph; a failed re-read keeps the last one', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality,
+                    token: CFG.accessToken, phone: CFG.phoneNumberId };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = 'test-phone';
+    const asked = [];
+    try {
+      global.fetch = async url => {
+        asked.push(String(url));
+        return { json: async () => ({ quality_rating: 'YELLOW', messaging_limit_tier: 'TIER_1K' }) };
+      };
+      S.quality = 'GREEN';
+      processEnvelope(envelopeOf('phone_number_quality_update',
+        { display_phone_number: '15550000000', event: 'DOWNGRADE', current_limit: 'TIER_1K' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'YELLOW',
+        'the warm-up gate steps back a rung on this value — it has to be what Meta reports now, mid-campaign');
+      assert.ok(asked.some(u => u.includes('quality_rating')),
+        'read back from Graph, not mapped from the event name — the payload says DOWNGRADE, not which colour');
+
+      global.fetch = async () => { throw new Error('network down'); };
+      const heard = await listening(async () => {
+        processEnvelope(envelopeOf('phone_number_quality_update', { event: 'FLAGGED' }));
+        await new Promise(r => setImmediate(r));
+      });
+      assert.equal(S.quality, 'YELLOW', 'a re-read that failed must not clobber the last rating anyone saw');
+      assert.ok(heard.some(h => h.event === 'log' && /quality rating/i.test(h.payload.msg)
+                                && /network down/.test(h.payload.msg)),
+        'and the failure is said out loud, not swallowed');
+    } finally {
+      global.fetch = saved.fetch; S.quality = saved.quality;
+      CFG.accessToken = saved.token; CFG.phoneNumberId = saved.phone;
+    }
+  });
+
+  // fetchAccountInfo() maps a missing rating to the string 'UNKNOWN' (so the
+  // account screen has something to show) — which is truthy, so assigning
+  // S.quality directly from a successful-but-ratingless re-read overwrote a
+  // held RED/YELLOW warm-up hold with a value the ladder does not recognise,
+  // lifting the hold on no evidence the number recovered. adoptQuality is the
+  // one door every other reader of Meta's rating goes through for exactly
+  // this (warmup.js, /start, Settings); this webhook path has to use it too.
+  testAsync('a quality update whose re-read carries no rating does not lift a held RED', async () => {
+    const saved = { fetch: global.fetch, quality: S.quality,
+                    token: CFG.accessToken, phone: CFG.phoneNumberId };
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = 'test-phone';
+    try {
+      S.quality = 'RED';
+      // No quality_rating field at all — fetchAccountInfo turns this into 'UNKNOWN'.
+      global.fetch = async () => ({ json: async () => ({ messaging_limit_tier: 'TIER_1K' }) });
+      processEnvelope(envelopeOf('phone_number_quality_update', { event: 'FLAGGED' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'RED', 'UNKNOWN is not evidence the number recovered — the held rung must stay held');
+
+      global.fetch = async () => ({ json: async () => ({ quality_rating: 'YELLOW', messaging_limit_tier: 'TIER_1K' }) });
+      processEnvelope(envelopeOf('phone_number_quality_update', { event: 'DOWNGRADE' }));
+      await new Promise(r => setImmediate(r));
+      assert.equal(S.quality, 'YELLOW', 'a real rating on the same path is still adopted');
+    } finally {
+      global.fetch = saved.fetch; S.quality = saved.quality;
+      CFG.accessToken = saved.token; CFG.phoneNumberId = saved.phone;
+    }
+  });
+
+  // The wa_id Meta reports is not always the number the campaign dialed —
+  // Brazil's ninth digit, Mexico's 521, Argentina's 9. Filed under the wa_id
+  // alone, an opt-out suppressed a string no campaign row will ever match, and
+  // the next campaign messaged the person who had just asked us to stop.
+  test('an opt-out tap suppresses the number we dialed as well as the wa_id it came from', () => {
+    const dialed = '5511988887777', waId = '551188887777';
+    recordOutbound({ wamid: 'wamid.BR1', waId: dialed, name: 'Marco', body: 'x', runId: null });
+    processEnvelope(envelopeOf('messages', {
+      contacts: [{ wa_id: waId, profile: { name: 'Marco' } }],
+      messages: [{ id: 'wamid.BR1-tap', from: waId, timestamp: '1700000000', type: 'button',
+                   context: { from: '15550000000', id: 'wamid.BR1' },
+                   button: { text: OPT_OUT_LABEL, payload: OPT_OUT_LABEL } }],
+    }));
+    assert.equal(contacts.isDisabled(waId), true, 'the wa_id Meta reported is suppressed, as it always was');
+    assert.equal(contacts.isDisabled(dialed), true,
+      'and so is the form in the CSV — that is the string the next campaign checks before it dials');
+    assert.equal(contacts.getRow(dialed).disabled_reason, 'opt_out',
+      'recorded as the customer asking to stop, which only an explicit re-enable may undo');
+    markRead(waId);
+  });
+
+  // summary() rebuilds the whole thread list — two correlated subqueries per
+  // thread that ever replied — and recordInbound used to emit one per MESSAGE.
+  // Meta batches, so an envelope of fifty replies was fifty rebuilds pushed down
+  // every open socket to render the same final list.
+  testAsync('an envelope of three messages rebuilds the thread list once, not three times', async () => {
+    const senders = ['919000004901', '919000004902', '919000004903'];
+    const three = envelopeOf('messages', {
+      contacts: senders.map((wa_id, i) => ({ wa_id, profile: { name: ['Asha', 'Rahul', 'Sarah'][i] } })),
+      messages: senders.map((from, i) => ({ id: `wamid.batch-${i}`, from, timestamp: '1700000000',
+                                            type: 'text', text: { body: `hello ${i}` } })),
+    });
+    const first = (await listening(() => processEnvelope(three))).filter(h => h.event === 'inbox');
+    assert.equal(first.length, 1,
+      'one thread-list rebuild per webhook — summary() walks every thread that ever replied, and Meta batches');
+    const ids = first[0].payload.threads.map(t => t.waId);
+    assert.ok(senders.every(s => ids.includes(s)), 'and the one it sends already carries all three conversations');
+
+    const again = (await listening(() => processEnvelope(three))).filter(h => h.event === 'inbox');
+    assert.equal(again.length, 0, 'a redelivery records nothing new, so there is nothing to announce');
+    senders.forEach(markRead);
+  });
+
+  // Before this, `inbound` was the only thing that could trigger an 'inbox'
+  // emit — a status-only envelope carried none, so an open thread never
+  // learned a reply it sent had just been refused (or picked up its ticks):
+  // the transcript sat there showing the message as still on its way.
+  testAsync('a delivery failure emits inbox once, though nothing arrived to reply to', async () => {
+    const waId = '919000005801';
+    recordOutbound({ wamid: 'wamid.failonly-1', waId, name: 'FailOnly', body: 'x', runId: null });
+    const failedStatus = envelopeOf('messages', { statuses: [{
+      id: 'wamid.failonly-1', status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)),
+      recipient_id: waId, errors: [{ code: 131049, title: 'Not delivered' }],
+    }] });
+
+    const first = (await listening(() => processEnvelope(failedStatus))).filter(h => h.event === 'inbox');
+    assert.equal(first.length, 1, 'the transition into failed must reach an open thread the same way a reply does');
+
+    const again = (await listening(() => processEnvelope(failedStatus))).filter(h => h.event === 'inbox');
+    assert.equal(again.length, 0,
+      'a redelivery of the same failure is not a second transition into failed, so applyStatus returns nothing to announce');
+  });
+}
+
 console.log('\ndiagnostics');
 {
   const diag = require('./src/services/diagnostics');
@@ -4093,16 +6125,22 @@ test('a source file that fails to parse is left in place, not renamed, and logge
 
 console.log('\nF6 — idempotent failure handling');
 test('a redelivered failed status yields one failLog entry, not one per redelivery', () => {
-  seedOut('m-f1');
-  const before = S.failLog.length;
-  applyStatus({ id: 'm-f1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
-  assert.equal(S.failLog.length, before + 1);
-  assert.equal(statusOf('m-f1').status, 'failed');
-  // Meta redelivers webhooks it did not get a 200 for, so the identical
-  // 'failed' status for the same wamid can arrive more than once.
-  applyStatus({ id: 'm-f1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
-  assert.equal(S.failLog.length, before + 1, 'a redelivered failure must not push a second failLog entry');
-  assert.equal(statusOf('m-f1').status, 'failed');
+  // A private failLog: it is capped at 50, and once the suite before this has
+  // filled it, a push is paired with a shift and the length cannot move —
+  // which would read as "no entry" whatever applyStatus did.
+  const held = S.failLog;
+  S.failLog = [];
+  try {
+    seedOut('m-f1');
+    applyStatus({ id: 'm-f1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+    assert.equal(S.failLog.length, 1);
+    assert.equal(statusOf('m-f1').status, 'failed');
+    // Meta redelivers webhooks it did not get a 200 for, so the identical
+    // 'failed' status for the same wamid can arrive more than once.
+    applyStatus({ id: 'm-f1', status: 'failed', errors: [{ code: 131026, title: 'Undeliverable' }] });
+    assert.equal(S.failLog.length, 1, 'a redelivered failure must not push a second failLog entry');
+    assert.equal(statusOf('m-f1').status, 'failed');
+  } finally { S.failLog = held; }
 });
 test('a later failed webhook still updates the error code and title', () => {
   // Still worth recording the best detail seen, even though only the FIRST
@@ -4230,6 +6268,115 @@ testAsync('a signed envelope well over the old 100kb express default is accepted
   assert.equal(after, before + 1, 'the oversized envelope must actually be recorded, not merely accepted');
 });
 
+// These two need the REAL app, not the bare webhook router: the size-limit
+// test compares /webhook's allowance against /api/login's, and the
+// unparseable-body test exercises the error middleware server.js registers
+// after routes.mount(app) — neither exists on startWebhookServer's bare mount.
+testAsync('a signed body that is not JSON is stored for replay, not 400d — and a badly signed one is still refused', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const raw = Buffer.from('{ not json');
+    const sig = sign(raw, 'test-secret');
+    const before = testDb.prepare('SELECT count(*) n FROM webhook_events WHERE processed_at IS NULL').get().n;
+
+    const r = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sig },
+    });
+    assert.equal(r.status, 200, 'Meta retries a 400 forever with identical bytes — a permanently lost batch');
+    assert.equal(testDb.prepare('SELECT count(*) n FROM webhook_events WHERE processed_at IS NULL').get().n, before + 1,
+      'the envelope must land in the replay queue ingest.js already knows how to hold');
+
+    const forged = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': 'sha256=00' },
+    });
+    assert.equal(forged.status, 401,
+      'an unparseable body with a bad signature must still be refused, exactly like a parseable one — the parse failure must not become a second way past the HMAC check');
+  } finally {
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+});
+// Same durability boundary as "when the write fails the route answers 500,
+// never 200, and stores nothing" above, on the OTHER entrance to
+// recordEnvelope: the catch block server.js's error middleware wraps its call
+// in must hold on the unparseable-body path too, not just the normal one.
+// Same ALTER TABLE … RENAME technique, through the full app so the error
+// middleware (not the bare router) is what answers.
+testAsync('when the write fails on the unparseable-body entrance too, the route answers 500 and stores nothing', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  const before = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  testDb.exec('ALTER TABLE webhook_events RENAME TO webhook_events_hidden');
+  let res;
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const raw = Buffer.from('{ not json');
+    res = await fetch(`${base}/webhook`, {
+      method: 'POST', body: raw,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(raw, 'test-secret') },
+    });
+  } finally {
+    testDb.exec('ALTER TABLE webhook_events_hidden RENAME TO webhook_events');
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+  assert.equal(res.status, 500,
+    'a signed-but-unstorable envelope must never be acknowledged 200 — Meta would take the 200 as proof it landed and never resend it');
+  const after = testDb.prepare('SELECT count(*) AS n FROM webhook_events').get().n;
+  assert.equal(after, before, 'the failed write must leave no phantom row on this entrance either');
+});
+testAsync('only /webhook accepts a multi-megabyte JSON body', async () => {
+  const savedSecret = CFG.appSecret;
+  CFG.appSecret = 'test-secret';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    const big = JSON.stringify({ object: 'x', pad: 'a'.repeat(2 * 1024 * 1024) });
+    const w = await fetch(`${base}/webhook`, {
+      method: 'POST', body: big,
+      headers: { 'content-type': 'application/json', 'x-hub-signature-256': sign(big, 'test-secret') },
+    });
+    assert.equal(w.status, 200, 'a batched status webhook is legitimately large');
+
+    const l = await fetch(`${base}/api/login`, {
+      method: 'POST', body: big, headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(l.status, 413, 'nothing unauthenticated but the signed webhook should be allowed to parse megabytes');
+  } finally {
+    s.close();
+    CFG.appSecret = savedSecret;
+  }
+});
+
+console.log('\nsecurity headers');
+testAsync('the SPA shell and an API response both carry the baseline hardening headers', async () => {
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+    for (const path of ['/', '/api/session']) {
+      const r = await fetch(`${base}${path}`);
+      assert.equal(r.headers.get('x-frame-options'), 'SAMEORIGIN',
+        `${path}: DENY would blank the same-origin PDF <object> preview in views/inbox.jsx`);
+      assert.match(r.headers.get('content-security-policy'), /frame-ancestors 'self'/,
+        `${path}: 'none' would break that same PDF preview`);
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff',
+        `${path}: without it a browser can sniff a response into something it will render`);
+      assert.equal(r.headers.get('referrer-policy'), 'no-referrer',
+        `${path}: the URL (which can carry a session-adjacent path) must not leak to a third party via Referer`);
+    }
+  } finally { s.close(); }
+});
+
 console.log('\nmedia routes');
 {
   // Mirrors startWebhookServer: mount the real router on a bare app so the
@@ -4261,6 +6408,10 @@ console.log('\nmedia routes');
 
       const dl = await fetch(`http://127.0.0.1:${port}/api/media/asset/${up.asset.id}`);
       assert.equal(dl.status, 200);
+      assert.equal(dl.headers.get('x-content-type-options'), 'nosniff',
+        'an operator upload is served with the inbound route\'s hardening, not a bare stream');
+      assert.match(dl.headers.get('content-security-policy'), /sandbox/,
+        'the same sandboxed CSP the inbound route sends, in case a browser is ever handed this to render');
       assert.equal(Buffer.from(await dl.arrayBuffer()).toString(), bytes.toString());
     } finally { server.close(); }
   });
@@ -4331,8 +6482,118 @@ console.log('\nmedia routes');
   });
 }
 
+console.log('\nsocket.io origin enforcement');
+testAsync('a WebSocket/polling handshake from a foreign origin is refused', async () => {
+  // The REAL singleton server, not a second http.createServer(app): socket.io
+  // is attached to this exact instance in server.js, so only it has a
+  // /socket.io/ transport to hit. Torn down with io.close() rather than
+  // server.close() — io.close() also clears any engine.io client/timer state a
+  // handshake below leaves behind before it closes the httpServer, which is
+  // what keeps this test from being why the suite does not exit on its own.
+  const { server: realServer, io: realIo } = require('./server');
+  await new Promise(resolve => realServer.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${realServer.address().port}`;
+    const bad = await fetch(`${base}/socket.io/?EIO=4&transport=polling`, { headers: { origin: 'https://evil.example' } });
+    assert.notEqual(bad.status, 200, 'CORS never applied to the upgrade; allowRequest is what refuses it');
+
+    const ok = await fetch(`${base}/socket.io/?EIO=4&transport=polling`);
+    // No cookie → socketAuth refuses at connect, but the transport handshake itself is allowed.
+    assert.equal(ok.status, 200, 'same-origin clients (no Origin header on polling) must still connect');
+  } finally {
+    await new Promise(resolve => realIo.close(resolve));
+  }
+});
+
+console.log('\nHTTP wiring — route order, auth, CSRF origin, upload');
+// One boot of the real app/router table, walking every edge this batch
+// touches in the order an operator would actually hit them: locked out,
+// logged in, refused for a foreign Origin, throttled, then the two mount-order
+// traps (search-before-:waId, and the multer major B1 upgraded).
+testAsync('route order, session auth, CSRF origin, the login limiter and a multipart upload all work over real HTTP', async () => {
+  const savedPw = CFG.appPassword;
+  CFG.appPassword = 'correct horse';
+  const s = http.createServer(app);
+  await new Promise(r => s.listen(0, r));
+  try {
+    const base = `http://127.0.0.1:${s.address().port}`;
+
+    // 1. Everything under /api is behind requireAuth before any router's own
+    // logic runs — settings.js never sees an unauthenticated /state request.
+    assert.equal((await fetch(`${base}/api/state`)).status, 401,
+      'route order is the security boundary: the gate must refuse before the handler does');
+
+    // 2. Exempt from the gate so the Docker healthcheck keeps working.
+    assert.equal((await fetch(`${base}/health`)).status, 200);
+
+    // 3. Meta cannot sign in, so /webhook sits above requireAuth — reachable,
+    // but its own two checks (verify token, HMAC) still refuse a bad caller.
+    assert.equal((await fetch(`${base}/webhook`)).status, 403,
+      'no hub.verify_token configured must refuse the challenge, not echo it');
+    assert.equal((await fetch(`${base}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    })).status, 401, 'an unsigned POST must never reach recordEnvelope');
+
+    // 4. The right password sets a cookie, and that cookie is what clears the
+    // gate point 1 hit — same route, now signed in.
+    const login = await fetch(`${base}/api/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'correct horse' }),
+    });
+    assert.equal(login.status, 200);
+    const cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+    assert.match(cookie, /^wa_session=/, 'a successful login must set the session cookie');
+    assert.equal((await fetch(`${base}/api/state`, { headers: { cookie } })).status, 200,
+      'the same cookie that failed at point 1 must now pass');
+
+    // 5. sameSite=strict is the primary CSRF defence, but originAllowed is the
+    // server-side backstop for a state-changing request that announces an
+    // origin this app does not serve — a valid cookie must not be enough alone.
+    assert.equal((await fetch(`${base}/api/pause`, {
+      method: 'POST', headers: { cookie, origin: 'https://evil.example' },
+    })).status, 403, 'a foreign Origin on a state-changing POST is refused even with a valid session');
+
+    // 6. A distinct source IP (trust proxy 1 honours X-Forwarded-For), so
+    // exhausting this budget cannot lock out the login at point 4 above,
+    // wherever this assertion ends up relative to it.
+    let last;
+    for (let i = 0; i < 11; i++) {
+      last = await fetch(`${base}/api/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.7' },
+        body: JSON.stringify({ password: 'wrong' }),
+      });
+    }
+    assert.equal(last.status, 429, 'the 11th attempt inside the window must be throttled');
+
+    // 7. Mounted before /inbox/:waId (src/routes/inbox.js) — unmount that
+    // order and "search" is read as a wa_id, and this 404s instead of
+    // returning a search result.
+    const search = await fetch(`${base}/api/inbox/search?q=a`, { headers: { cookie } });
+    assert.equal(search.status, 200);
+    assert.equal(typeof (await search.json()).tooShort, 'boolean',
+      'a thread-not-found body has no tooShort field — this is what proves /search matched, not /:waId');
+
+    // 8. Pins the multer 2.x upgrade (B1): a real multipart body through the
+    // real router, not a direct call to the CSV parser.
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    try {
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from('name,phone\nAsha,+91 90000 00001\n')], { type: 'text/csv' }), 'contacts.csv');
+      const up = await fetch(`${base}/api/upload-csv`, { method: 'POST', headers: { cookie }, body: form });
+      const upBody = await up.json();
+      assert.equal(upBody.ok, true, upBody.error);
+    } finally { S.phase = savedPhase; }
+  } finally {
+    s.close();
+    CFG.appPassword = savedPw;
+  }
+});
+
 console.log('\nmedia — Meta identifiers');
 {
+  const fsx = require('fs');
   const seed = () => {
     const r = saveUpload({ buffer: Buffer.from(`bytes-${Math.random()}`),
                            originalname: 'sheet.pdf', mimetype: 'application/pdf' });
@@ -4372,6 +6633,45 @@ console.log('\nmedia — Meta identifiers');
     } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
   });
 
+  testAsync('a handle less than 23h old is reused without any fetch', async () => {
+    const id = seed();
+    db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?')
+      .run('h:FRESH', Date.now() - 60 * 60 * 1000, id);
+    await withFetch(() => { throw new Error('must not fetch for a handle inside its 23h window'); },
+      async () => {
+        const r = await ensureHandle(id);
+        assert.equal(r.ok, true, r.error);
+        assert.equal(r.handle, 'h:FRESH');
+      });
+  });
+
+  testAsync('a handle 24h old (or with no recorded age) is re-minted, not reused forever', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const upload = url => url.includes('/uploads?') ? json({ id: 'upload:SESSION2' }) : json({ h: 'h:FRESH2' });
+    try {
+      const stale = seed();
+      db.prepare('UPDATE media_assets SET meta_handle = ?, meta_handle_at = ? WHERE id = ?')
+        .run('h:STALE', Date.now() - 24 * 60 * 60 * 1000, stale);
+      await withFetch(upload, async calls => {
+        const r = await ensureHandle(stale);
+        assert.equal(r.handle, 'h:FRESH2', 'a 24h-old handle must not be trusted');
+        assert.equal(calls.length, 2, 'the full two-step upload runs again');
+      });
+      const row = getAsset(stale);
+      assert.equal(row.meta_handle, 'h:FRESH2');
+      assert.ok(row.meta_handle_at > Date.now() - 5000, 'meta_handle_at is re-stamped on a fresh mint');
+
+      const unstamped = seed();
+      db.prepare('UPDATE media_assets SET meta_handle = ? WHERE id = ?').run('h:NOAGE', unstamped);
+      await withFetch(upload, async calls => {
+        const r = await ensureHandle(unstamped);
+        assert.equal(r.handle, 'h:FRESH2', 'a handle with no recorded age must not be trusted as fresh either');
+        assert.equal(calls.length, 2);
+      });
+    } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
   testAsync('ensureHandle refuses clearly when APP_ID is not configured', async () => {
     const savedApp = CFG.appId;
     CFG.appId = '';
@@ -4381,6 +6681,19 @@ console.log('\nmedia — Meta identifiers');
       assert.equal(r.ok, false);
       assert.match(r.error, /APP_ID/, 'the error must name the missing setting');
     } finally { CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureHandle refuses a missing file before any fetch, not with a network error', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    fsx.unlinkSync(assetPath(getAsset(id)));   // e.g. wa.db restored without the uploads directory
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch for a file that is not on disk'); },
+        () => ensureHandle(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i, 'not "Could not reach graph.facebook.com" — there was nothing to send it');
+    } finally { CFG.accessToken = savedToken; CFG.appId = savedApp; }
   });
 
   testAsync('ensureMediaId uploads once and caches', async () => {
@@ -4429,6 +6742,65 @@ console.log('\nmedia — Meta identifiers');
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
 
+  testAsync('ensureMediaId refuses a missing file before any fetch, not with a network error', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    fsx.unlinkSync(assetPath(getAsset(id)));
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch for a file that is not on disk'); },
+        () => ensureMediaId(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /missing on this server/i);
+    } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  // readBytes() turns `media_assets.path` into a filesystem path with no
+  // containment check of its own — the same class of bug 6.11 closed for
+  // dropBytes/deleteAsset/rescanIfNeeded, just reached from these two instead.
+  // A tampered row must not get its target read and handed to Meta as though
+  // it were the operator's own file.
+  testAsync('ensureHandle refuses an asset whose path escapes UPLOAD_DIR, never reading it', async () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    const outside = pathx.join(UPLOAD_DIR, '..', `wa-outside-${process.pid}-${Date.now()}.txt`);
+    fsx.writeFileSync(outside, 'not actually an uploaded asset');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', pathx.basename(outside)), id);
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
+        () => ensureHandle(id));
+      assert.equal(r.ok, false);
+      // Its own sentence, not missingMsg: re-uploading repairs a genuinely
+      // missing file, but an escaped path means the ROW looks corrupted,
+      // which "upload it again" alone does not explain how to fix.
+      assert.match(r.error, /outside the uploads directory/i);
+      assert.match(r.error, /corrupted/i);
+    } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureMediaId refuses an asset whose path escapes UPLOAD_DIR, never reading it', async () => {
+    const pathx = require('path');
+    const { UPLOAD_DIR } = require('./src/config');
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    const outside = pathx.join(UPLOAD_DIR, '..', `wa-outside-${process.pid}-${Date.now()}-2.txt`);
+    fsx.writeFileSync(outside, 'not actually an uploaded asset');
+    db.prepare('UPDATE media_assets SET path = ? WHERE id = ?')
+      .run(pathx.join('..', pathx.basename(outside)), id);
+    try {
+      const r = await withFetch(() => { throw new Error('must not fetch — the path escapes UPLOAD_DIR'); },
+        () => ensureMediaId(id));
+      assert.equal(r.ok, false);
+      assert.match(r.error, /outside the uploads directory/i);
+      assert.match(r.error, /corrupted/i);
+    } finally { fsx.unlinkSync(outside); CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
   testAsync('a Graph error is returned as a message, not thrown', async () => {
     const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
     CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
@@ -4440,6 +6812,43 @@ console.log('\nmedia — Meta identifiers');
         assert.match(r.error, /Upload failed/);
       });
     } finally { CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
+  });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers, so one
+  // wedged connection would hold up a template submission or a campaign send
+  // for minutes. Verified by replacing AbortSignal.timeout with a spy — the
+  // real signal still runs underneath, so the request behaves identically.
+  const spyTimeout = () => {
+    const real = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return real(ms); };
+    return { seen, restore: () => { AbortSignal.timeout = real; } };
+  };
+
+  testAsync('ensureHandle: the session-open call carries graphMs, the byte-push carries transferMs', async () => {
+    const savedToken = CFG.accessToken, savedApp = CFG.appId;
+    CFG.accessToken = 'test-token'; CFG.appId = '1234567890';
+    const id = seed();
+    const { TIMEOUTS } = require('./src/config');
+    const spy = spyTimeout();
+    try {
+      await withFetch(url => url.includes('/uploads?') ? json({ id: 'upload:SESSION' }) : json({ h: 'h:X' }),
+        () => ensureHandle(id));
+      assert.deepEqual(spy.seen, [TIMEOUTS.graphMs, TIMEOUTS.transferMs],
+        'the session-open call is a small JSON request; the byte-push is what actually moves the file');
+    } finally { spy.restore(); CFG.accessToken = savedToken; CFG.appId = savedApp; }
+  });
+
+  testAsync('ensureMediaId upload carries transferMs — it moves the file, it does not just ask about it', async () => {
+    const savedToken = CFG.accessToken, savedPhone = CFG.phoneNumberId;
+    CFG.accessToken = 'test-token'; CFG.phoneNumberId = '100000000000000';
+    const id = seed();
+    const { TIMEOUTS } = require('./src/config');
+    const spy = spyTimeout();
+    try {
+      await withFetch(() => json({ id: 'media-timeout-1' }), () => ensureMediaId(id));
+      assert.deepEqual(spy.seen, [TIMEOUTS.transferMs]);
+    } finally { spy.restore(); CFG.accessToken = savedToken; CFG.phoneNumberId = savedPhone; }
   });
 }
 
@@ -4654,6 +7063,23 @@ console.log('\ninbound media — save, serve, expire');
       assert.ok(row.downloaded_at > 0);
       assert.equal(fsm.readFileSync(inboundPath(row)).toString(), bytes.toString());
     }));
+  });
+
+  // Without a signal, fetch waits on undici's own ~5-minute timers — a byte
+  // transfer (this app's own 100 MB document ceiling) genuinely needs longer
+  // than a small JSON call, which is why the two hops carry different budgets.
+  testAsync('saveInbound: the metadata GET carries graphMs, the CDN download carries transferMs', async () => {
+    const bytes = Buffer.from(`timeout-${Date.now()}`);
+    const id = seedInbound({ bytes });
+    const { TIMEOUTS } = require('./src/config');
+    const real = AbortSignal.timeout;
+    const seen = [];
+    AbortSignal.timeout = ms => { seen.push(ms); return real(ms); };
+    try {
+      await withToken(() => withMeta(metaOk(bytes), () => saveInbound(id)));
+      assert.deepEqual(seen, [TIMEOUTS.graphMs, TIMEOUTS.transferMs],
+        'resolving the media id is a small JSON call; the CDN fetch is what actually pulls the file');
+    } finally { AbortSignal.timeout = real; }
   });
 
   testAsync('saving twice never refetches and never rewrites', async () => {
@@ -4968,6 +7394,27 @@ console.log('\ninbound media — save, serve, expire');
       } finally { MEDIA_LIMITS.minFreeBytes = saved; }
     });
 
+    testAsync('the free-space check is size-aware — an enormous claimed size is refused even though bavail alone looks fine', async () => {
+      const savedFree = MEDIA_LIMITS.minFreeBytes, savedMax = MEDIA_LIMITS.maxBytes;
+      // minFreeBytes at 0 means `free < 0` is never true, so only a check that
+      // SUBTRACTS the incoming size can catch this. maxBytes is raised out of
+      // the way so it is this check, not the separate size cap, under test.
+      MEDIA_LIMITS.minFreeBytes = 0;
+      MEDIA_LIMITS.maxBytes = Number.MAX_SAFE_INTEGER;
+      const bytes = Buffer.from(`huge${Date.now()}`);
+      const id = seedInbound({ bytes });
+      const hugeMeta = url => url.includes('lookaside')
+        ? { ok: true, status: 200, arrayBuffer: async () => bytes, headers: new Headers() }
+        : { ok: true, status: 200, headers: new Headers(),
+            json: async () => ({ url: 'https://lookaside.fbsbx.com/whatsapp/1', mime_type: 'image/jpeg',
+                                  file_size: Number.MAX_SAFE_INTEGER }) };
+      try {
+        const r = await withoutScanner(() => withToken(() => withMeta(hugeMeta, () => saveInbound(id))));
+        assert.equal(r.ok, false, 'no real disk has this much free space once the claimed size is subtracted');
+        assert.match(r.error, /disk space/i);
+      } finally { MEDIA_LIMITS.minFreeBytes = savedFree; MEDIA_LIMITS.maxBytes = savedMax; }
+    });
+
     testAsync('with no scanner configured a save succeeds and says so', async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(`n${Date.now()}`)]);
       const id = seedInbound({ bytes });
@@ -5058,6 +7505,26 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(after.scan_status, 'infected');
       assert.equal(after.path, null);
       assert.ok(!fsm.existsSync(file), 'a late signature hit must remove the bytes, not just relabel them');
+    });
+
+    testAsync('rescanIfNeeded refuses a row whose path escapes MEDIA_DIR, and never reads or unlinks it', async () => {
+      const pathx = require('path');
+      const { MEDIA_DIR } = require('./src/config');
+      // A REAL file one level above MEDIA_DIR — if the containment guard were
+      // missing, this is exactly what a crafted `path` would get read and
+      // (on an infected verdict) unlinked.
+      const name    = `wa-outside-${process.pid}-${Date.now()}.txt`;
+      const outside = pathx.join(MEDIA_DIR, '..', name);
+      fsm.mkdirSync(pathx.dirname(outside), { recursive: true });
+      fsm.writeFileSync(outside, 'not actually inbound media');
+      const id = seedInbound({ bytes: Buffer.from('irrelevant') });
+      db.prepare("UPDATE media SET path = ?, scan_status = 'skipped' WHERE media_id = ?")
+        .run(pathx.join('..', name), id);
+      try {
+        const after = await withClamd('stream: Eicar-Test-Signature FOUND\x00', () => rescanIfNeeded(getInbound(id)));
+        assert.equal(after.scan_status, 'skipped', 'the row is returned unchanged, not scanned');
+        assert.ok(fsm.existsSync(outside), 'a file outside MEDIA_DIR must never be touched, let alone unlinked');
+      } finally { fsm.unlinkSync(outside); }
     });
 
     testAsync('a transient rescan failure leaves the row retryable', async () => {
@@ -5283,6 +7750,14 @@ console.log('\ninbound media — save, serve, expire');
     const age = (id, ms) => db.prepare('UPDATE media SET downloaded_at = ? WHERE media_id = ?')
       .run(Date.now() - ms, id);
 
+    // The sweep runs on its own tick, not on demand, so how OFTEN it ticks is
+    // what actually bounds the preview promise below — a daily tick could only
+    // ever be as tight as the DAY, whatever previewHours said.
+    test('the sweep ticks hourly, so a previewHours as low as 1 is never outlived by the tick itself', () => {
+      assert.ok(SWEEP_EVERY_MS <= 60 * 60 * 1000,
+        'previewHours can be configured down to 1; a coarser tick would let a preview sit unswept past its own promised hour before the sweep ever looks at it');
+    });
+
     const saveOne = async () => {
       const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]),
                                    Buffer.from(`k${Date.now()}${Math.random()}`)]);
@@ -5449,6 +7924,19 @@ console.log('\ninbound media — save, serve, expire');
       assert.equal(r.ok, true);
       assert.equal(getInbound(id).provisional, 0,
         'a Preview click must not put a 24-hour clock on something kept on purpose');
+    });
+
+    // The mirror of the test above: Save on an already-previewed row must not
+    // re-fetch bytes already on disk, but it DOES have to drop the 24-hour
+    // preview clock — Preview and Save are the same fetch on different clocks.
+    testAsync('Save on an already-previewed row promotes it without re-fetching', async () => {
+      const id = await previewOne();
+      assert.equal(getInbound(id).provisional, 1, 'starts on the short preview clock');
+      const r = await withMeta(() => { throw new Error('Save must not re-fetch bytes already on disk'); },
+        () => saveInbound(id, { provisional: false }));
+      assert.equal(r.ok, true, r.error);
+      assert.equal(r.promoted, true, 'the route needs to know this was a promotion, not a fresh save');
+      assert.equal(getInbound(id).provisional, 0, 'Save moves it onto the 90-day clock like any other kept file');
     });
 
     testAsync('Keep refuses a row with nothing on disk', () => {
@@ -5757,6 +8245,20 @@ console.log('\nfile risk classification');
     assert.equal(classify({ mime: 'image/png', filename: 'logo.png', bytes: Buffer.from('  <svg onload=alert(1)>') }).tier, 'block');
   });
 
+  // Google Docs and Notepad both export HTML/SVG with a UTF-8 BOM (EF BB BF)
+  // prefix. Decoded as latin1 — which the MARKUP test does — those three bytes
+  // become three unrelated Latin-1 characters, never U+FEFF, so a class that
+  // tried to skip the BOM there matched nothing and the whole file voted `ok`
+  // instead of `block`.
+  test('a UTF-8 BOM before markup does not hide it from the block tier', () => {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const htmlWithBom = Buffer.concat([bom, Buffer.from('<html><script>x</script>')]);
+    assert.equal(classify({ mime: 'text/plain', filename: 'a.txt', bytes: htmlWithBom }).tier, 'block');
+
+    const svgWithBom = Buffer.concat([bom, Buffer.from('<svg onload=alert(1)>')]);
+    assert.equal(classify({ mime: 'text/plain', filename: 'a.txt', bytes: svgWithBom }).tier, 'block');
+  });
+
   test('zip resolves by extension because the magic bytes cannot', () => {
     assert.equal(classify({ mime: 'application/zip', filename: 'app.apk',  bytes: zip }).tier, 'block');
     assert.equal(classify({ mime: 'application/zip', filename: 'lib.jar',  bytes: zip }).tier, 'block');
@@ -5940,6 +8442,17 @@ console.log('\ncontacts — directory paging, rename, delete, suppression');
     assert.equal(last.rows.length, 1, 'the final page is short, not empty');
     assert.equal(contacts.page({ q: marker, limit: 2, offset: 99 }).rows.length, 0,
       'and paging past the end is empty rather than an error');
+  });
+
+  test('page 1 of "all" leads with enabled rows, the same rationale as the CSV export', () => {
+    const marker = `Order${Date.now()}`;
+    const pDisabled = nextPhone(), pEnabled = nextPhone();
+    seed(pDisabled, `${marker} disabled`);
+    contacts.disable(pDisabled, 'manual');
+    seed(pEnabled, `${marker} enabled`);
+    const first = contacts.page({ q: marker, limit: 10, offset: 0 });
+    assert.equal(first.rows[0].enabled, 1,
+      'an operator opening the directory should see who a campaign will reach first, not who it will skip');
   });
 
   test('a hand-edited limit cannot ask for the whole table', () => {
@@ -6244,11 +8757,123 @@ console.log('\nstorage — a file in use is never deleted');
   });
 }
 
-// ── The one thing that needs the loop itself ──────────────────────────────────
-// Every other test in this file stays out of the campaign loop on purpose. This
-// one cannot: the bug is a race between an HTTP route and an `await` inside the
-// loop, and there is no way to observe it from outside. `fetch` is stubbed so the
-// Reset lands at exactly the wrong moment, every run, rather than sometimes.
+// ── Driving the real loop, and calling a campaign route, from a test ──────────
+// Function declarations, so they are hoisted and any section can use them.
+//
+// Every test that lets the loop run needs the same scaffolding and, above all,
+// the same teardown: the loop is Stopped and waited out BEFORE fetch is put
+// back, because a loop still inside an await when the stub comes off would
+// carry on against the real Graph API. campaign.json and warmup.json live at
+// the repo root and the loop writes both, so they are snapshotted and restored.
+async function withLoop(stubFetch, body, { exitMs = 5000 } = {}) {
+  const M = require('./server');
+  const { CFG: cfg, FILES: files } = require('./src/config');
+  const fs = require('node:fs');
+  const saved = {
+    cfg: { ...cfg }, fetch: global.fetch, config: { ...M.S.config },
+    days: [...M.W.days], enabled: M.W.enabled, quality: M.S.quality,
+    run: M.S.currentRunId, phase: M.S.phase, reason: M.S.pauseReason,
+  };
+  const snap = [files.campaign, files.warmup].map(f => [f, fs.existsSync(f) ? fs.readFileSync(f) : null]);
+  Object.assign(M.S.config, { delaySec: 0, dailyCap: 0, headerAssetId: null });
+  M.W.enabled = false;
+  // Already a sending day, so markWarmupDay() is a no-op and writes nothing.
+  if (!M.W.days.includes(todayKey())) M.W.days.push(todayKey());
+  M.flags.stopFlag = false; M.flags.pauseFlag = false;
+  global.fetch = stubFetch;
+  const h = {
+    M,
+    // What an upload does: open a run, stage its queue, make it current.
+    stage(contacts, label) { const id = M.startRun(label); M.buildRun(id, contacts); return id; },
+    // What /start does once its checks pass.
+    start() { M.S.phase = 'running'; M.S.pauseReason = null; M.startLoop(); },
+    async until(pred, ms = 3000) {
+      const end = Date.now() + ms;
+      while (!pred() && Date.now() < end) await new Promise(r => setTimeout(r, 10));
+      return pred();
+    },
+    row: (run, phone) => M.db.prepare('SELECT * FROM run_recipients WHERE run_id = ? AND phone = ?').get(run, phone),
+  };
+  try {
+    await body(h);
+  } finally {
+    M.flags.stopFlag = true;
+    const exited = await h.until(() => !M.flags.running, exitMs);
+    // Only a loop that has exited gets the real fetch back. One still inside an
+    // await would carry on against the real Graph API, and walk whichever run
+    // is current once the state below is put back — so the stub and the Stop
+    // stay in place and the test fails, rather than carrying on as if it had.
+    if (exited) { M.flags.stopFlag = false; global.fetch = saved.fetch; }
+    M.flags.pauseFlag = false;
+    Object.assign(cfg, saved.cfg);
+    for (const k of Object.keys(M.S.config)) if (!(k in saved.config)) delete M.S.config[k];
+    Object.assign(M.S.config, saved.config);
+    M.W.days = saved.days; M.W.enabled = saved.enabled; M.S.quality = saved.quality;
+    Object.assign(M.S, { currentRunId: saved.run, phase: saved.phase, pauseReason: saved.reason });
+    for (const [f, prev] of snap) if (prev) fs.writeFileSync(f, prev); else fs.rmSync(f, { force: true });
+    assert.ok(exited, `the loop did not exit within ${exitMs} ms of Stop — the fetch stub and the Stop are left in place`);
+  }
+}
+
+// withLoop's own teardown. If the loop has not exited after its Stop, putting
+// the real fetch back would let a live loop carry on against Meta — so the
+// teardown must fail loudly, leaving the stub and the Stop in place. Here the
+// send never answers until the test releases it; afterwards the loop's own
+// writes are undone, because they land after withLoop has restored everything.
+testAsync('withLoop fails, stub still in place, when the loop outlives its Stop', async () => {
+  const M = require('./server');
+  const { FILES: files } = require('./src/config');
+  const fsw = require('node:fs');
+  const snap = [files.campaign, files.warmup].map(f => [f, fsw.existsSync(f) ? fsw.readFileSync(f) : null]);
+  const saved = { fetch: global.fetch, phase: M.S.phase, reason: M.S.pauseReason, days: [...M.W.days] };
+  let release = null;
+  const stuck = () => new Promise(r => { release = () => r(graphOk('wamid.stuck.1')); });
+  try {
+    await assert.rejects(withLoop(stuck, async h => {
+      h.stage([{ dialStr: '919000033301', name: 'Asha' }], 'stuck-loop');
+      h.start();
+    }, { exitMs: 100 }), /did not exit/);
+    assert.equal(global.fetch, stuck, 'the stub stays in place while a loop is alive');
+  } finally {
+    release?.();                                   // the send answers; the loop sees the Stop and exits
+    const end = Date.now() + 3000;
+    while (M.flags.running && Date.now() < end) await new Promise(r => setTimeout(r, 10));
+    M.flags.stopFlag = false;
+    global.fetch = saved.fetch;
+    Object.assign(M.S, { phase: saved.phase, pauseReason: saved.reason });
+    M.W.days = saved.days;
+    for (const [f, prev] of snap) if (prev) fsw.writeFileSync(f, prev); else fsw.rmSync(f, { force: true });
+  }
+});
+
+// Graph's two answers to a send, as the stubbed fetch returns them.
+function graphOk(id) {
+  return { ok: true, headers: new Map(), json: async () => ({ messages: [{ id }] }) };
+}
+function graphErr(error) {
+  return { ok: false, headers: new Map(), json: async () => ({ error }) };
+}
+
+// A campaign route called the way Express calls it, minus the socket: the
+// handlers are thin, and HTTP would only add a port to close and a stubbed
+// fetch that has to wave localhost through.
+function callRoute(method, path, body = {}, routerPath = './src/routes/campaign') {
+  const router = require(routerPath);
+  const layer = router.stack.find(l => l.route?.path === path && l.route.methods[method]);
+  if (!layer) throw new Error(`no ${method.toUpperCase()} ${path} on the campaign router`);
+  return new Promise((resolve, reject) => {
+    const res = { status() { return this; }, json(o) { resolve(o); return this; } };
+    Promise.resolve(layer.route.stack[0].handle({ body, query: {}, params: {} }, res, reject)).catch(reject);
+  });
+}
+
+// ── Tests that drive the real loop ─────────────────────────────────────────────
+// Most of this file tests the loop's pieces from outside it. The tests in this
+// block — and the others that call withLoop() — cannot: their bugs are races
+// between a route or a webhook and an `await` inside the loop, and there is no
+// way to observe those from outside. `fetch` is stubbed so the interruption
+// lands at exactly the wrong moment every run, rather than sometimes; the first
+// one below is the Reset that lands mid-send.
 console.log('\na Reset that lands mid-send');
 {
   const M = require('./server');
@@ -6313,6 +8938,141 @@ console.log('\na Reset that lands mid-send');
       flags.stopFlag = false; flags.pauseFlag = false;
       if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
+    }
+  });
+
+  // ── A failure webhook that beats the send's own response ────────────────────
+  // The other mid-send race. Meta's status webhook can arrive while the send API
+  // has still not answered, and the message row that status is about only
+  // exists once the loop records the send. It used to be logged and dropped,
+  // with the envelope stamped processed — and a dropped `failed` is a contact
+  // the retry ladder never sees: the run closed "1 of 1 sent", nobody owed.
+  const failedEnvelope = (wamid, to, code, title) => ({
+    object: 'whatsapp_business_account',
+    entry: [{ changes: [{ field: 'messages', value: { statuses: [{
+      id: wamid, status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)),
+      recipient_id: to, errors: [{ code, title }] }] } }] }],
+  });
+
+  testAsync('a failure webhook that beats its own send response still reaches the retry ladder', async () => {
+    const { processEnvelope } = require('./src/services/ingest');
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, fetch: global.fetch,
+                    days: [...W.days], enabled: W.enabled, delay: S.config.delaySec,
+                    cap: S.config.dailyCap, header: S.config.headerAssetId,
+                    run: S.currentRunId, phase: S.phase };
+    const hadC = fsr.existsSync(FILESr.campaign);
+    const prevC = hadC ? fsr.readFileSync(FILESr.campaign) : null;
+    const hadW = fsr.existsSync(FILESr.warmup);
+    const prevW = hadW ? fsr.readFileSync(FILESr.warmup) : null;
+
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p';
+    S.config.delaySec = 0; S.config.dailyCap = 0; S.config.headerAssetId = null;
+    W.enabled = false;
+    if (!W.days.includes(todayKey())) W.days.push(todayKey());
+
+    const runId = startRun('status-before-send');
+    buildRun(runId, [{ dialStr: '919300000555', name: 'Early' }]);
+    S.currentRunId = runId;
+    S.phase = 'running';
+    flags.stopFlag = false; flags.pauseFlag = false;
+
+    // Meta refuses the message — and says so over the webhook — while the send
+    // itself is still inside this await. The whole race, made deterministic.
+    global.fetch = async () => {
+      processEnvelope(failedEnvelope('wamid.beaten', '919300000555', 131049, 'Not delivered'));
+      return { ok: true, headers: new Map(),
+               json: async () => ({ messages: [{ id: 'wamid.beaten' }] }) };
+    };
+
+    const rowQ = db.prepare(
+      'SELECT wamid, skipped_reason, error_code, attempts FROM run_recipients WHERE run_id = ? AND phone = ?');
+    let row;
+    try {
+      startLoop();
+      const until = Date.now() + 8000;
+      while (Date.now() < until) {
+        row = rowQ.get(runId, '919300000555');
+        if (row.skipped_reason === 'retry' || !flags.running) break;
+        await new Promise(r => setTimeout(r, 25));
+      }
+      // Parked a day out on the 131049 ladder, which is where it belongs. Stop
+      // it so the suite does not wait with it.
+      flags.stopFlag = true;
+      const gone = Date.now() + 4000;
+      while (flags.running && Date.now() < gone) await new Promise(r => setTimeout(r, 25));
+
+      assert.equal(db.prepare("SELECT status FROM messages WHERE wamid = 'wamid.beaten'").get().status, 'failed',
+        'the held status is applied the moment the send is recorded');
+      assert.equal(row.skipped_reason, 'retry',
+        'and the ladder saw it — a failure it never sees is a contact never retried');
+      assert.equal(row.wamid, null, 'un-stamped, so the queue knows another attempt is owed');
+      assert.equal(row.error_code, 131049, 'stamped with what Meta actually said');
+      assert.equal(row.attempts, 1, 'one rung, exactly as if the webhook had come second');
+    } finally {
+      global.fetch = saved.fetch;
+      CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
+      S.config.delaySec = saved.delay; S.config.dailyCap = saved.cap; S.config.headerAssetId = saved.header;
+      W.days = saved.days; W.enabled = saved.enabled;
+      S.currentRunId = saved.run; S.phase = saved.phase;
+      flags.stopFlag = false; flags.pauseFlag = false;
+      if (hadC) fsr.writeFileSync(FILESr.campaign, prevC); else fsr.rmSync(FILESr.campaign, { force: true });
+      if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
+    }
+  });
+
+  // /test-send records through the same recordOutbound, so the same race lands
+  // there. A test send is the cheapest place to learn a number is not on
+  // WhatsApp, and that must not depend on which arrived first.
+  testAsync('a test send whose failure beats its response still switches the dead number off', async () => {
+    const { processEnvelope } = require('./src/services/ingest');
+    const saved = { token: CFGr.accessToken, phone: CFGr.phoneNumberId, waba: CFGr.wabaId,
+                    fetch: global.fetch, config: { ...S.config }, days: [...W.days], phase: S.phase };
+    const hadW = fsr.existsSync(FILESr.warmup);
+    const prevW = hadW ? fsr.readFileSync(FILESr.warmup) : null;
+
+    CFGr.accessToken = 't'; CFGr.phoneNumberId = 'p'; CFGr.wabaId = 'waba-test';
+    Object.assign(S.config, { templateName: 'race_check', headerAssetId: null, mmLite: false });
+    S.phase = 'idle';
+    // Already a sending day, so a successful send stamps nothing into warmup.json.
+    if (!W.days.includes(todayKey())) W.days.push(todayKey());
+
+    const dialStr = '919300000556';
+    const real = saved.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.startsWith('http://127.0.0.1')) return real(url, opts);
+      if (u.includes('/message_templates')) {
+        return { ok: true, json: async () => ({ data: [{
+          name: 'race_check', status: 'APPROVED', category: 'MARKETING', language: S.config.templateLanguage,
+          components: [{ type: 'BODY', text: 'Hello from the race test' }] }] }) };
+      }
+      processEnvelope(failedEnvelope('wamid.ts-beaten', dialStr, 131026, 'Message undeliverable'));
+      return { ok: true, headers: new Map(),
+               json: async () => ({ messages: [{ id: 'wamid.ts-beaten' }] }) };
+    };
+
+    const a = express();
+    a.use(express.json());
+    a.use('/api', require('./src/routes/campaign'));
+    const server = http.createServer(a);
+    await new Promise(r => server.listen(0, r));
+    try {
+      const r = await (await real(`http://127.0.0.1:${server.address().port}/api/test-send`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ numbers: [dialStr] }),
+      })).json();
+      assert.equal(r.ok, true, `the send itself was accepted: ${JSON.stringify(r)}`);
+      assert.equal(db.prepare("SELECT status FROM messages WHERE wamid = 'wamid.ts-beaten'").get().status, 'failed',
+        'the held status is applied to the test send too');
+      assert.equal(contacts.isDisabled(dialStr), true,
+        'and an undeliverable number is switched off whichever arrived first — the webhook or the response');
+    } finally {
+      server.close();
+      global.fetch = saved.fetch;
+      CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone; CFGr.wabaId = saved.waba;
+      Object.assign(S.config, saved.config);
+      W.days = saved.days; S.phase = saved.phase;
+      if (hadW) fsr.writeFileSync(FILESr.warmup, prevW); else fsr.rmSync(FILESr.warmup, { force: true });
     }
   });
 
@@ -6388,6 +9148,129 @@ console.log('\na Reset that lands mid-send');
       if (hadW) fsr.writeFileSync(FILESr.warmup, prevW);   else fsr.rmSync(FILESr.warmup, { force: true });
     }
   });
+  // A rate limit answering a send that was in flight when the campaign was
+  // parked under the flag must not repaint the park. Over the operator's Pause
+  // it wrote "auto-resuming" — and a reason that is not USER_PAUSE makes the
+  // next boot resume on its own; over a halt it promised an auto-resume that
+  // never comes, and hid the code the operator has to fix.
+  testAsync('a rate limit does not repaint a pause that was set while the send was in flight', async () => {
+    let sends = 0;
+    const limited = () => ({ ok: false, headers: new Map([['retry-after', '0']]),
+      json: async () => ({ error: { code: 130429, message: 'Throughput rate limit reached' } }) });
+    await withLoop(async () => {
+      sends++;
+      if (sends === 1) { callRoute('post', '/pause'); return limited(); }        // the operator pauses mid-send
+      if (sends === 3) {                                                        // a halt lands mid-send
+        M.handleDeliveryFailure(M.applyStatus({ id: 'wamid.m2.2', status: 'failed',
+          errors: [{ code: 131042, title: 'Business eligibility payment issue' }] }));
+        return limited();
+      }
+      return graphOk(`wamid.m2.${sends}`);
+    }, async h => {
+      const { S, flags } = h.M;
+      h.stage([{ dialStr: '919000033201', name: 'Asha' }, { dialStr: '919000033202', name: 'Rahul' }], 'rate-limit-paint');
+      h.start();
+      await h.until(() => sends === 1 && S.phase === 'paused');
+      await new Promise(r => setTimeout(r, 50));
+      assert.equal(S.pauseReason, h.M.USER_PAUSE, 'the operator\'s pause stays theirs, so a reboot does not resume it');
+
+      assert.equal((await callRoute('post', '/resume')).ok, true);
+      await h.until(() => sends === 3 && flags.pauseFlag);
+      await new Promise(r => setTimeout(r, 50));
+      assert.match(S.pauseReason || '', /^Campaign paused — .+ \[131042\]$/,
+        'the halt names the code to fix — "auto-resuming" would promise a resume that never comes');
+    });
+  });
+
+  // The SEND-TIME halt branch (haltsCampaign, right after sendTemplate) had no
+  // guard at all against a Stop or a Pause landing in the same window — unlike
+  // the rate-limit branch just above (B3's M2 fix). A Stop already writes
+  // S.phase='idle'/S.pauseReason=null synchronously in the route, before this
+  // send even resolves; overwriting that with 'paused' and a halt reason, then
+  // persisting it with saveCampaignNow(), leaves a crash in the gap before the
+  // loop's own stopFlag check runs again free to resurrect a campaign the
+  // operator stopped. The loop's own flag check owns what happens next — Stop
+  // exits idle on its very next iteration — so this branch must defer to it
+  // rather than writing an answer of its own.
+  testAsync('a Stop landing during a halting send is not painted over as a resumable pause', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      await callRoute('post', '/stop');                    // lands while this send is still in flight
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags } = h.M;
+      h.stage([{ dialStr: '919000034101', name: 'Asha' }], 'halt-during-stop');
+      h.start();
+      await h.until(() => !flags.running);
+      assert.equal(s.phase, 'idle', 'a Stop is final — a halt landing after it must not repaint it as paused');
+      assert.equal(s.pauseReason, null, 'nothing here may leave a stale halt reason behind an already-stopped run');
+      assert.equal(flags.pauseFlag, false, 'the halt branch must not turn a stopped run into one Resume could lift');
+      assert.equal(sends, 1, 'the loop must not keep sending after a Stop landed mid-send');
+      assert.ok(!s.logs.some(l => /190/.test(l.msg) && /paused, nobody was skipped/.test(l.msg)),
+        'the halt must not be announced as a fresh park once the campaign is already stopping');
+    });
+  });
+
+  // Same race, the operator's own Pause instead of a Stop. USER_PAUSE is what
+  // tells resumeIfInterrupted this pause is the operator's to lift, not one the
+  // loop gave itself — overwriting it with the halt reason silently turned an
+  // operator Pause into one the next boot auto-resumes on its own.
+  testAsync('a Pause landing during a halting send keeps USER_PAUSE, not the halt reason', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      await callRoute('post', '/pause');                   // lands while this send is still in flight
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags, USER_PAUSE: up } = h.M;
+      h.stage([{ dialStr: '919000034111', name: 'Rahul' }], 'halt-during-pause');
+      h.start();
+      await h.until(() => sends === 1 && s.logs.some(l => /190/.test(l.msg)));
+      assert.equal(s.pauseReason, up, 'the operator\'s own Pause must not be overwritten by the halt reason');
+      assert.equal(s.phase, 'paused');
+      assert.equal(flags.pauseFlag, true, 'still set, so Resume is theirs to press');
+      assert.equal(sends, 1, 'the fault must not be probed again while the operator\'s pause holds');
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused, so nothing else changes/.test(l.msg)),
+        'the fault is still said out loud in one line, even though the pause stays the operator\'s');
+    });
+  });
+
+  // Same race again, but the pause already there is the loop's OWN — an
+  // earlier halt (a previous contact here, or handleDeliveryFailure on the
+  // webhook thread) rather than the operator's. Gating on
+  // S.pauseReason === USER_PAUSE alone left an earlier halt's reason just as
+  // overwritable as no pause at all: a second, unrelated fault replaced the
+  // FIRST one's reason with its own, and the operator lost the fact that
+  // actually parked the campaign. flags.pauseFlag is the signal both cases
+  // share, and mirrors handleDeliveryFailure's own webhook entrance exactly.
+  testAsync('a halt landing on an already halt-paused loop keeps the first reason', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      // An earlier halt already parked the run under its own reason. Set
+      // directly rather than via a second send: the loop offers a paused
+      // run no further attempts, so a real second send could never race here.
+      const M = require('./server');
+      M.flags.pauseFlag = true;
+      M.S.phase = 'paused';
+      M.S.pauseReason = 'Campaign paused — first fault [131042]';
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags } = h.M;
+      h.stage([{ dialStr: '919000034121', name: 'Marco' }], 'halt-during-halt');
+      h.start();
+      await h.until(() => sends === 1 && s.logs.some(l => /190/.test(l.msg)));
+      assert.equal(s.pauseReason, 'Campaign paused — first fault [131042]',
+        'the first halt\'s reason is kept, not overwritten by the second fault');
+      assert.equal(s.phase, 'paused');
+      assert.equal(flags.pauseFlag, true);
+      assert.equal(sends, 1, 'the loop must not probe the fault again while the campaign is already paused');
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused, so nothing else changes/.test(l.msg)),
+        'the second fault is still said out loud in one line, even though the first reason stays on screen');
+    });
+  });
+
   // ── An account-level fault must pause the campaign, not burn the list ───────
   // Every send after an expired token / paused template / billing hold fails
   // identically. The loop used to write that identical failure once per contact
@@ -6449,6 +9332,273 @@ console.log('\na Reset that lands mid-send');
     }
   });
 
+  // The same halt arriving the way it mostly does: Meta accepted the send and
+  // refuses it over the status webhook while the loop is already on to the next
+  // contact. The send in flight cannot be recalled; nobody after it is sent into
+  // the fault, and Resume carries on from the next contact.
+  testAsync('an account-level failure that arrives by webhook stops the loop before the next contact', async () => {
+    let sends = 0, halted = null;
+    await withLoop(async () => {
+      if (++sends === 2) {
+        // Meta refuses the FIRST send while the loop is sending the second.
+        const failure = M.applyStatus({ id: 'wamid.haltw.1', status: 'failed',
+                                        errors: [{ code: 131042, title: 'Business eligibility payment issue' }] });
+        halted = failure && M.handleDeliveryFailure(failure);
+      }
+      return graphOk(`wamid.haltw.${sends}`);
+    }, async h => {
+      const { S } = h.M;
+      const p = ['919000035101', '919000035102', '919000035103'];
+      const run = h.stage(p.map((dialStr, i) => ({ dialStr, name: ['Asha', 'Rahul', 'Marco'][i] })), 'halt-webhook');
+      h.start();
+      await h.until(() => h.row(run, p[1]).wamid !== null);        // the send in flight has landed
+      await new Promise(r => setTimeout(r, 100));                   // room for a third, were the loop still walking
+
+      assert.equal(halted, 'halted', 'the billing hold parked the campaign from the webhook');
+      assert.equal(S.phase, 'paused');
+      assert.match(S.pauseReason || '', /131042/, 'and the reason names the code the operator has to fix');
+      assert.equal(sends, 2, 'the send already in flight completes; nobody after it is sent into the fault');
+      assert.equal(h.row(run, p[2]).attempted_at, null, 'the third contact is untouched');
+
+      const resumed = await callRoute('post', '/resume');
+      assert.equal(resumed.ok, true, 'Resume is how the operator says "fixed it" — the flag makes it theirs to press');
+      await h.until(() => h.row(run, p[2]).wamid !== null);
+      assert.equal(sends, 3, 'and the loop carries on from the next contact, skipping nobody');
+    });
+  });
+
+  // A Stop is final, and a burst of halt webhooks must not undo it. /stop clears
+  // pauseFlag and says idle, but the loop takes up to half a second to notice. A
+  // second refusal landing in that window re-parked the campaign, the loop's
+  // exit then promoted the repainted phase to 'done' — the one phase a failure
+  // webhook reopens — and a later 131049 restarted the run and sent to the next
+  // contact on a list the operator had stopped.
+  testAsync('a Stop during a burst of halt webhooks stays a Stop', async () => {
+    let sends = 0;
+    const refused = (wamid, code) => M.handleDeliveryFailure(
+      M.applyStatus({ id: wamid, status: 'failed', errors: [{ code, title: 'refused' }] }));
+    await withLoop(async () => {
+      if (++sends === 3) refused('wamid.stopburst.1', 131042);   // the first refusal lands during the third send
+      return graphOk(`wamid.stopburst.${sends}`);
+    }, async h => {
+      const { S, flags } = h.M;
+      const p = ['919000037101', '919000037102', '919000037103', '919000037104'];
+      const run = h.stage(p.map(dialStr => ({ dialStr, name: 'Sarah' })), 'stop-burst');
+      h.start();
+      await h.until(() => h.row(run, p[2]).wamid !== null && S.phase === 'paused');
+      assert.equal(flags.pauseFlag, true, 'precondition: the first refusal parked the campaign');
+
+      const stopped = callRoute('post', '/stop');     // the handler runs now; the loop is still in its idle sleep
+      assert.notEqual(refused('wamid.stopburst.2', 131042), 'halted', 'a Stop in flight is final — the next refusal must not re-park it');
+      assert.equal((await stopped).ok, true);
+      await h.until(() => !flags.running);
+      assert.equal(S.phase, 'idle', 'a Stop leaves the campaign idle, never "done" — done is what a failure webhook reopens');
+      assert.equal(flags.pauseFlag, false, 'and no pause is left behind for the next Start to trip over');
+
+      assert.equal(refused('wamid.stopburst.3', 131049), 'retrying', 'the contact is still owed a message, for whenever the operator starts again');
+      await new Promise(r => setTimeout(r, 200));
+      assert.equal(flags.running, false, 'but a webhook must not restart a campaign the operator stopped');
+      assert.equal(sends, 3, 'nobody after the Stop is sent to');
+      assert.equal(h.row(run, p[3]).attempted_at, null, 'the fourth contact is untouched');
+    });
+  });
+
+  // The loop's own half of the same rule: only /stop and /reset set stopFlag,
+  // and both mean idle, so whatever repaints the phase between the Stop and the
+  // loop's exit, the exit says idle — never 'done', which a webhook reopens.
+  testAsync('a Stop always exits idle, whatever was painted after it', async () => {
+    await withLoop(async () => graphOk('wamid.stopidle.1'), async h => {
+      const { S, flags } = h.M;
+      h.stage([{ dialStr: '919000037111', name: 'Marco' }, { dialStr: '919000037112', name: 'Asha' }], 'stop-idle');
+      h.start();
+      await callRoute('post', '/pause');               // lands during the first send; the loop then idles
+      await callRoute('post', '/stop');
+      S.phase = 'paused'; S.pauseReason = 'painted late'; // any writer landing before the loop notices
+      await h.until(() => !flags.running);
+      assert.equal(S.phase, 'idle', 'a stopped run must not end "done"');
+      assert.equal(S.pauseReason, null);
+      assert.equal(flags.pauseFlag, false);
+    });
+  });
+
+  // ── A throttle on the NUMBER parks the whole loop ───────────────────────────
+  // 131048 is Meta limiting the sending number over spam signals: while it is in
+  // force every send fails. The loop used to park only the contact who met it and
+  // walk straight on — on a long list, hundreds of guaranteed failures at full
+  // tempo, each burning a rung and feeding the signal that raised the throttle.
+  // Now it parks until the latest live 131048 rung on the queue, and the next
+  // contact after that is a single probe.
+  testAsync('131048 at send time parks the loop — the rest of the list is not walked into it', async () => {
+    let sends = 0;
+    await withLoop(async () => (++sends === 1
+      ? graphErr({ code: 131048, message: 'Spam rate limit hit' })
+      : graphOk(`wamid.t48s.${sends}`)), async h => {
+      const { S, flags } = h.M;
+      const p = ['919000032101', '919000032102', '919000032103'];
+      const run = h.stage(p.map((dialStr, i) => ({ dialStr, name: ['Asha', 'Rahul', 'Marco'][i] })), 'throttle-send');
+      h.start();
+      await h.until(() => S.phase === 'paused' && /131048/.test(S.pauseReason || ''));
+
+      assert.match(S.pauseReason || '',
+        /^Meta is limiting this number over spam signals \[131048\] — sending pauses until .+\. Contacts already reached are unaffected\.$/,
+        'the operator is told which limit stopped the run');
+      const until = h.M.senderThrottleUntil(run);
+      assert.ok(until > Date.now(), 'the deadline is the queue\'s own 131048 rung');
+      assert.ok(S.pauseReason.includes(new Date(until).toLocaleTimeString('en-IN',
+        { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })), 'and until when, in IST');
+      assert.equal(sends, 1, 'a sender-level throttle fails every send — the next contacts must not be burned');
+      assert.equal(h.row(run, p[1]).attempted_at, null, 'the next contact has not been touched');
+
+      const resume = await callRoute('post', '/resume');
+      assert.equal(resume.ok, false, 'Resume cannot beat a throttle on the number — the loop is asleep until it lifts');
+      assert.match(resume.error, /131048/, 'and the refusal is the sentence that explains why');
+
+      flags.stopFlag = true;
+      const t0 = Date.now();
+      await h.until(() => !flags.running);
+      assert.equal(flags.running, false);
+      // sleepUntil polls in slices of up to ONE SECOND (campaign.js) — Stop can
+      // land right after a slice starts, so the true worst case is close to
+      // 1000ms before flags.stopFlag is even read again, before any of the
+      // Stop branch's own work (saveCampaignNow, broadcast). 1500ms left under
+      // 500ms of margin over that documented granularity and failed for real
+      // (not just here — under load) about 1 run in 20: flaky on the WAIT, not
+      // on the behaviour. 2500ms keeps this nowhere near "waited for the
+      // throttle" (4h away) while giving the poll loop room to answer.
+      assert.ok(Date.now() - t0 < 2500, 'Stop is answered within a couple of seconds, not when the throttle lifts');
+    });
+  });
+
+  // The busy entrance. Meta usually accepts the send and refuses it later over
+  // the status webhook, so this is how 131048 mostly arrives — with the loop
+  // already on to the next contact. The requeue writes the same kind of rung the
+  // send-time path writes, which is why the park needs no state of its own.
+  testAsync('a 131048 that arrives over the webhook parks the loop at its next iteration', async () => {
+    let sends = 0, requeued = null;
+    await withLoop(async () => {
+      if (++sends === 2) {
+        // Meta refuses the FIRST send while the loop is sending the second.
+        const failure = M.applyStatus({ id: 'wamid.t48w.1', status: 'failed',
+                                        errors: [{ code: 131048, title: 'Spam rate limit hit' }] });
+        requeued = failure && M.handleDeliveryFailure(failure);
+      }
+      return graphOk(`wamid.t48w.${sends}`);
+    }, async h => {
+      const { S } = h.M;
+      const p = ['919000032111', '919000032112', '919000032113'];
+      const run = h.stage(p.map(dialStr => ({ dialStr, name: 'Sarah' })), 'throttle-webhook');
+      h.start();
+      await h.until(() => S.phase === 'paused' && /131048/.test(S.pauseReason || ''));
+
+      assert.equal(requeued, 'retrying', 'the refused contact is back on its 131048 rung');
+      assert.match(S.pauseReason || '', /131048/, 'the busy entrance parks the loop, not only the send-time one');
+      assert.equal(sends, 2, 'the send already in flight completes; the one after it is never made');
+      assert.equal(h.row(run, p[2]).attempted_at, null, 'the third contact is untouched');
+    });
+  });
+
+  // Nothing about the park lives in memory. A restart mid-throttle re-derives it
+  // from the rung the queue already carries, so the loop that auto-resumes parks
+  // again instead of spending a probe the moment the process comes back.
+  testAsync('the 131048 park survives a restart — derived from the queue, not remembered', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.t48r.${++sends}`), async h => {
+      const { S, flags } = h.M;
+      const p = ['919000032121', '919000032122'];
+      const run = h.stage(p.map(dialStr => ({ dialStr, name: 'Rahul' })), 'throttle-restart');
+      // What the send-time entrance wrote before the process died…
+      M.recordRecipientRetry(run, p[0], 131048, Date.now() + 4 * 3600000);
+      // …and the campaign.json the park itself saved.
+      Object.assign(S, { currentRunId: run, phase: 'paused',
+        pauseReason: 'Meta is limiting this number over spam signals [131048] — sending pauses until 14:00. Contacts already reached are unaffected.' });
+      h.M.saveCampaignNow();
+      Object.assign(S, { currentRunId: null, phase: 'idle', pauseReason: null });   // a fresh boot
+
+      h.M.resumeIfInterrupted({ graceMs: 20 });
+      await h.until(() => flags.running && /131048/.test(S.pauseReason || ''));
+      assert.match(S.pauseReason || '', /131048/,
+        'the loop that auto-resumed found the throttle on the queue by itself — a pause the loop gave itself resumes, and re-parks');
+      assert.equal(sends, 0, 'and the next contact was not sent early: a restart must not cost a probe');
+      assert.equal(h.row(run, p[1]).attempted_at, null);
+    });
+  });
+
+  // ── A loop that crashes has to say so ───────────────────────────────────────
+  // startLoop's catch used to clear `running` and nothing else: the phase went on
+  // saying "running" with no loop behind it, campaignBlocker() answered every
+  // Start and upload with "still sending", and the only trace was one line in a
+  // 500-entry log. The queue is durable, so Resume can carry on from the same
+  // contact — the screen only has to say so.
+  testAsync('a loop that crashes parks with a sentence, and Resume carries on from the same contact', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.crash.${++sends}`), async h => {
+      const { S, flags, db: d } = h.M;
+      const phone = '919000033101';
+      const run = h.stage([{ dialStr: phone, name: 'Sarah' }], 'crash-parks');
+      // The loop's first query meets a missing table and throws — the same
+      // escape a disk-full or an SQL error takes. The table is back before the
+      // catch runs (a microtask later), so only the loop saw it gone.
+      d.exec('ALTER TABLE run_recipients RENAME TO run_recipients_away');
+      try { h.start(); } finally { d.exec('ALTER TABLE run_recipients_away RENAME TO run_recipients'); }
+      await h.until(() => !flags.running);
+
+      assert.equal(flags.running, false, 'the loop is gone');
+      assert.equal(S.phase, 'paused', 'so the phase must stop claiming a campaign is sending');
+      assert.match(S.pauseReason || '',
+        /^The send loop stopped on an error — .+\. Press Resume to carry on from the same contact\.$/,
+        'the operator is told what happened and which button fixes it');
+      assert.equal(flags.pauseFlag, true, 'set, so /api/resume treats the pause as the operator\'s to lift');
+      assert.match(h.M.campaignBlocker() || '', /paused part-way/, 'a Start or an upload is told the run is paused…');
+      assert.doesNotMatch(h.M.campaignBlocker() || '', /still sending/, '…never that it is still sending, when nothing is');
+
+      const resumed = await callRoute('post', '/resume');
+      assert.equal(resumed.ok, true, 'Resume is allowed');
+      await h.until(() => !flags.running && S.phase === 'done');
+      assert.equal(h.row(run, phone).wamid, 'wamid.crash.1', 'and it carried on from the same contact — nobody skipped');
+      assert.equal(sends, 1, 'and nobody messaged twice');
+    });
+  });
+
+  // The crash park must not overrule what the operator already said. A Stop is
+  // final — parking it as a resumable pause would bring back a campaign they
+  // stopped, one Resume or reboot later — and their own Pause must stay theirs:
+  // any other reason makes it auto-resume on the next boot. Both land in the
+  // microtask before the crash handler runs, exactly as a click would.
+  const crashWith = (h, operatorSays) => {
+    h.M.db.exec('ALTER TABLE run_recipients RENAME TO run_recipients_away');
+    try { h.start(); } finally { h.M.db.exec('ALTER TABLE run_recipients_away RENAME TO run_recipients'); }
+    return callRoute('post', operatorSays);
+  };
+
+  testAsync('a loop that crashes after a Stop stays stopped', async () => {
+    await withLoop(async () => graphOk('wamid.crashstop.1'), async h => {
+      const { S, flags } = h.M;
+      h.stage([{ dialStr: '919000033111', name: 'Rahul' }], 'crash-after-stop');
+      await crashWith(h, '/stop');
+      await h.until(() => !flags.running);
+      assert.equal(S.phase, 'idle', 'a Stop is final — not a pause that Resume or a reboot would lift');
+      assert.equal(flags.pauseFlag, false);
+      assert.equal(S.pauseReason, null);
+    });
+  });
+
+  testAsync('a loop that crashes during the operator\'s Pause keeps it theirs', async () => {
+    let sends = 0;
+    await withLoop(async () => graphOk(`wamid.crashpause.${++sends}`), async h => {
+      const { S, flags } = h.M;
+      const run = h.stage([{ dialStr: '919000033121', name: 'Sarah' }], 'crash-in-user-pause');
+      await crashWith(h, '/pause');
+      await h.until(() => !flags.running);
+      assert.equal(S.pauseReason, h.M.USER_PAUSE,
+        'any other reason turns their pause into one the next boot resumes on its own');
+      assert.equal(S.phase, 'paused');
+      assert.equal(flags.pauseFlag, true, 'still set, so Resume is theirs to press');
+      assert.equal((await callRoute('post', '/resume')).ok, true);
+      await h.until(() => h.row(run, '919000033121').wamid !== null);
+      assert.equal(sends, 1, 'and Resume carries on from the same contact');
+    });
+  });
+
   // A thrown fetch (DNS, TLS, no network) is a moment, not three hours: it goes
   // through the same in-loop backoff a rate limit gets, and only lands on the
   // ladder after RATE_LIMIT_RETRIES straight misses.
@@ -6466,6 +9616,50 @@ console.log('\na Reset that lands mid-send');
     } finally {
       global.fetch = saved.fetch; CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
       S.config.headerAssetId = saved.header;
+    }
+  });
+
+  // A connection that never answers is the other half of "fetch threw". With no
+  // signal, fetch waits on undici's own ~5-minute timers, and the loop is single
+  // — so one wedged socket held every remaining send, and Stop, for minutes per
+  // contact. The stub hangs forever unless it is handed a signal, and only the
+  // signal's abort ends it; the race is here so a regression fails rather than
+  // hanging the suite.
+  const hungFetch = (u, o = {}) => new Promise((_, rej) =>
+    o.signal?.addEventListener('abort', () => rej(o.signal.reason)));
+  const orHang = (p, ms = 1000) => Promise.race([p, new Promise(r => setTimeout(() => r('still waiting'), ms))]);
+
+  testAsync('a campaign send that never answers times out into the transient path', async () => {
+    const { TIMEOUTS } = require('./src/config');
+    const saved = { fetch: global.fetch, graphMs: TIMEOUTS.graphMs, header: S.config.headerAssetId };
+    TIMEOUTS.graphMs = 20; S.config.headerAssetId = null;
+    global.fetch = hungFetch;
+    try {
+      const t0 = Date.now();
+      const r = await orHang(M.sendTemplate({ name: 'X', dialStr: '919300000905' }));
+      assert.notEqual(r, 'still waiting', 'the send must carry a timeout — without one a wedged socket holds the whole loop');
+      assert.equal(r.errorCode, -1, 'an abort is a network failure like any other…');
+      assert.equal(r.transient, true, '…so the loop backs off and retries this contact in seconds, not on the ladder');
+      assert.ok(Date.now() - t0 < 500, 'and it is the Graph timeout that ended it, not a five-minute one');
+    } finally {
+      global.fetch = saved.fetch; TIMEOUTS.graphMs = saved.graphMs; S.config.headerAssetId = saved.header;
+    }
+  });
+
+  testAsync('every Graph helper call carries the timeout too', async () => {
+    const { TIMEOUTS } = require('./src/config');
+    const saved = { fetch: global.fetch, graphMs: TIMEOUTS.graphMs };
+    TIMEOUTS.graphMs = 20;
+    global.fetch = hungFetch;
+    try {
+      // /start awaits this with the loop not yet running; hung, Start never answered.
+      const info = await orHang(M.fetchAccountInfo().catch(e => e));
+      assert.notEqual(info, 'still waiting', 'fetchAccountInfo must give up rather than hang /start and /account-info');
+      assert.match(String(info?.name || info), /TimeoutError|AbortError/, 'it gives up with the abort, which every caller already catches');
+      const sent = await orHang(M.graphSend('POST', 'test-phone/messages', { x: 1 }).catch(e => e));
+      assert.notEqual(sent, 'still waiting', 'graphSend carries the inbox replies — a hung one held the operator\'s request open');
+    } finally {
+      global.fetch = saved.fetch; TIMEOUTS.graphMs = saved.graphMs;
     }
   });
 
@@ -6498,6 +9692,150 @@ console.log('\na Reset that lands mid-send');
       global.fetch = saved.fetch; CFGr.accessToken = saved.token; CFGr.phoneNumberId = saved.phone;
       S.config.mmLite = saved.mm; S.config.templateCategory = saved.cat; S.config.headerAssetId = saved.header;
     }
+  });
+
+  // ── The campaign routes, across their own awaits ────────────────────────────
+  // Meta's answers for /start's two Graph calls: the template list, and the
+  // phone number's account info.
+  const templateList = (name, text = 'Hello') => ({ ok: true, json: async () => ({ data: [{
+    name, status: 'APPROVED', category: 'MARKETING', language: 'en',
+    components: [{ type: 'BODY', text }] }] }) });
+  const accountInfo = () => ({ ok: true, json: async () => ({ quality_rating: 'GREEN', messaging_limit_tier: 'TIER_1K' }) });
+
+  // /start checks the staged run, then awaits two Graph calls with no loop
+  // running and the phase still idle — so a CSV uploaded in another tab passes
+  // its own blocker in that window and stages a NEW run. /start then started
+  // that one: a list nobody had pressed Start for, validated against nothing.
+  testAsync('/start refuses when a CSV upload swaps the staged list during its awaits', async () => {
+    let swapped = null;
+    await withLoop(async url => {
+      if (!String(url).includes('/message_templates')) return accountInfo();
+      // The upload lands while /start is waiting on Meta.
+      swapped = M.stageRun([{ dialStr: '919000033002', name: 'Rahul' }], 'uploaded-in-another-tab');
+      return templateList('swap_check');
+    }, async h => {
+      const { S, flags } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'swap_check';
+      const checked = h.stage([{ dialStr: '919000033001', name: 'Asha' }], 'the-list-that-was-checked');
+      S.phase = 'idle';
+
+      const r = await callRoute('post', '/start');
+      assert.ok(swapped && swapped !== checked, 'the swap really happened, inside the await');
+      assert.deepEqual(r, { ok: false, error: 'The staged list changed while starting — check it and press Start again.' },
+        'a list uploaded in another tab must never be sent without its own Start');
+      assert.equal(flags.running, false, 'no loop was started');
+      assert.notEqual(S.phase, 'running', 'and nothing on screen claims one was');
+      assert.equal(h.row(swapped, '919000033002').attempted_at, null, 'the uploaded list is untouched');
+    });
+  });
+
+  // /start reads the rating fresh, and an answer without one must not lift a
+  // held rung any more than the loop's own re-read may.
+  testAsync('/start keeps a RED hold when Meta\'s answer has no rating', async () => {
+    await withLoop(async url => {
+      if (String(url).includes('/message_templates')) return templateList('quality_hold');
+      if (String(url).endsWith('/messages')) return graphOk('wamid.qualityhold.1');
+      return { ok: true, json: async () => ({ messaging_limit_tier: 'TIER_1K' }) };
+    }, async h => {
+      const { S } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'quality_hold';
+      S.quality = 'RED';
+      h.stage([{ dialStr: '919000033031', name: 'Marco' }], 'quality-hold-start');
+      S.phase = 'idle';
+      const r = await callRoute('post', '/start');
+      assert.equal(r.ok, true, r.error);
+      assert.equal(S.quality, 'RED', 'the rung stays held — "UNKNOWN" is no evidence the number recovered');
+    });
+  });
+
+  // The same window lets a second Start through: another tab's Start passes the
+  // same blocker, launches the loop, and the operator pauses it — then this one
+  // resumed, wiped the log, cleared pauseFlag and painted 'running' over their
+  // pause, and the first loop walked on. Refused with the blocker's sentence.
+  testAsync('/start refuses when another Start launched the campaign during its awaits', async () => {
+    let sends = 0, raced = false;
+    await withLoop(async url => {
+      if (String(url).endsWith('/messages')) return graphOk(`wamid.secondstart.${++sends}`);
+      if (!String(url).includes('/message_templates')) return accountInfo();
+      if (!raced) {                                   // the other tab: Start, then Pause
+        raced = true;
+        M.S.phase = 'running'; M.S.pauseReason = null; M.startLoop();
+        callRoute('post', '/pause');
+      }
+      return templateList('second_start');
+    }, async h => {
+      const { S, flags } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'second_start';
+      h.stage([{ dialStr: '919000033041', name: 'Asha' }, { dialStr: '919000033042', name: 'Rahul' }], 'second-start');
+      S.phase = 'idle';
+
+      const r = await callRoute('post', '/start');
+      assert.ok(raced, 'the other Start really landed inside the await');
+      assert.equal(r.ok, false, 'a campaign already under way must not be started over');
+      assert.match(r.error || '', /paused part-way through/, 'with the sentence the blocker gives');
+      assert.equal(flags.pauseFlag, true, 'the operator\'s pause stays in force');
+      assert.equal(S.pauseReason, h.M.USER_PAUSE);
+      assert.ok(S.logs.some(l => l.msg === 'Paused'), 'and the log is not wiped');
+      await new Promise(res => setTimeout(res, 100));
+      assert.equal(sends, 1, 'the paused loop does not walk on');
+    });
+  });
+
+  // A template this app cannot fill — named {{first_name}} variables — is marked
+  // in S.config.templateUnsupported by adoptTemplate (contract C6), and the two
+  // send doors are where that has to bite: every contact would fail at Meta on a
+  // slot nobody can fill. Set directly here, because adoptTemplate is not this
+  // file's to fake; what matters is that both doors refuse with the sentence.
+  testAsync('/start and /test-send refuse a template the app cannot fill, with its own sentence', async () => {
+    let sends = 0;
+    await withLoop(async url => {
+      if (String(url).includes('/message_templates')) return templateList('named_vars', 'Hi {{first_name}}');
+      if (String(url).endsWith('/messages')) { sends++; return graphOk(`wamid.named.${sends}`); }
+      return accountInfo();
+    }, async h => {
+      const { S, flags } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'named_vars';
+      S.config.templateUnsupported =
+        'This template uses named variables ({{first_name}}), which this app cannot fill yet — pick one that uses {{1}}, {{2}}…';
+      h.stage([{ dialStr: '919000033011', name: 'Marco' }], 'named-vars');
+      S.phase = 'idle';
+
+      const start = await callRoute('post', '/start');
+      assert.deepEqual(start, { ok: false, error: S.config.templateUnsupported },
+        'refused with the sentence that names the fix — not a campaign of identical failures');
+      assert.equal(flags.running, false, 'and no loop was started');
+
+      const tried = await callRoute('post', '/test-send', { numbers: ['+919000033012'] });
+      assert.deepEqual(tried, { ok: false, error: S.config.templateUnsupported },
+        'a test send goes through the same door, so it is refused the same way');
+      assert.equal(sends, 0, 'nothing reached Meta\'s /messages');
+    });
+  });
+
+  // A test send is a template this number really sent, and reconcileWarmupDays
+  // already counts its day at the next boot. Only the loop marked the day live,
+  // so a day of test sends alone climbed no rung until a restart — and then the
+  // ceiling on screen moved with nothing sent in between. withLoop snapshots
+  // W.days and warmup.json, so marking the day here writes nothing that lasts.
+  testAsync('a test send counts as a sending day live, as it already does after a reboot', async () => {
+    await withLoop(async url => {
+      if (String(url).includes('/message_templates')) return templateList('warm_day');
+      if (String(url).endsWith('/messages')) return graphOk('wamid.warmday.1');
+      return accountInfo();
+    }, async h => {
+      const { S, W } = h.M;
+      CFGr.wabaId = 'test-waba';
+      S.config.templateName = 'warm_day';
+      W.days = W.days.filter(d => d !== todayKey());      // nothing has gone out today
+      const r = await callRoute('post', '/test-send', { numbers: ['+919000033021'] });
+      assert.equal(r.ok, true, 'the stubbed send was accepted');
+      assert.ok(W.days.includes(todayKey()),
+        'the day a template went out is a sending day, whichever button sent it');
+    });
   });
 }
 
@@ -6611,6 +9949,46 @@ test('a restart resumes the loop\'s own pause and respects the operator\'s', () 
     if (had) fs2.writeFileSync(FILES2.campaign, prev);
     else fs2.rmSync(FILES2.campaign, { force: true });
   }
+});
+
+// The grace period is announced on screen — "resuming N contacts in 10s" — and
+// an operator who answers it with Stop, Pause or Reset meant it. The timer used
+// to resume regardless: it set the phase to running, startLoop() cleared both
+// flags, and the campaign the operator had just ended sent anyway. The grace is
+// injected so the suite never waits the real ten seconds.
+testAsync('Stop, Pause or Reset inside the restart grace window is honoured; left alone, it resumes', async () => {
+  let sends = 0;
+  await withLoop(async () => graphOk(`wamid.grace.${++sends}`), async h => {
+    const { S, flags } = h.M;
+    const phone = '919000032001';
+    const run = h.stage([{ dialStr: phone, name: 'Asha' }], 'restart-grace');
+    // What a boot finds: campaign.json saying a run was sending, and a queue
+    // with someone still owed a message.
+    const boot = () => {
+      Object.assign(S, { currentRunId: run, phase: 'running', pauseReason: null });
+      h.M.saveCampaignNow();
+      Object.assign(S, { currentRunId: null, phase: 'idle', pauseReason: null });
+      flags.stopFlag = false; flags.pauseFlag = false;
+      h.M.resumeIfInterrupted({ graceMs: 20 });
+      assert.match(S.pauseReason || '', /Server restarted — resuming 1 remaining contacts in 0.02s/,
+        'the window is announced first, with the grace actually in force');
+    };
+
+    for (const [action, phase] of [['/stop', 'idle'], ['/pause', 'paused'], ['/reset', 'idle']]) {
+      boot();
+      await callRoute('post', action);                    // the operator answers the banner
+      await new Promise(r => setTimeout(r, 80));          // well past the 20 ms grace
+      assert.equal(flags.running, false,
+        `${action} inside the announced window must not be erased by the timer — nothing may resurrect a campaign the operator ended`);
+      assert.equal(sends, 0, `and after ${action} nobody is messaged`);
+      assert.equal(S.phase, phase, `the phase ${action} left behind is still the operator's`);
+    }
+
+    boot();
+    await h.until(() => h.row(run, phone).wamid);
+    assert.equal(h.row(run, phone).wamid, 'wamid.grace.1',
+      'left alone, the grace period ends in a resume — the half that must keep working');
+  });
 });
 
 // ── People an older campaign still owes a message to ─────────────────────────
@@ -6727,6 +10105,88 @@ test('a CSV that lists the same number twice reports the merge rather than hidin
   assert.equal(duplicates[0].row, 4, 'named by the row an operator can go and look at');
   assert.equal(duplicates[0].firstRow, 2, 'and by the row it collided with, which is the one they have to compare it to');
   assert.equal(skipped.length, 1, 'a row with no usable number is still a different problem, counted separately');
+});
+
+// ── Deployment files ────────────────────────────────────────────────────────
+console.log('\ndeployment files');
+test('.dockerignore keeps secrets and customer data out of image layers', () => {
+  const lines = fsx.readFileSync(pathx.join(__dirname, '.dockerignore'), 'utf8')
+    .split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+  for (const must of ['.env*', '*.db', '*.db-wal', '.git', '*.csv', 'media/', 'uploads/', 'docs/', 'campaign.json', 'warmup.json', 'Thumbs.db'])
+    assert.ok(lines.includes(must), `${must} must stay out of the image — COPY . . ignores .gitignore`);
+});
+test('the image runs as a non-root user and binds all interfaces inside the container', () => {
+  const df = fsx.readFileSync(pathx.join(__dirname, 'Dockerfile'), 'utf8');
+  assert.match(df, /^USER node$/m, 'a process that holds a money-spending token should not be root');
+  assert.match(df, /BIND_HOST=0\.0\.0\.0/, 'loopback inside a container is unreachable through a published port');
+  assert.match(df, /process\.env\.PORT/, 'the healthcheck must follow PORT, not assume 3000');
+});
+test('docker-compose.yml publishes the port on loopback only, with state on a named volume', () => {
+  const dc = fsx.readFileSync(pathx.join(__dirname, 'docker-compose.yml'), 'utf8');
+  assert.match(dc, /build:\s*\.\s*$/m, 'must build from this repo\'s own Dockerfile, not run an image nobody can audit');
+  assert.match(dc, /env_file:\s*\.env/, 'credentials come from the operator\'s own .env, never baked into the image');
+  assert.match(dc, /"127\.0\.0\.1:3000:3000"/, 'binding 0.0.0.0 on the host exposes the app to the internet with no tunnel or proxy in front of it');
+  assert.match(dc, /restart:\s*unless-stopped/, 'a crash on a box nobody is watching must not need a manual restart');
+  assert.match(dc, /wa-data:\/data/, 'state must live on the named volume, or a rebuild silently deletes the database');
+});
+test('the repo carries an MIT license, so a self-hoster has a right to run it', () => {
+  assert.match(fsx.readFileSync(pathx.join(__dirname, 'LICENSE'), 'utf8'), /MIT License/,
+    'without a license the repo is all-rights-reserved and self-hosters have no right to run it');
+  assert.equal(require('./package.json').license, 'MIT',
+    'package.json is the machine-readable half — tools that read it should see the same answer as a human reading LICENSE');
+  assert.match(fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8'), /## License\s*\n+MIT/,
+    'the README is where a human actually looks, not just the LICENSE file');
+});
+test('CI runs the real suite on every push and PR, and reports audit advisories without blocking a merge', () => {
+  const wf = fsx.readFileSync(pathx.join(__dirname, '.github', 'workflows', 'test.yml'), 'utf8');
+  assert.match(wf, /^on:\s*\[push, *pull_request\]/m, 'a fork PR that never runs the suite is how a regression reaches main unseen');
+  assert.match(wf, /actions\/setup-node@v4/, 'pin the action major version, or a v5 someday changes behaviour under everyone at once');
+  assert.match(wf, /node-version:\s*'22'/, 'this app requires Node 22.5+ for node:sqlite — an older runner would fail for a reason unrelated to the change under review');
+  assert.match(wf, /run:\s*npm ci/, 'ci must install from the lockfile exactly, not npm install\'s "close enough"');
+  assert.match(wf, /run:\s*npm test/, 'the whole point of the workflow');
+  const auditLine = wf.split('\n').findIndex(l => /npm audit --omit=dev/.test(l));
+  assert.ok(auditLine >= 0, 'a transitive dev-tool CVE is information, not a reason to skip auditing entirely');
+  assert.match(wf.split('\n').slice(auditLine, auditLine + 2).join('\n'), /continue-on-error:\s*true/,
+    'an advisory must not turn a green suite into a red build — that is a decision for a human, not the audit step');
+});
+test('.gitignore keeps local assistant settings out of the public repo', () => {
+  const lines = fsx.readFileSync(pathx.join(__dirname, '.gitignore'), 'utf8').split('\n').map(s => s.trim());
+  assert.ok(lines.includes('.claude/'), 'a contributor\'s local Claude Code settings are not this project\'s to publish');
+  // A root-level rule is cheap protection even though a nested .gitignore under
+  // .superpowers/sdd/ already covers most of it: this repo's planning workspace
+  // has quoted the real hosting username in its working files before.
+  assert.ok(lines.includes('.superpowers/'), 'the planning workspace can quote real infrastructure details and must never reach a public commit');
+});
+test('README documents only a deployment the session cookie can actually authenticate on', () => {
+  const md = fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8');
+  assert.doesNotMatch(md, /Cloudflare Pages \(frontend\) \+ Render \(backend\)/,
+    'a split frontend/backend deploy cannot log in — the session cookie is sameSite: strict and never rides cross-site');
+  assert.doesNotMatch(md, /setup screen asking for your .*backend URL/,
+    'that screen does not exist in the code; the README must not promise a feature that was never built');
+  assert.match(md, /\bBIND_HOST\b/, 'the bind-host env var must be documented now that Docker and Render both set it differently than the 127.0.0.1 default');
+  assert.match(md, /\bWA_DATA_DIR\b/, 'the data directory env var must be documented for anyone running this outside the repo root, e.g. the Docker volume');
+  assert.match(md, /docker compose up/, 'the Docker deployment path needs its own instructions now that the Dockerfile and compose file exist');
+});
+test('the DigitalOcean droplet option publishes on loopback only, same as the Docker option above it', () => {
+  const md = fsx.readFileSync(pathx.join(__dirname, 'README.md'), 'utf8');
+  const start = md.indexOf('### Option C: DigitalOcean Droplet');
+  const section = md.slice(start, md.indexOf('### Option D', start));
+  assert.doesNotMatch(section, /-p 3002:3000/,
+    'publishing on every interface with no proxy or tunnel in front is exactly what the loopback default (Docker, BIND_HOST) exists to close');
+  assert.doesNotMatch(section, /ufw allow 3002/,
+    'a firewall rule for a port bound to loopback only exposes it to nothing and just contradicts the line above it');
+  assert.match(section, /-p 127\.0\.0\.1:3002:3000/, 'bound to loopback, same as docker-compose.yml');
+  assert.match(section, /reverse proxy|Cloudflare Tunnel/i,
+    'a loopback-only port needs something in front of it for a public URL, or the droplet is unreachable and the option is useless');
+});
+test('the tracked backup scripts and the README that documents them carry no hosting username', () => {
+  const read = f => fsx.readFileSync(pathx.join(__dirname, f), 'utf8');
+  // README.md's own backup table once spelled out a real deploy's /home/<user>
+  // path as the "default" for WA_APP_DIR / WA_BACKUP_DIR — this repo is public,
+  // and the scripts themselves were already scrubbed to @APP_USER@ for exactly
+  // this reason; the docs describing them must match.
+  assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service') + read('README.md'), /\/home\/[a-z]/,
+    'a real hosting username in a public repo is exactly what docs/ is gitignored for');
 });
 
 // ── Frontend scripts share one global scope ──────────────────────────────────

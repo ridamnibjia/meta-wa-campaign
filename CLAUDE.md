@@ -15,9 +15,13 @@ npm test           # node test.js — no framework, no fixtures
 npm run dev        # node --watch server.js
 ```
 
-`npm test` is the whole suite and takes about four seconds. Run it before every
-commit. It uses an in-memory database and temp directories, so it never touches
-the repo's own state files.
+`npm test` is the whole suite and takes about twenty seconds — it drives the
+real campaign loop and real HTTP servers. Run it before every commit. It is
+hermetic: an in-memory database, temp directories for uploads, media and every
+state file (`WA_DATA_DIR`), fake Meta credentials set before the app loads, and
+test servers bound to `127.0.0.1` — so it never touches the repo's own state
+files, never reaches Graph with a real token, and passes in a fresh clone, a
+worktree and CI (`.github/workflows/test.yml`).
 
 ## Layering
 
@@ -54,6 +58,10 @@ comments** — they terminate the string, and the error you get points at the
 comment rather than at the cause.
 
 Pragmas: `journal_mode = WAL`, `synchronous = FULL`, `busy_timeout = 5000`.
+WAL is not about in-process concurrency — there is one `DatabaseSync`
+connection on one thread. It buys one WAL fsync per commit under FULL (the
+rollback journal pays two) and lets external readers, such as the nightly
+`VACUUM INTO` backup, read without blocking the app.
 FULL rather than NORMAL is deliberate: NORMAL fsyncs at checkpoints only, so a
 committed webhook survives a process crash but not a power loss — and a lost
 webhook cannot be re-fetched from Meta's push-only API, which would make the
@@ -231,7 +239,8 @@ measures.
 `campaign.js:suppressIfPermanent()` is called by all three paths that can learn
 it — the send response, the delivery-failure webhook, and a test send — so none
 of them can grow its own idea of which codes mean "not on WhatsApp". It routes
-through `skipDisposition() === 'permanent'` and `disable(…, 'failed_hard')`,
+through `skipDisposition() === 'permanent'` and `disable(…, disableReasonFor(code))`
+— `'failed_hard'` for a number that cannot receive, `'opt_out'` for 131050 —
 which writes both the `contacts` row and the `suppressed` row and is a no-op when
 the contact is already off for that reason, so webhook redeliveries and envelope
 replays cost nothing. The suppression outlives the contacts row, so re-uploading
@@ -721,7 +730,139 @@ change and every queue write — and Meta batches statuses. Leading edge fires
 straight away so a single event still feels instant; a broadcast dropped inside
 the window is not dropped but deferred to the end of it, so the LAST state always
 arrives. Nothing is cached — every send is a fresh derivation, so a client can be
-shown a slightly late number, never a stale one.
+shown a slightly late number, never a stale one. The window is not fixed: it is
+`coalesceDelay() = max(250 ms, 4 × the last rebuild)`, so on a run large enough
+that one `buildState()` takes hundreds of milliseconds, rebuilding can never eat
+more than about a quarter of the event loop. The first stretch is logged once.
+
+## Phase 1 hardening (2026-09) — decisions that look changeable but are not
+
+**131048 parks the loop, and the park is derived from the queue.** 131048 is a
+throttle on the SENDING number: every send fails while it is in force, so
+walking the list into it burned one ladder rung per remaining contact and fed
+the spam signal that raised it. `senderThrottleUntil()` is `max(retry_after)`
+over this run's 131048 retry rows — the rows BOTH ladder entrances already
+write — so the park needs no state of its own, survives a restart, and a
+replayed webhook cannot extend it. When it passes, the next untried contact is
+the probe: one probe per rung, never a walk. `SENDER_LEVEL` in `lib/errors.js`
+is the list.
+
+**131050 is an opt-out, not an undeliverable number.** It is the person turning
+marketing off inside WhatsApp. It is `PERMANENT` (never retried), but
+`disableReasonFor(131050)` is `'opt_out'`, so the contact is suppressed as an
+opt-out and `bucketOf` files it under Opted out rather than Unreachable — the
+same split `BUCKET_CASE` makes for the never-attempted half through
+`c.disabled_reason`. 130497 (country block) stays unclassified on purpose.
+
+**Each error code walks its own ladder, bounded by a total.** `attempts` is the
+TOTAL retry count — what "tried N×" and the report CSV render — and it never
+resets. `ladder_code` / `ladder_attempts` count retries on the current code's
+ladder, and `ladderPosition()` is the one helper both entrances use. The obvious
+fix, `CASE WHEN error_code IS ?`, is wrong: `markSent` nulls `error_code` on
+every accept, and a webhook failure (131049's usual route) arrives after that
+accept, so the counter would reset to 1 forever — unbounded paid retries.
+`MAX_RETRIES_TOTAL = 8` stops two alternating codes looping.
+
+**While the warm-up rung is the cap in force, it counts a rolling 24 hours.**
+Meta's limit is unique recipients per rolling 24h, and a calendar day let two
+abutting days put up to twice the rung inside one window — on a new number,
+where that matters most. `capWindow()` is `'24h'` only when the rung governs;
+the operator's own cap is a daily number they chose and stays a day. The park
+sleeps until the earlier of `slotFreesAt()` and IST midnight, because the rung
+itself climbs at midnight. Waits under `ANNOUNCE_WAIT_MS` stay silent, or the
+340-announcement slowdown returns. `dailyCount` still means "today" on screen.
+
+**`adoptQuality()` is the only way `S.quality` changes.** It accepts GREEN,
+YELLOW or RED and nothing else. `fetchAccountInfo()` maps a missing rating to
+`'UNKNOWN'`, and every writer used to assign it — so a Graph answer without a
+rating LIFTED a YELLOW/RED warm-up hold. The quality webhook, the cap-wake
+re-read, `/start` and `/account-info` all go through it. The cap-wake re-read
+abandons only on Stop, never on Pause.
+
+**Nothing the loop paints may overwrite the operator's command.** Every
+post-await repaint — the send-time and webhook halts, the crash park, the rate
+limit, the cap wake — checks `flags.stopFlag` (a Stop in flight is final; the
+loop exits `idle` and clears `pauseFlag`, never promotes to `done`, which a
+webhook could reopen) and keeps an existing pause's reason (`USER_PAUSE` or the
+first halt). A halt arriving by webhook parks the run like a send-time halt. A
+crashed loop parks with `pauseFlag` set and a sentence, so Resume restarts it
+from the same row instead of the dashboard claiming a send that is not
+happening.
+
+**A status can arrive before its send's bookkeeping.** `applyStatus` holds a
+status for an unknown wamid (capped) instead of dropping it, and
+`recordOutbound` claims it after its insert and returns the failure descriptor,
+which the loop and `/test-send` hand to `handleDeliveryFailure`. `status_at` is
+Meta's own timestamp, so a replay does not re-date history.
+
+**Opt-outs are recorded under both identities.** The tap's `context.id` names the
+template it answers, and that row names the number we DIALED — which for
+Brazil/Mexico/Argentina can differ from the `wa_id` Meta reports. Both strings
+are suppressed. `ponytail:` a typed stop word has no `context.id`.
+
+**A campaign's template identity is locked while it runs.** The loop reads
+`S.config.templateName`/`templateLanguage` per send, so `templateLocked()` refuses
+a name OR language change through `adoptTemplate`, `/validate-template`,
+`/config` (before anything is mutated) and `/template/create` (which still
+submits to Meta, answering `adopted:false`). A language variant is chosen
+explicitly; named-variable templates are refused with a sentence
+(`templateUnsupported`) rather than sent empty. The header FORMAT comes from
+Meta's current copy alone — the local row only remembers which file.
+
+**Upload handles expire; media ids expire; missing bytes are named.**
+`meta_handle` is reused only within `HANDLE_TTL_MS` (23h), like
+`MEDIA_ID_TTL_MS`. A missing file is reported before any network call, and a
+stored path that escapes its directory is refused by one containment helper,
+`insideDir()`, at every read, write and unlink site.
+
+**The open inbox refreshes once per envelope, on a message OR a refusal.**
+`processEnvelope` emits `'inbox'` when an envelope carried an inbound message
+or moved an outbound row INTO `failed` — never per status, because Meta batches
+statuses and a thread refetch per tick is a firehose. The refusal half matters
+because `VISIBLE` hides a refused send: without the emit, an open thread kept
+showing a reply the customer never got. `failedTransition` comes only from
+`applyStatus`'s transition descriptor, so a redelivered or replayed failure
+emits nothing. The client's `refreshNewest` must call `load()` outside its
+`setData` updater — React may call an updater more than once, so it must be
+pure; the updater only records that a reload is owed.
+
+**Phone numbers: an explicit prefix is E.164, and every guess is said out loud.**
+`normalize()` in `lib/phone.js` guesses India for a bare 10-digit number and for
+`0` + 10 digits, and `parseCSV` sums those into `guessedCountry`, which the
+upload screen prints. A `+` or a stripped `00` means the digits ARE the whole
+number — so the 10-digit guess is skipped (`+45 1234 5678` is Denmark, not
+`914512345678`, a stranger) and the length floor drops to E.164's 8. The
+`0`-prefixed guess still applies after a `+`, because no country code starts
+with 0. `+` followed by exactly 10 digits starting 6–9 is dialled as written but
+counted as `shortPlus` and shown beside `guessedCountry`: it is how an Indian
+mobile loses its 91, and it is also a real Singapore or New Zealand number, so
+it is flagged rather than re-guessed. The operator's own list had exactly one.
+Toll-free (`1800`/`1860`/`1900`) is refused twice: as raw digits only when no
+`+` was given (`+1 860` is Connecticut), and as `91…` after the guess.
+
+**Retention sweeps hourly, and `PRAGMA optimize` runs once a day inside it.**
+Hourly because `previewHours` can be as low as 1: a daily tick let a preview
+outlive its promise by up to a day. One `setInterval`, `unref()`ed, one clock.
+
+**A contact mid-ladder at upgrade keeps its rung count.** `openDb` backfills
+`ladder_code`/`ladder_attempts` from `error_code`/`attempts` on retry rows that
+predate the columns. It is guarded on `ladder_code IS NULL`, so it runs once.
+`attempts` is the TOTAL, which can only overstate a rung count — the safe
+direction for a counter that exists to stop hammering 131049.
+
+**The server binds loopback by default; everything it writes can move.**
+`CFG.bindHost` is `127.0.0.1` unless `BIND_HOST` is set (Render is detected as
+`0.0.0.0`; the Docker image sets it). The tunnel or reverse proxy on the same
+host is the only public entrance, which is also what keeps `X-Forwarded-For`
+honest under `trust proxy 1`. `WA_DATA_DIR` (default: the app directory) moves
+`wa.db`, the state files and both media stores together, for a container
+volume.
+
+**Security headers are SAMEORIGIN, not DENY.** `X-Frame-Options: SAMEORIGIN` and
+`frame-ancestors 'self'`, because the inbox previews PDFs in a same-origin
+`<object>` and DENY would blank it. The media routes overwrite CSP with their own
+`sandbox; default-src 'none'`. socket.io refuses a cross-origin handshake in
+`allowRequest`, because CORS never applied to a WebSocket upgrade.
 
 ## Gotchas
 
@@ -794,6 +935,15 @@ shown a slightly late number, never a stale one.
   list. And the `data:` URI was built into the anchor's href on every render, so
   a large group serialised megabytes nobody had asked for and hit the browser's
   URL cap; it is a `Blob` created on click and revoked after.
+- **A test server must `listen(0, '127.0.0.1')`, never bare `listen(0)`.** On
+  macOS/BSD a wildcard bind can be handed a port another local process already
+  holds on `127.0.0.1` — IDE language servers do — and a request to
+  `127.0.0.1:port` then reaches THAT process ("Healthy", "404 page not found").
+  test.js's `createServer` override enforces it and answers `Connection: close`,
+  so no pooled keep-alive socket outlives a test's server.
+- **A timing assertion must out-margin the wait it measures.** `sleepUntil`
+  polls once a second, so "Stop answered within 1.5 s" failed one run in
+  twenty under load. The budget is 2.5 s, which still proves Stop is not ignored.
 - **Frontend scripts share one global scope** and load in the order listed in
   `index.html`. A `const` used by two views belongs in `ui.jsx`, which loads
   first.

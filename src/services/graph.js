@@ -1,5 +1,5 @@
 'use strict';
-const { CFG } = require('../config');
+const { CFG, TIMEOUTS } = require('../config');
 const { log }  = require('../state');
 
 const graphHeaders = () => ({
@@ -9,9 +9,15 @@ const graphHeaders = () => ({
 
 const graphUrl = endpoint => `https://graph.facebook.com/${CFG.apiVersion}/${endpoint}`;
 
+// Every call through here carries the JSON timeout, read per call so it can be
+// changed at runtime. Without a signal fetch waits on undici's own ~5-minute
+// timers: a hung account-info read held /start open with no loop running, and a
+// hung inbox send held the operator's request. An abort rejects like any other
+// network failure, which every caller already catches.
 async function graphGet(endpoint, fields) {
   const qs  = fields ? `?fields=${encodeURIComponent(fields)}` : '';
-  const res = await fetch(graphUrl(endpoint) + qs, { headers: graphHeaders() });
+  const res = await fetch(graphUrl(endpoint) + qs,
+    { headers: graphHeaders(), signal: AbortSignal.timeout(TIMEOUTS.graphMs) });
   return res.json();
 }
 
@@ -20,6 +26,7 @@ async function graphSend(method, endpoint, body) {
     method,
     headers: graphHeaders(),
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(TIMEOUTS.graphMs),
   });
   const data = await res.json();
   return { res, data };

@@ -33,7 +33,7 @@ Send approved WhatsApp marketing templates to bulk contacts using Meta's officia
 7. [Project Structure](#7-project-structure)
 8. [Running Locally](#8-running-locally)
 9. [Deployment](#9-deployment)
-   - [Option A: Cloudflare Pages (frontend) + Render (backend)](#option-a-cloudflare-pages-frontend--render-backend-free)
+   - [Docker](#docker)
    - [Option B: A small VM behind a Cloudflare Tunnel](#option-b-a-small-vm-behind-a-cloudflare-tunnel)
    - [Option C: DigitalOcean Droplet (everything)](#option-c-digitalocean-droplet-everything)
    - [Option D: Railway](#option-d-railway)
@@ -754,77 +754,42 @@ template that was rejected five minutes ago.
 
 ## 9. Deployment
 
-### Option A: Cloudflare Pages (frontend) + Render (backend) — Free
+Single-origin only. The dashboard's session cookie is issued `sameSite:
+strict` (`src/middleware/auth.js`) and so is never sent on a cross-site
+request — a frontend split onto its own domain cannot authenticate against a
+backend on another. An earlier version of this README described exactly that
+split (Cloudflare Pages for the frontend, Render for the backend, with a
+first-run screen asking for the backend's URL); neither the login nor that
+screen exist, and both are gone. Every option below serves the frontend and
+the API from the same origin — including Render, which works fine as a
+single Node web service (`npm install` / `node server.js`) serving both.
 
-This is the split deployment. Frontend served from Cloudflare's global CDN; backend runs on Render's free tier.
+### Docker
 
-**Architecture:**
+The `Dockerfile` and `docker-compose.yml` in the repo root work on any host
+that runs Docker:
+
+```bash
+# Write .env by hand next to docker-compose.yml — it is gitignored, so
+# `docker compose` reads it without it ever reaching git.
+cat > .env <<'EOF'
+ACCESS_TOKEN=your_system_user_token
+PHONE_NUMBER_ID=your_phone_number_id
+APP_PASSWORD=pick_something_long
+APP_SECRET=your_meta_app_secret
+EOF
+
+docker compose up -d
 ```
-User's browser
-  ↕ loads index.html from Cloudflare Pages (global CDN, free)
-  ↕ connects via HTTP + WebSocket to Render backend
-Render backend (server.js)
-  ↕ calls Meta WhatsApp Cloud API
-```
 
-#### Step 1 — Deploy backend to Render
-
-1. Push your code to GitHub
-2. Go to [render.com](https://render.com) → **New** → **Web Service**
-3. Connect your GitHub repo
-4. Set:
-   - **Runtime:** Node
-   - **Build Command:** `npm install`
-   - **Start Command:** `node server.js`
-   - **Plan:** Free
-5. Under **Environment Variables**, add:
-   ```
-   ACCESS_TOKEN          = your_system_user_token
-   PHONE_NUMBER_ID       = your_phone_number_id
-   BUSINESS_ID           = your_business_portfolio_id
-   WABA_ID               = (optional — auto-resolved)
-   APP_SECRET            = your_meta_app_secret
-   APP_ID                = your_meta_app_id   ← only for media headers
-   APP_PASSWORD          = a_long_random_password_you_choose
-   WEBHOOK_VERIFY_TOKEN  = any_random_string_you_choose
-   FRONTEND_URL          = https://your-project.pages.dev   ← add after step 3
-   ```
-
-   `APP_PASSWORD` is not optional in practice — the API returns `503 setup required`
-   for every call until it is set. Generate one with `openssl rand -base64 24`.
-
-   Two easily confused names: **`APP_SECRET` is Meta's** (App → Settings → Basic →
-   App Secret) and verifies webhook signatures. **`APP_PASSWORD` is yours** — you
-   invent it, and it is the dashboard login. There is nowhere to "get" it.
-
-   `APP_ID` (App → Settings → Basic → App ID) is only needed to attach an image,
-   video or document header to a template: Meta's Resumable Upload API keys on the
-   app id, and nothing else substitutes for it. Leave it unset and everything else
-   works — the composer greys media headers out and says why.
-6. Click **Create Web Service**. Render gives you a URL like `https://meta-wa-campaign.onrender.com`
-
-> **Free tier caveat:** Render free tier sleeps after 15 minutes of inactivity. The frontend sends a keep-alive ping every 10 minutes when it has an open connection, so as long as you keep the browser tab open during a campaign, the backend stays awake. If you close the tab mid-campaign, it may sleep. For reliability on multi-day campaigns, upgrade to the Starter plan ($7/mo) or use DigitalOcean.
-
-#### Step 2 — Deploy frontend to Cloudflare Pages
-
-1. Go to [pages.cloudflare.com](https://pages.cloudflare.com) → **Create a project**
-2. **Connect to Git** → select your GitHub repo
-3. Set build settings:
-   - **Framework preset:** None
-   - **Build command:** *(leave empty)*
-   - **Build output directory:** `public`
-4. Click **Save and Deploy**
-5. Cloudflare gives you a URL like `https://wa-campaign.pages.dev`
-
-#### Step 3 — Connect them
-
-1. Copy your Cloudflare Pages URL (e.g. `https://wa-campaign.pages.dev`)
-2. Go back to your Render service → **Environment** → update `FRONTEND_URL` to that URL
-3. Render auto-redeploys with the new CORS setting
-
-#### Step 4 — First-time frontend setup
-
-When you open your Cloudflare Pages URL for the first time, the app shows a one-time setup screen asking for your Render backend URL. Enter it (e.g. `https://meta-wa-campaign.onrender.com`) and click **Save and Connect**. The app tests the connection, then saves the URL to your browser's localStorage. You will not be asked again.
+State — `wa.db`, `warmup.json`, `campaign.json`, saved media and uploads —
+lives on the `wa-data` named volume, mounted at `WA_DATA_DIR=/data` (the
+image sets this; do not override it to a path outside the volume, or a
+rebuild silently orphans your database). Inside the container `BIND_HOST` is
+`0.0.0.0`, so the app is reachable from outside its own network namespace —
+but `docker-compose.yml` publishes the port on `127.0.0.1` only, so it is
+**not** reachable from outside the host itself. Put a reverse proxy or a
+tunnel (Option B below) in front of it for a public URL.
 
 ---
 
@@ -945,23 +910,25 @@ ssh root@YOUR_DROPLET_IP
 mkdir -p /opt/meta-wa && cd /opt/meta-wa
 git clone https://github.com/YOUR_USERNAME/meta-wa-campaign .
 cp .env.example .env && nano .env    # fill in token + phone number ID
-ufw allow 3002/tcp
 docker build -t meta-wa-img .
-docker run -d --name meta-wa -p 3002:3000 --env-file .env --restart unless-stopped meta-wa-img
-# Visit: http://YOUR_DROPLET_IP:3002
+docker run -d --name meta-wa -p 127.0.0.1:3002:3000 --env-file .env --restart unless-stopped meta-wa-img
 ```
+
+Loopback only, same as `docker-compose.yml` (Docker, above) — no `ufw allow` here,
+since nothing outside the droplet can reach it yet. Put a reverse proxy (Caddy or
+nginx with TLS) or a Cloudflare Tunnel (Option B) in front for a public URL.
 
 **Updating:**
 ```bash
 cd /opt/meta-wa && git pull
 docker stop meta-wa && docker rm meta-wa
-docker build -t meta-wa-img . && docker run -d --name meta-wa -p 3002:3000 --env-file .env --restart unless-stopped meta-wa-img
+docker build -t meta-wa-img . && docker run -d --name meta-wa -p 127.0.0.1:3002:3000 --env-file .env --restart unless-stopped meta-wa-img
 ```
 
 **Full cleanup:**
 ```bash
 docker stop meta-wa && docker rm meta-wa && docker rmi meta-wa-img
-rm -rf /opt/meta-wa && ufw delete allow 3002/tcp
+rm -rf /opt/meta-wa
 ```
 
 ---
@@ -982,7 +949,7 @@ Railway provides $5/month free credit. This app easily stays within free limits.
 
 Campaigns send fine without a webhook. What you lose without one is everything
 that comes *back*: `Delivered` and `Read` counts, inbound replies in the inbox,
-one-tap opt-outs, and template approval notifications.
+one-tap opt-outs, template approval notifications, and quality-rating changes.
 
 **Requirement:** a public HTTPS URL. Render, Railway and a Cloudflare Tunnel all
 provide one.
@@ -1009,6 +976,10 @@ anything.
 6. Click **Manage** and subscribe to these fields:
    - `messages` — delivery receipts, read receipts, inbound replies, opt-out taps
    - `message_template_status_update` — approval / rejection notifications
+   - `phone_number_quality_update` — quality rating and tier changes. The warm-up
+     ladder steps back a rung the moment the rating slips, instead of whenever
+     someone next opens the dashboard, which matters on a campaign whose retries
+     run for days
 
 Step 6 is the one people miss. Without `message_template_status_update`, the app
 falls back to polling Meta every 15 seconds for template status, which works but
@@ -1194,9 +1165,9 @@ static files are public; everything behind them is not.
 `state` after every send, so counters and the progress bar move live in every
 open tab.
 
-**Backend URL detection:** relative URLs when the backend serves the UI. In the
-split Pages + Render deployment it reads the backend URL from `localStorage`,
-prompting once if unset.
+**Backend URL:** every request is a relative URL — the backend serves the UI
+itself in every deployment §9 documents, so there is no separate backend
+origin to configure or detect.
 
 **Template validation:** the template name input debounces 1.2s, then calls
 `/api/validate-template` for status, category, language, body and variable count.
@@ -1230,20 +1201,22 @@ a working default.
 | `APP_ID` | unset | Meta App ID. Needed **only** to put an image, video or document header on a template — Meta's Resumable Upload API keys on the app id, and neither the WABA id nor the business id substitutes. Unset, the composer greys media headers out and explains why; everything else is unaffected. |
 | `BUSINESS_ID` | — | Business Portfolio ID, used to auto-resolve `WABA_ID`. |
 | `WEBHOOK_VERIFY_TOKEN` | — | Any random string. Must match what you type into Meta's webhook config. |
-| `FRONTEND_URL` | (same-origin only) | Set to your exact frontend origin for the split Pages + Render deployment. |
+| `FRONTEND_URL` | (same-origin only) | Adds a second allowed CORS origin. Does not enable a split deployment to log in — the session cookie is `sameSite: strict` and is never sent on a cross-site request regardless of CORS. Leave it unset; every deployment in §9 serves the frontend and the API from the same origin. |
 | `TEMPLATE_NAME` | — | Pre-selected template name. |
 | `TEMPLATE_LANGUAGE` | `en` | Template language code. |
 | `TEMPLATE_CATEGORY` | `MARKETING` | Drives the cost estimate. |
 | `API_VERSION` | `v23.0` | Meta Graph API version. |
 | `PORT` | `3000` | Server port. |
+| `BIND_HOST` | `127.0.0.1` | Interface the server listens on. Auto-detected as `0.0.0.0` on Render (`process.env.RENDER` is set for you there); the Docker image sets it explicitly, since loopback inside a container is unreachable through a published port. Change it only if you know your host needs it — the default is the safe one. |
+| `WA_DATA_DIR` | the app directory | Where `wa.db`, `warmup.json`, `campaign.json` and the other state files live. The Docker image sets this to `/data`, the mounted volume; outside Docker, leave it unset unless you specifically want state kept somewhere other than the checkout. |
 | `WA_QUIET_HOURS` | on | Set to `0` to let campaigns send between 23:00 and 07:00 IST. Deliberately env-only — there is no UI switch, because night notifications are what get a number blocked and reported. |
 
 ### Backup (`scripts/backup.sh` only — the app never reads these)
 
 | Variable | Default | Description |
 |---|---|---|
-| `WA_APP_DIR` | `/home/earlyearnly/app` | Where `wa.db` and the state files live. |
-| `WA_BACKUP_DIR` | `/home/earlyearnly/backups` | Where nightly backups are written. |
+| `WA_APP_DIR` | the checkout containing `scripts/` | Where `backup.sh` looks for `wa.db` — derived from the script's own location, not from `WA_DATA_DIR`. If you've pointed the app's `WA_DATA_DIR` somewhere else (the Docker volume, say), set `WA_APP_DIR` to match, or the backup keeps reading the checkout's `wa.db` instead of the one the app is actually writing to. |
+| `WA_BACKUP_DIR` | `$HOME/backups` | Where nightly backups are written. |
 | `WA_BACKUP_DAYS` | `7` | Age, in days, past which anything in the backup directory is swept — hand-made copies included. |
 
 ### Inbound media safety
@@ -1349,8 +1322,10 @@ best customers or plant fake conversations.
 - If `APP_SECRET` leaks, rotate it in **App Settings → Basic → App Secret → Reset**.
 - Never commit a real contact CSV. Phone numbers are personal data in most
   jurisdictions, and a public repo is a permanent, indexed, un-deletable copy.
-- Set `FRONTEND_URL` to your exact frontend origin in production if you split the
-  deployment. Leave it blank when the backend serves the UI itself.
+- Leave `FRONTEND_URL` blank. The backend serves the UI itself in every
+  deployment §9 documents; setting it does not make a split frontend/backend
+  deployment able to log in, because the session cookie is `sameSite: strict`
+  and is never sent on a cross-site request.
 
 ### Inbound customer media
 
