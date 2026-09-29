@@ -5737,6 +5737,26 @@ console.log('\nwebhook ingest — what an envelope means');
     assert.equal(again.length, 0, 'a redelivery records nothing new, so there is nothing to announce');
     senders.forEach(markRead);
   });
+
+  // Before this, `inbound` was the only thing that could trigger an 'inbox'
+  // emit — a status-only envelope carried none, so an open thread never
+  // learned a reply it sent had just been refused (or picked up its ticks):
+  // the transcript sat there showing the message as still on its way.
+  testAsync('a delivery failure emits inbox once, though nothing arrived to reply to', async () => {
+    const waId = '919000005801';
+    recordOutbound({ wamid: 'wamid.failonly-1', waId, name: 'FailOnly', body: 'x', runId: null });
+    const failedStatus = envelopeOf('messages', { statuses: [{
+      id: 'wamid.failonly-1', status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)),
+      recipient_id: waId, errors: [{ code: 131049, title: 'Not delivered' }],
+    }] });
+
+    const first = (await listening(() => processEnvelope(failedStatus))).filter(h => h.event === 'inbox');
+    assert.equal(first.length, 1, 'the transition into failed must reach an open thread the same way a reply does');
+
+    const again = (await listening(() => processEnvelope(failedStatus))).filter(h => h.event === 'inbox');
+    assert.equal(again.length, 0,
+      'a redelivery of the same failure is not a second transition into failed, so applyStatus returns nothing to announce');
+  });
 }
 
 console.log('\ndiagnostics');

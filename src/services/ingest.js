@@ -26,7 +26,7 @@ const inbox = require('./inbox');
 // list follows the same rule, for the same reason (see `inbound` below).
 function processEnvelope(body) {
   if (body.object !== 'whatsapp_business_account') return;
-  let changed = false, inbound = 0;
+  let changed = false, inbound = 0, failedTransition = false;
   for (const entry of (body.entry || [])) {
     // Meta stamps every webhook with the WABA ID that produced it. A System User
     // token without business_management cannot look that ID up from the Business
@@ -151,15 +151,22 @@ function processEnvelope(body) {
         // Both sides are idempotent — the transition guard here, the wamid
         // guard in the UPDATE — which is what keeps Replay safe to press twice.
         const failure = applyStatus(status);
-        if (failure) handleDeliveryFailure(failure);
+        if (failure) { handleDeliveryFailure(failure); failedTransition = true; }
         changed = true;
       }
     }
   }
   // One thread-list rebuild per envelope. recordInbound is the only writer of
   // inbound rows and emits nothing itself, so this is the one place a reply
-  // reaches the open inbox screens.
-  if (inbound) emit('inbox', inbox.summary());
+  // reaches the open inbox screens. A failed transition reaches it too: an
+  // open thread otherwise never learned that a reply it sent had just been
+  // refused (or picked up its ticks) until something ELSE happened to
+  // refresh the list — the transcript sat there showing "sending" for a
+  // message Meta had already given up on. `failedTransition` is only ever
+  // true on the transition INTO 'failed' (applyStatus returns undefined for
+  // an already-failed row), so a redelivered or replayed status still emits
+  // nothing new, same as inbound.
+  if (inbound || failedTransition) emit('inbox', inbox.summary());
   if (changed) broadcast();
 }
 
