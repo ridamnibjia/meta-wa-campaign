@@ -2548,6 +2548,39 @@ console.log('\nschema — media + template tables');
     d.close();
   });
 
+  test('a retry row parked before ladder_code existed is backfilled from error_code/attempts, once', () => {
+    const f = require('node:path').join(require('node:os').tmpdir(), `wa-ladderbackfill-${process.pid}-${Date.now()}.db`);
+    try {
+      const d1 = openDb(f);
+      d1.prepare('INSERT INTO campaign_runs (id, started_at) VALUES (1, 1)').run();
+      // No ladder_code / ladder_attempts given — exactly the row a deploy of
+      // this column pair finds: mid-ladder, error_code already there (markRetry
+      // has always written it), the new pair still at its column default.
+      d1.prepare(`INSERT INTO run_recipients (run_id, phone, name, seq, skipped_reason, error_code, attempts)
+                  VALUES (1, '9000000001', 'Asha', 1, 'retry', 131049, 2)`).run();
+      d1.close();
+
+      const readRow = d => d.prepare(
+        'SELECT ladder_code, ladder_attempts FROM run_recipients WHERE run_id = 1 AND phone = ?'
+      ).get('9000000001');
+
+      const d2 = openDb(f);   // the boot that ships the backfill
+      const after1 = readRow(d2);
+      assert.equal(after1.ladder_code, 131049, 'the code already failing this contact seeds ladder_code');
+      assert.equal(after1.ladder_attempts, 2,
+        'total tries so far seed the rung — it can only shorten what is left on that ladder, never extend it');
+      d2.close();
+
+      const d3 = openDb(f);   // a later boot must leave an already-backfilled row alone
+      const after2 = readRow(d3);
+      assert.equal(after2.ladder_code, 131049, 'ladder_code is no longer NULL, so the WHERE guard makes a second boot a no-op');
+      assert.equal(after2.ladder_attempts, 2, 'and must not re-copy attempts on top of it either');
+      d3.close();
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) { try { require('node:fs').unlinkSync(f + suffix); } catch {} }
+    }
+  });
+
   test('campaign_runs carries the run-time template snapshot columns', () => {
     const d = openDb(':memory:');
     const c = cols(d, 'campaign_runs');
