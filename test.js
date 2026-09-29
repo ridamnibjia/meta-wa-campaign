@@ -9178,8 +9178,43 @@ console.log('\na Reset that lands mid-send');
       assert.equal(s.phase, 'paused');
       assert.equal(flags.pauseFlag, true, 'still set, so Resume is theirs to press');
       assert.equal(sends, 1, 'the fault must not be probed again while the operator\'s pause holds');
-      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused by the operator/.test(l.msg)),
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused, so nothing else changes/.test(l.msg)),
         'the fault is still said out loud in one line, even though the pause stays the operator\'s');
+    });
+  });
+
+  // Same race again, but the pause already there is the loop's OWN — an
+  // earlier halt (a previous contact here, or handleDeliveryFailure on the
+  // webhook thread) rather than the operator's. Gating on
+  // S.pauseReason === USER_PAUSE alone left an earlier halt's reason just as
+  // overwritable as no pause at all: a second, unrelated fault replaced the
+  // FIRST one's reason with its own, and the operator lost the fact that
+  // actually parked the campaign. flags.pauseFlag is the signal both cases
+  // share, and mirrors handleDeliveryFailure's own webhook entrance exactly.
+  testAsync('a halt landing on an already halt-paused loop keeps the first reason', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      // An earlier halt already parked the run under its own reason. Set
+      // directly rather than via a second send: the loop offers a paused
+      // run no further attempts, so a real second send could never race here.
+      const M = require('./server');
+      M.flags.pauseFlag = true;
+      M.S.phase = 'paused';
+      M.S.pauseReason = 'Campaign paused — first fault [131042]';
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags } = h.M;
+      h.stage([{ dialStr: '919000034121', name: 'Marco' }], 'halt-during-halt');
+      h.start();
+      await h.until(() => sends === 1 && s.logs.some(l => /190/.test(l.msg)));
+      assert.equal(s.pauseReason, 'Campaign paused — first fault [131042]',
+        'the first halt\'s reason is kept, not overwritten by the second fault');
+      assert.equal(s.phase, 'paused');
+      assert.equal(flags.pauseFlag, true);
+      assert.equal(sends, 1, 'the loop must not probe the fault again while the campaign is already paused');
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused, so nothing else changes/.test(l.msg)),
+        'the second fault is still said out loud in one line, even though the first reason stays on screen');
     });
   });
 
