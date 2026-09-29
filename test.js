@@ -757,6 +757,27 @@ console.log('\ntemplate routes — identity locked mid-campaign');
     } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; S.config.templateLanguage = savedLang; }
   });
 
+  testAsync('POST /api/config refuses before touching credentials, not just after, when the same request also switches templates mid-campaign', async () => {
+    // accessToken/phoneNumberId/wabaId used to be written unconditionally
+    // before the template-lock check below them in the handler, so a request
+    // refused for its templateName half had already landed its credential
+    // half — a refusal is supposed to mean "nothing happened", not "the part
+    // I checked first didn't happen".
+    const savedPhase = S.phase, savedName = S.config.templateName, savedToken = CFG.accessToken;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    CFG.accessToken = 'token-before';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ accessToken: 'token-after', templateName: 'promo_b' }),
+      })).json();
+      assert.equal(r.ok, false, 'the template half of this request is refused mid-campaign');
+      assert.equal(CFG.accessToken, 'token-before', 'a refused request must mutate nothing, including fields the lock does not itself guard');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; CFG.accessToken = savedToken; }
+  });
+
   testAsync('POST /api/template/create still submits to Meta but does not adopt, mid-campaign', async () => {
     const savedPhase = S.phase, savedName = S.config.templateName;
     const savedToken = CFG.accessToken, savedWaba = CFG.wabaId;
