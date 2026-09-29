@@ -1215,8 +1215,8 @@ a working default.
 
 | Variable | Default | Description |
 |---|---|---|
-| `WA_APP_DIR` | `/home/earlyearnly/app` | Where `wa.db` and the state files live. |
-| `WA_BACKUP_DIR` | `/home/earlyearnly/backups` | Where nightly backups are written. |
+| `WA_APP_DIR` | the checkout containing `scripts/` | Where `backup.sh` looks for `wa.db` — derived from the script's own location, not from `WA_DATA_DIR`. If you've pointed the app's `WA_DATA_DIR` somewhere else (the Docker volume, say), set `WA_APP_DIR` to match, or the backup keeps reading the checkout's `wa.db` instead of the one the app is actually writing to. |
+| `WA_BACKUP_DIR` | `$HOME/backups` | Where nightly backups are written. |
 | `WA_BACKUP_DAYS` | `7` | Age, in days, past which anything in the backup directory is swept — hand-made copies included. |
 
 ### Inbound media safety

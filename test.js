@@ -9958,9 +9958,13 @@ test('the DigitalOcean droplet option publishes on loopback only, same as the Do
   assert.match(section, /reverse proxy|Cloudflare Tunnel/i,
     'a loopback-only port needs something in front of it for a public URL, or the droplet is unreachable and the option is useless');
 });
-test('the tracked backup scripts carry no hosting username', () => {
+test('the tracked backup scripts and the README that documents them carry no hosting username', () => {
   const read = f => fsx.readFileSync(pathx.join(__dirname, f), 'utf8');
-  assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service'), /\/home\/[a-z]/,
+  // README.md's own backup table once spelled out a real deploy's /home/<user>
+  // path as the "default" for WA_APP_DIR / WA_BACKUP_DIR — this repo is public,
+  // and the scripts themselves were already scrubbed to @APP_USER@ for exactly
+  // this reason; the docs describing them must match.
+  assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service') + read('README.md'), /\/home\/[a-z]/,
     'a real hosting username in a public repo is exactly what docs/ is gitignored for');
 });
 
