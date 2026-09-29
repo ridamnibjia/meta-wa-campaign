@@ -815,6 +815,41 @@ Meta's current copy alone — the local row only remembers which file.
 stored path that escapes its directory is refused by one containment helper,
 `insideDir()`, at every read, write and unlink site.
 
+**The open inbox refreshes once per envelope, on a message OR a refusal.**
+`processEnvelope` emits `'inbox'` when an envelope carried an inbound message
+or moved an outbound row INTO `failed` — never per status, because Meta batches
+statuses and a thread refetch per tick is a firehose. The refusal half matters
+because `VISIBLE` hides a refused send: without the emit, an open thread kept
+showing a reply the customer never got. `failedTransition` comes only from
+`applyStatus`'s transition descriptor, so a redelivered or replayed failure
+emits nothing. The client's `refreshNewest` must call `load()` outside its
+`setData` updater — React may call an updater more than once, so it must be
+pure; the updater only records that a reload is owed.
+
+**Phone numbers: an explicit prefix is E.164, and every guess is said out loud.**
+`normalize()` in `lib/phone.js` guesses India for a bare 10-digit number and for
+`0` + 10 digits, and `parseCSV` sums those into `guessedCountry`, which the
+upload screen prints. A `+` or a stripped `00` means the digits ARE the whole
+number — so the 10-digit guess is skipped (`+45 1234 5678` is Denmark, not
+`914512345678`, a stranger) and the length floor drops to E.164's 8. The
+`0`-prefixed guess still applies after a `+`, because no country code starts
+with 0. `+` followed by exactly 10 digits starting 6–9 is dialled as written but
+counted as `shortPlus` and shown beside `guessedCountry`: it is how an Indian
+mobile loses its 91, and it is also a real Singapore or New Zealand number, so
+it is flagged rather than re-guessed. The operator's own list had exactly one.
+Toll-free (`1800`/`1860`/`1900`) is refused twice: as raw digits only when no
+`+` was given (`+1 860` is Connecticut), and as `91…` after the guess.
+
+**Retention sweeps hourly, and `PRAGMA optimize` runs once a day inside it.**
+Hourly because `previewHours` can be as low as 1: a daily tick let a preview
+outlive its promise by up to a day. One `setInterval`, `unref()`ed, one clock.
+
+**A contact mid-ladder at upgrade keeps its rung count.** `openDb` backfills
+`ladder_code`/`ladder_attempts` from `error_code`/`attempts` on retry rows that
+predate the columns. It is guarded on `ladder_code IS NULL`, so it runs once.
+`attempts` is the TOTAL, which can only overstate a rung count — the safe
+direction for a counter that exists to stop hammering 131049.
+
 **The server binds loopback by default; everything it writes can move.**
 `CFG.bindHost` is `127.0.0.1` unless `BIND_HOST` is set (Render is detected as
 `0.0.0.0`; the Docker image sets it). The tunnel or reverse proxy on the same
