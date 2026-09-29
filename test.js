@@ -614,6 +614,32 @@ console.log('\nadoptTemplate — language variants');
     assert.notEqual(S.config.templateBody, 'decoy');
   });
 
+  // GET /api/validate-template?name=<running template> with no ?language= is
+  // exactly what the 15s status poll sends. With two APPROVED variants, "no
+  // language given" used to fall into the same "prefer APPROVED" branch as a
+  // fresh pick and could adopt whichever variant Meta's list happened to list
+  // first — switching the language of a campaign already sending, mid-run,
+  // from a request that only meant to ask "is it still approved".
+  test('a bare re-validate of the running template does not switch its language', () => {
+    // hi listed FIRST and en running: "prefer first APPROVED" (the no-language
+    // branch used by a genuinely fresh pick) would adopt hi here if the running
+    // identity were not checked first — the order below is what makes this
+    // test able to fail.
+    const bothApproved = { found: true, templates: [
+      { name: 'promo', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy.', headerFormat: null, headerText: null },
+      { name: 'promo', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, en copy.', headerFormat: null, headerText: null },
+    ] };
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo';
+    S.config.templateLanguage = 'en';
+    S.phase = 'waiting';
+    try {
+      adoptTemplate('promo', bothApproved);   // no third argument at all
+      assert.equal(S.config.templateLanguage, 'en', 'the campaign is sending en; a bare re-validate must stay on en');
+      assert.equal(S.config.templateBody, 'Hi {{1}}, en copy.');
+    } finally { S.phase = savedPhase; }
+  });
+
   Object.assign(S.config, before);
 }
 

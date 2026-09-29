@@ -300,6 +300,15 @@ function templateLocked(name, language) {
 // When a template lookup succeeds, make it the active one: remember its status
 // (gates Start) and how many variables its body needs (drives buildParams).
 function adoptTemplate(name, result, language) {
+  // templateLocked treats a missing language as "same" so a bare status poll
+  // of the running template is not refused — but that leaves `language`
+  // undefined below, where "no language given" means "prefer any APPROVED
+  // variant", not "keep the one already sending". A GET with no ?language=
+  // against the exact template mid-campaign must resolve to the identity
+  // it is already checking, or the poll itself can switch the campaign's
+  // language to whichever APPROVED variant Meta happened to list first.
+  if (!language && campaignActive() && name === S.config.templateName) language = S.config.templateLanguage;
+
   // Defence in depth: /validate-template and /config already check this
   // before calling in, but /start (routes/campaign.js) calls straight through
   // to here, so the guard has to hold even when nothing upstream asked first.
