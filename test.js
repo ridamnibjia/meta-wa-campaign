@@ -930,6 +930,20 @@ test('normalizePhone reads the 00 international prefix', () => {
   assert.equal(normalizePhone('0044 20 7946 0958'), '442079460958', 'no country code starts with 0 — sending 0044… always fails');
   assert.equal(normalizePhone('00971 50 123 4567'), '971501234567');
 });
+test('an explicit international prefix is trusted as the whole number — no India guess on top of it', () => {
+  // A Danish "+45 1234 5678" is 10 raw digits once formatting is stripped —
+  // the same length as a bare Indian mobile — so the d.length === 10 branch
+  // used to prepend 91 onto a number that already named its own country,
+  // producing 914512345678: not Denmark, not India, a wrong number nobody
+  // owns rather than either of the two real candidates.
+  assert.equal(normalizePhone('+45 1234 5678'), '4512345678', 'an explicit + names the country; there is nothing left here to guess');
+  assert.equal(normalizePhone('0045 1234 5678'), '4512345678', 'a stripped 00 access prefix is just as explicit as a +');
+  // Regression guards: this fix is scoped to "an explicit prefix was given",
+  // not "skip the guess always" — an explicit +91 number was never broken,
+  // and a number with no prefix at all must still fall back to the guess.
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'an explicit +91 number is unaffected');
+  assert.equal(normalizePhone('9000000001'), '919000000001', 'no prefix at all still falls back to the India guess');
+});
 test('toll-free rules: explicit + is trusted, Indian service lines are not', () => {
   assert.equal(normalizePhone('+1 860 555 1234'), '18605551234', 'Hartford, Connecticut is a real area code');
   assert.equal(normalizePhone('1860 123 4567'), null, 'a bare 1860 line is an Indian service number');

@@ -21,7 +21,16 @@ function normalize(raw) {
   // instead of +. No real E.164 country code starts with 0, so a number long
   // enough to still hold a country code after two digits are stripped is
   // always the access prefix, never part of the number.
-  if (d.length > 11 && d.startsWith('00')) d = d.slice(2);
+  const strippedZeroZero = d.length > 11 && d.startsWith('00');
+  if (strippedZeroZero) d = d.slice(2);
+  // An explicit + or a stripped 00 means the digits that are left ARE the
+  // whole E.164 number, country code included — there is nothing left here
+  // for either India guess to improve on. Without this, a Danish "+45 1234
+  // 5678" is 10 raw digits, the same length as a bare Indian mobile, and the
+  // d.length === 10 branch below prepended 91 onto a number that already
+  // named its own country: 914512345678, a wrong number nobody owns, not
+  // Denmark and not India either.
+  const explicitPrefix = /^\+/.test(s) || strippedZeroZero;
   // Two toll-free rules, independent of each other. This one is raw-digit
   // pattern matching and only trustworthy when the country is UNKNOWN — an
   // explicit + means it is not: +1 860 is Hartford, Connecticut, a real area
@@ -30,8 +39,10 @@ function normalize(raw) {
   // before it is ever considered for a 91 prefix.
   if (!/^\+/.test(s) && /^1(800|860|900)/.test(d)) return null;
   let guessed = false;
-  if (d.length === 10)                 { d = '91' + d; guessed = true; }         // 10-digit Indian
-  if (d.length === 11 && d[0] === '0') { d = '91' + d.slice(1); guessed = true; } // 0xxxxxxxxxx
+  if (!explicitPrefix) {
+    if (d.length === 10)                 { d = '91' + d; guessed = true; }         // 10-digit Indian
+    if (d.length === 11 && d[0] === '0') { d = '91' + d.slice(1); guessed = true; } // 0xxxxxxxxxx
+  }
   // The Indian toll-free/shared-cost lines this rule actually exists for,
   // however they are written — checked AFTER the guess, against the number as
   // it will actually be dialled. Checked against the pre-guess digits instead,
@@ -44,7 +55,13 @@ function normalize(raw) {
   // result, country code 91 is no longer in doubt, so a leading + still does
   // not exempt it.
   if (/^91(1800|1860|1900)/.test(d)) return null;
-  if (d.length < 11 || d.length > 15) return null;
+  // 11 is a floor sized for the guessed branches: a 10-digit Indian mobile
+  // plus the 91 this function just prepended. It is the wrong floor for a
+  // number that named its own (shorter) country code and was never guessed
+  // at — E.164's own bound is a two-digit country code plus as few as six
+  // subscriber digits, eight total, so that is the floor once the prefix was
+  // explicit rather than assumed.
+  if (d.length < (explicitPrefix ? 8 : 11) || d.length > 15) return null;
   return { d, guessed };
 }
 const normalizePhone = raw => normalize(raw)?.d ?? null;

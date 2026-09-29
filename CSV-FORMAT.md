@@ -58,10 +58,17 @@ Then:
 | `+91 90000 00002` | already has a country code | `919000000002` |
 | `+39 333 000 0004` | already has a country code | `393330000004` |
 | `0044 20 7946 0958` | `00` international access prefix → drop it, country code follows | `442079460958` |
+| `+45 1234 5678` | already has a country code — no India guess on top of a number that names its own | `4512345678` |
+
+A `+` or a `00` is trusted as naming the whole number, country code included,
+however short that makes it — `+45 1234 5678` above is 10 digits, the same
+length as a bare Indian mobile, and is sent exactly as given rather than
+guessed at.
 
 Rejected outright, no error shown, just skipped:
 
-- fewer than 7 digits, or a final result outside 11–15 digits
+- fewer than 7 digits, or a final result shorter than 11 digits (8 if the
+  number carried an explicit `+` or `00` country code) or longer than 15
 - toll-free prefixes `1800`, `1860`, `1900` on a number written **without** a
   `+` — write one and the number is trusted as-is: `+1 860 555 1234` is a real
   Hartford, Connecticut number, not the Indian `1860` service line it collides
