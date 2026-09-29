@@ -460,34 +460,44 @@ function Thread({ waId, onBack }) {
   // page no longer overlaps the one on screen, more than a page arrived while
   // nobody was watching — reload is the only correct answer to that.
   const refreshNewest = useCallback(() => {
-    api.get(`/api/inbox/${waId}`).then(fresh => setData(cur => {
-      if (!cur) return fresh;
-      const ids = new Set(cur.messages.map(m => m.id));
-      if (!fresh.messages.some(m => ids.has(m.id))) { load(); return cur; }
-      const freshById = new Map(fresh.messages.map(m => [m.id, m]));
-      // The oldest timestamp this fetch actually covers (messages come back
-      // oldest-first). A cur entry at or after it would have been IN `fresh`
-      // if it were still visible, so its absence means the server just hid
-      // it — VISIBLE excludes an outbound reply the instant a delayed status
-      // turns it 'failed', and applyStatus restamps threads.last_at for
-      // exactly that transition, which is what fires this refresh. A cur
-      // entry OLDER than the range is simply outside what this fetch asked
-      // for — merges only ever grow `cur.messages` past one page's worth —
-      // and must survive being merely absent from it.
-      // `<=`, not `<`: Meta timestamps whole seconds, so several messages can
-      // share rangeStart and the page's LIMIT can cut between them — one that
-      // merely aged out of the newest page then has m.at === rangeStart. The
-      // client has no rowid to break that tie, so a tie is kept: a duplicate
-      // line heals on reload, an omission is a message the operator never saw.
-      const rangeStart = fresh.messages[0]?.at ?? -Infinity;
-      const kept = cur.messages.filter(m => m.at <= rangeStart || freshById.has(m.id));
-      // Entries already on screen pick up their fresher copy too — a status
-      // moving sent → delivered → read on a bubble already rendered — and
-      // anything in the fresh page that was not here yet is appended after it.
-      const updated = kept.map(m => freshById.get(m.id) || m);
-      const merged  = [...updated, ...fresh.messages.filter(m => !ids.has(m.id))];
-      return { ...fresh, messages: merged, nextBefore: cur.nextBefore, hasMore: cur.hasMore };
-    })).catch(() => {});
+    api.get(`/api/inbox/${waId}`).then(fresh => {
+      // Set from inside the updater below, then acted on after it returns —
+      // setData's updater must stay a pure function of (cur, fresh) since
+      // React is free to call it more than once, and load() is a side effect
+      // (another fetch, another setData) that does not belong in there.
+      let overlapMissing = false;
+      setData(cur => {
+        if (!cur) return fresh;
+        const ids = new Set(cur.messages.map(m => m.id));
+        if (!fresh.messages.some(m => ids.has(m.id))) { overlapMissing = true; return cur; }
+        const freshById = new Map(fresh.messages.map(m => [m.id, m]));
+        // The oldest timestamp this fetch actually covers (messages come back
+        // oldest-first). A cur entry at or after it would have been IN `fresh`
+        // if it were still visible, so its absence means the server just hid
+        // it — VISIBLE excludes an outbound reply the instant a delayed status
+        // turns it 'failed'. The DB restamp alone does not reach this screen:
+        // what actually fires this refresh is services/ingest.js emitting the
+        // 'inbox' socket event for that transition, which is what updates
+        // `threads` (app.jsx) and therefore the `lastAt` prop this component
+        // watches. A cur entry OLDER than the range is simply outside what
+        // this fetch asked for — merges only ever grow `cur.messages` past
+        // one page's worth — and must survive being merely absent from it.
+        // `<=`, not `<`: Meta timestamps whole seconds, so several messages can
+        // share rangeStart and the page's LIMIT can cut between them — one that
+        // merely aged out of the newest page then has m.at === rangeStart. The
+        // client has no rowid to break that tie, so a tie is kept: a duplicate
+        // line heals on reload, an omission is a message the operator never saw.
+        const rangeStart = fresh.messages[0]?.at ?? -Infinity;
+        const kept = cur.messages.filter(m => m.at <= rangeStart || freshById.has(m.id));
+        // Entries already on screen pick up their fresher copy too — a status
+        // moving sent → delivered → read on a bubble already rendered — and
+        // anything in the fresh page that was not here yet is appended after it.
+        const updated = kept.map(m => freshById.get(m.id) || m);
+        const merged  = [...updated, ...fresh.messages.filter(m => !ids.has(m.id))];
+        return { ...fresh, messages: merged, nextBefore: cur.nextBefore, hasMore: cur.hasMore };
+      });
+      if (overlapMissing) load();
+    }).catch(() => {});
   }, [waId, load]);
   const seen = useRef(lastAt);
   // Reset the watermark on a thread switch rather than let it carry the
