@@ -735,6 +735,17 @@ function Campaign() {
                   list below if this is not an Indian audience.
                 </p>
               )}
+              {/* Not a guess — dialled exactly as written, since the same shape
+                  is also a real Singapore, New Zealand or Maldives number —
+                  but it is the single most common way an Indian mobile's 91
+                  goes missing, so it gets the same amber treatment rather than
+                  being silent about it. */}
+              {contacts.breakdown?.shortPlus > 0 && (
+                <p className="text-[11px] font-medium text-warning">
+                  {num(contacts.breakdown.shortPlus)} number(s) start with + but have only 10 digits — dialled exactly as
+                  written. If they are Indian mobiles, write them as +91 followed by the 10 digits.
+                </p>
+              )}
               <div className="divide-y divide-border">
                 {(contacts.sample || []).slice(0, 3).map((c, i) => (
                   <div key={i} className="flex justify-between py-1.5 text-xs">

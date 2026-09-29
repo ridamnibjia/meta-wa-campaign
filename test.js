@@ -343,7 +343,7 @@ test('a blank sample slot is caught positionally, not by counting non-blanks els
 test('an empty CSV still answers with every key the route destructures', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
-  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0 });
+  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0, shortPlus: 0 });
 });
 
 test('csvField — defuses formulas, strips control chars, quotes, and round-trips', () => {
@@ -961,6 +961,33 @@ test('the Indian toll-free rule is checked against the number AFTER the +91 gues
   // which spelling they used.
   assert.equal(normalizePhone('9118001234'), '919118001234', 'a bare mobile, not the toll-free line it coincidentally starts with');
   assert.equal(normalizePhone('09118001234'), '919118001234', 'the same person, written with a leading zero, must agree with the bare form');
+});
+
+// Item 6 (b81ba20) found ONE row in the operator's real list broken by its own
+// fix: a stray "+" in front of a 10-digit Indian mobile with no "91" at all
+// used to guess India (correct) and, after that fix, was trusted as a
+// complete E.164 number instead — a malformed foreign number nobody owns, and
+// the real person silently missed the campaign. These two amendments narrow
+// the explicit-prefix rule back down without reopening the Danish/+45 case.
+test('no E.164 country code starts with 0, so a leading zero overrules an explicit prefix', () => {
+  // "+0…" and "00…" both carry no real country code — the prefix was stray —
+  // so the Indian trunk-zero reading is the only one left, unlike the plain
+  // 10-digit guess just above it, which an explicit prefix still skips.
+  assert.equal(normalizePhone('+0 98765 43210'), '919876543210', 'the + is stray; read as a bare Indian mobile with its own leading zero');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+0 98765 43210\n')).guessedCountry, 1,
+    'still a guess, so guessedCountry counts it the same as any other assumed-Indian number');
+});
+test('a "+" in front of exactly 10 digits shaped like an Indian mobile is dialled as written, and flagged', () => {
+  // The shape (a leading 6-9) is ALSO a real Singapore, New Zealand or
+  // Maldives number, so it is never re-guessed — only said out loud, the same
+  // one-per-contact rule as guessedCountry, for the operator to check.
+  assert.equal(normalizePhone('+98765 43210'), '9876543210', 'dialled exactly as written, not turned into a 12-digit +91 guess');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+98765 43210\n')).shortPlus, 1,
+    'counted once, the same one-per-contact rule as guessedCountry');
+  assert.equal(normalizePhone('+45 1234 5678'), '4512345678', 'unaffected — first digit 4 is not the shape of an Indian mobile');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+45 1234 5678\n')).shortPlus, 0);
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'unaffected — a real country code is already there, 12 digits not 10');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+91 90000 00001\n')).shortPlus, 0);
 });
 
 console.log('\nparseCSV');
@@ -3590,6 +3617,32 @@ console.log('\ncontacts routes — /upload-csv reports the country guess (contra
       assert.equal(res.ok, true, res.error);
       assert.equal(res.guessedCountry, 0);
       assert.equal(res.guessedPhone, null, 'a named header column is not a guess — contract C3 keeps both fields on every response');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+
+  // Item 6b: a bare "+" with only 10 digits is dialled exactly as written, not
+  // turned into a guess — so it must be reported beside guessedCountry, never
+  // folded into it, the same way guessedPhone and guessedCountry are already
+  // kept apart.
+  testAsync('a "+" with only 10 digits is reported as shortPlus, not folded into guessedCountry', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = `name,phone\nAsha,+${bareNum()}\n`;
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+      const before = S.logs.length;
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.shortPlus, 1, 'a bare "+" with 10 digits is dialled as written, not re-guessed as Indian');
+      assert.equal(res.guessedCountry, 0, 'nothing here was changed before sending, so it is not a guess');
+
+      const warned = S.logs.slice(before).some(l => l.level === 'warn' && /only 10 digits/.test(l.msg));
+      assert.ok(warned, 'said out loud beside the guessedCountry warning, the same way that guess already is');
     } finally { server.close(); S.phase = savedPhase; }
   });
 }

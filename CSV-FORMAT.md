@@ -59,11 +59,21 @@ Then:
 | `+39 333 000 0004` | already has a country code | `393330000004` |
 | `0044 20 7946 0958` | `00` international access prefix → drop it, country code follows | `442079460958` |
 | `+45 1234 5678` | already has a country code — no India guess on top of a number that names its own | `4512345678` |
+| `+0 98765 43210` | no real country code starts with `0`, so a leading zero after `+`/`00` is never one — Indian trunk zero | `919876543210` |
+| `+98765 43210` | `+` with only 10 digits — not re-guessed; see below | `9876543210` |
 
 A `+` or a `00` is trusted as naming the whole number, country code included,
 however short that makes it — `+45 1234 5678` above is 10 digits, the same
 length as a bare Indian mobile, and is sent exactly as given rather than
-guessed at.
+guessed at. The one exception is a leading zero straight after that `+` or
+`00`: no country code starts with `0`, so the prefix was never real, and the
+number is read as a bare Indian one instead.
+
+A `+` immediately followed by exactly 10 digits starting `6`–`9` — the shape
+of an Indian mobile typed without its `91` — is sent exactly as written
+rather than guessed, because the same shape is also a real Singapore, New
+Zealand or Maldives number; the upload result says how many numbers matched
+this shape, so you can check whether they need a `+91` in front.
 
 Rejected outright, no error shown, just skipped:
 
