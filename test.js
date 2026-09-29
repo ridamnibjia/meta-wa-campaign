@@ -343,7 +343,7 @@ test('a blank sample slot is caught positionally, not by counting non-blanks els
 test('an empty CSV still answers with every key the route destructures', () => {
   // The route destructures `duplicates`; the old two-key early return threw a
   // TypeError AFTER an empty run had already replaced the queue.
-  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0 });
+  assert.deepEqual(parseCSV(Buffer.from('')), { contacts: [], skipped: [], duplicates: [], headers: [], guessedPhone: null, guessedCountry: 0, shortPlus: 0 });
 });
 
 test('csvField — defuses formulas, strips control chars, quotes, and round-trips', () => {
@@ -614,6 +614,32 @@ console.log('\nadoptTemplate — language variants');
     assert.notEqual(S.config.templateBody, 'decoy');
   });
 
+  // GET /api/validate-template?name=<running template> with no ?language= is
+  // exactly what the 15s status poll sends. With two APPROVED variants, "no
+  // language given" used to fall into the same "prefer APPROVED" branch as a
+  // fresh pick and could adopt whichever variant Meta's list happened to list
+  // first — switching the language of a campaign already sending, mid-run,
+  // from a request that only meant to ask "is it still approved".
+  test('a bare re-validate of the running template does not switch its language', () => {
+    // hi listed FIRST and en running: "prefer first APPROVED" (the no-language
+    // branch used by a genuinely fresh pick) would adopt hi here if the running
+    // identity were not checked first — the order below is what makes this
+    // test able to fail.
+    const bothApproved = { found: true, templates: [
+      { name: 'promo', language: 'hi', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, hi copy.', headerFormat: null, headerText: null },
+      { name: 'promo', language: 'en', status: 'APPROVED', category: 'MARKETING', bodyText: 'Hi {{1}}, en copy.', headerFormat: null, headerText: null },
+    ] };
+    const savedPhase = S.phase;
+    S.config.templateName = 'promo';
+    S.config.templateLanguage = 'en';
+    S.phase = 'waiting';
+    try {
+      adoptTemplate('promo', bothApproved);   // no third argument at all
+      assert.equal(S.config.templateLanguage, 'en', 'the campaign is sending en; a bare re-validate must stay on en');
+      assert.equal(S.config.templateBody, 'Hi {{1}}, en copy.');
+    } finally { S.phase = savedPhase; }
+  });
+
   Object.assign(S.config, before);
 }
 
@@ -729,6 +755,27 @@ console.log('\ntemplate routes — identity locked mid-campaign');
       assert.equal(r.ok, false, 'the same template under a different language is still a different outbound message');
       assert.equal(S.config.templateLanguage, 'en', 'nothing is mutated by a refused switch');
     } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; S.config.templateLanguage = savedLang; }
+  });
+
+  testAsync('POST /api/config refuses before touching credentials, not just after, when the same request also switches templates mid-campaign', async () => {
+    // accessToken/phoneNumberId/wabaId used to be written unconditionally
+    // before the template-lock check below them in the handler, so a request
+    // refused for its templateName half had already landed its credential
+    // half — a refusal is supposed to mean "nothing happened", not "the part
+    // I checked first didn't happen".
+    const savedPhase = S.phase, savedName = S.config.templateName, savedToken = CFG.accessToken;
+    S.phase = 'waiting'; S.config.templateName = 'promo_a';
+    CFG.accessToken = 'token-before';
+    const s = await startSettingsServer();
+    try {
+      const base = `http://127.0.0.1:${s.address().port}`;
+      const r = await (await fetch(`${base}/api/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ accessToken: 'token-after', templateName: 'promo_b' }),
+      })).json();
+      assert.equal(r.ok, false, 'the template half of this request is refused mid-campaign');
+      assert.equal(CFG.accessToken, 'token-before', 'a refused request must mutate nothing, including fields the lock does not itself guard');
+    } finally { s.close(); S.phase = savedPhase; S.config.templateName = savedName; CFG.accessToken = savedToken; }
   });
 
   testAsync('POST /api/template/create still submits to Meta but does not adopt, mid-campaign', async () => {
@@ -883,6 +930,20 @@ test('normalizePhone reads the 00 international prefix', () => {
   assert.equal(normalizePhone('0044 20 7946 0958'), '442079460958', 'no country code starts with 0 — sending 0044… always fails');
   assert.equal(normalizePhone('00971 50 123 4567'), '971501234567');
 });
+test('an explicit international prefix is trusted as the whole number — no India guess on top of it', () => {
+  // A Danish "+45 1234 5678" is 10 raw digits once formatting is stripped —
+  // the same length as a bare Indian mobile — so the d.length === 10 branch
+  // used to prepend 91 onto a number that already named its own country,
+  // producing 914512345678: not Denmark, not India, a wrong number nobody
+  // owns rather than either of the two real candidates.
+  assert.equal(normalizePhone('+45 1234 5678'), '4512345678', 'an explicit + names the country; there is nothing left here to guess');
+  assert.equal(normalizePhone('0045 1234 5678'), '4512345678', 'a stripped 00 access prefix is just as explicit as a +');
+  // Regression guards: this fix is scoped to "an explicit prefix was given",
+  // not "skip the guess always" — an explicit +91 number was never broken,
+  // and a number with no prefix at all must still fall back to the guess.
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'an explicit +91 number is unaffected');
+  assert.equal(normalizePhone('9000000001'), '919000000001', 'no prefix at all still falls back to the India guess');
+});
 test('toll-free rules: explicit + is trusted, Indian service lines are not', () => {
   assert.equal(normalizePhone('+1 860 555 1234'), '18605551234', 'Hartford, Connecticut is a real area code');
   assert.equal(normalizePhone('1860 123 4567'), null, 'a bare 1860 line is an Indian service number');
@@ -900,6 +961,33 @@ test('the Indian toll-free rule is checked against the number AFTER the +91 gues
   // which spelling they used.
   assert.equal(normalizePhone('9118001234'), '919118001234', 'a bare mobile, not the toll-free line it coincidentally starts with');
   assert.equal(normalizePhone('09118001234'), '919118001234', 'the same person, written with a leading zero, must agree with the bare form');
+});
+
+// Item 6 (b81ba20) found ONE row in the operator's real list broken by its own
+// fix: a stray "+" in front of a 10-digit Indian mobile with no "91" at all
+// used to guess India (correct) and, after that fix, was trusted as a
+// complete E.164 number instead — a malformed foreign number nobody owns, and
+// the real person silently missed the campaign. These two amendments narrow
+// the explicit-prefix rule back down without reopening the Danish/+45 case.
+test('no E.164 country code starts with 0, so a leading zero overrules an explicit prefix', () => {
+  // "+0…" and "00…" both carry no real country code — the prefix was stray —
+  // so the Indian trunk-zero reading is the only one left, unlike the plain
+  // 10-digit guess just above it, which an explicit prefix still skips.
+  assert.equal(normalizePhone('+0 98765 43210'), '919876543210', 'the + is stray; read as a bare Indian mobile with its own leading zero');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+0 98765 43210\n')).guessedCountry, 1,
+    'still a guess, so guessedCountry counts it the same as any other assumed-Indian number');
+});
+test('a "+" in front of exactly 10 digits shaped like an Indian mobile is dialled as written, and flagged', () => {
+  // The shape (a leading 6-9) is ALSO a real Singapore, New Zealand or
+  // Maldives number, so it is never re-guessed — only said out loud, the same
+  // one-per-contact rule as guessedCountry, for the operator to check.
+  assert.equal(normalizePhone('+98765 43210'), '9876543210', 'dialled exactly as written, not turned into a 12-digit +91 guess');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+98765 43210\n')).shortPlus, 1,
+    'counted once, the same one-per-contact rule as guessedCountry');
+  assert.equal(normalizePhone('+45 1234 5678'), '4512345678', 'unaffected — first digit 4 is not the shape of an Indian mobile');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+45 1234 5678\n')).shortPlus, 0);
+  assert.equal(normalizePhone('+91 90000 00001'), '919000000001', 'unaffected — a real country code is already there, 12 digits not 10');
+  assert.equal(parseCSV(Buffer.from('name,phone\nAsha,+91 90000 00001\n')).shortPlus, 0);
 });
 
 console.log('\nparseCSV');
@@ -1181,6 +1269,25 @@ console.log('\nwarm-up ladder');
     // a finished ladder plus no cap of your own is no cap at all
     setup(new Array(50).fill(0).map((_, i) => 'd' + i)); S.config.dailyCap = 0;
     assert.equal(effectiveCap(), null);
+  });
+
+  // The day-start log announces the window the cap in force counts over.
+  // capWindow() says which: a rolling 24 hours while the rung governs, the IST
+  // day once your own lower cap does. The log named "any 24 hours"
+  // unconditionally, which is exactly wrong when your own cap is the one
+  // actually counting the calendar day instead.
+  test('the day-start log says "today" when your own lower cap governs, not "any 24 hours"', () => {
+    const { markWarmupDay, capWindow } = require('./server');
+    setup([]); S.config.dailyCap = 0;               // nothing of your own: the rung governs, rolling
+    markWarmupDay();
+    assert.equal(capWindow(), '24h', 'precondition: the rung is the cap in force');
+    assert.match(S.logs[S.logs.length - 1].msg, /at most 20 people in any 24 hours/);
+
+    setup([]); S.config.dailyCap = 5;                // below day 1's rung of 20: your own cap governs
+    markWarmupDay();
+    assert.equal(capWindow(), 'day', 'precondition: your own lower cap is the one counting');
+    assert.match(S.logs[S.logs.length - 1].msg, /at most 20 people today/,
+      'your own cap counts the IST day, not a rolling 24 hours, and the log must say so');
   });
   // The shipped default, read from a pristine copy of the module rather than
   // from the S every other test has been writing to. It was 1000, and a number
@@ -2501,6 +2608,39 @@ console.log('\nschema — media + template tables');
     d.close();
   });
 
+  test('a retry row parked before ladder_code existed is backfilled from error_code/attempts, once', () => {
+    const f = require('node:path').join(require('node:os').tmpdir(), `wa-ladderbackfill-${process.pid}-${Date.now()}.db`);
+    try {
+      const d1 = openDb(f);
+      d1.prepare('INSERT INTO campaign_runs (id, started_at) VALUES (1, 1)').run();
+      // No ladder_code / ladder_attempts given — exactly the row a deploy of
+      // this column pair finds: mid-ladder, error_code already there (markRetry
+      // has always written it), the new pair still at its column default.
+      d1.prepare(`INSERT INTO run_recipients (run_id, phone, name, seq, skipped_reason, error_code, attempts)
+                  VALUES (1, '9000000001', 'Asha', 1, 'retry', 131049, 2)`).run();
+      d1.close();
+
+      const readRow = d => d.prepare(
+        'SELECT ladder_code, ladder_attempts FROM run_recipients WHERE run_id = 1 AND phone = ?'
+      ).get('9000000001');
+
+      const d2 = openDb(f);   // the boot that ships the backfill
+      const after1 = readRow(d2);
+      assert.equal(after1.ladder_code, 131049, 'the code already failing this contact seeds ladder_code');
+      assert.equal(after1.ladder_attempts, 2,
+        'total tries so far seed the rung — it can only shorten what is left on that ladder, never extend it');
+      d2.close();
+
+      const d3 = openDb(f);   // a later boot must leave an already-backfilled row alone
+      const after2 = readRow(d3);
+      assert.equal(after2.ladder_code, 131049, 'ladder_code is no longer NULL, so the WHERE guard makes a second boot a no-op');
+      assert.equal(after2.ladder_attempts, 2, 'and must not re-copy attempts on top of it either');
+      d3.close();
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) { try { require('node:fs').unlinkSync(f + suffix); } catch {} }
+    }
+  });
+
   test('campaign_runs carries the run-time template snapshot columns', () => {
     const d = openDb(':memory:');
     const c = cols(d, 'campaign_runs');
@@ -3477,6 +3617,32 @@ console.log('\ncontacts routes — /upload-csv reports the country guess (contra
       assert.equal(res.ok, true, res.error);
       assert.equal(res.guessedCountry, 0);
       assert.equal(res.guessedPhone, null, 'a named header column is not a guess — contract C3 keeps both fields on every response');
+    } finally { server.close(); S.phase = savedPhase; }
+  });
+
+  // Item 6b: a bare "+" with only 10 digits is dialled exactly as written, not
+  // turned into a guess — so it must be reported beside guessedCountry, never
+  // folded into it, the same way guessedPhone and guessedCountry are already
+  // kept apart.
+  testAsync('a "+" with only 10 digits is reported as shortPlus, not folded into guessedCountry', async () => {
+    const savedPhase = S.phase;
+    S.phase = 'idle';
+    const server = await startContactsServer();
+    try {
+      const port = server.address().port;
+      const body = `name,phone\nAsha,+${bareNum()}\n`;
+      const form = new FormData();
+      form.append('csv', new Blob([Buffer.from(body)], { type: 'text/csv' }), 'list.csv');
+      const before = S.logs.length;
+
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/upload-csv`,
+        { method: 'POST', body: form })).json();
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.shortPlus, 1, 'a bare "+" with 10 digits is dialled as written, not re-guessed as Indian');
+      assert.equal(res.guessedCountry, 0, 'nothing here was changed before sending, so it is not a guess');
+
+      const warned = S.logs.slice(before).some(l => l.level === 'warn' && /only 10 digits/.test(l.msg));
+      assert.ok(warned, 'said out loud beside the guessedCountry warning, the same way that guess already is');
     } finally { server.close(); S.phase = savedPhase; }
   });
 }
@@ -5642,6 +5808,26 @@ console.log('\nwebhook ingest — what an envelope means');
     const again = (await listening(() => processEnvelope(three))).filter(h => h.event === 'inbox');
     assert.equal(again.length, 0, 'a redelivery records nothing new, so there is nothing to announce');
     senders.forEach(markRead);
+  });
+
+  // Before this, `inbound` was the only thing that could trigger an 'inbox'
+  // emit — a status-only envelope carried none, so an open thread never
+  // learned a reply it sent had just been refused (or picked up its ticks):
+  // the transcript sat there showing the message as still on its way.
+  testAsync('a delivery failure emits inbox once, though nothing arrived to reply to', async () => {
+    const waId = '919000005801';
+    recordOutbound({ wamid: 'wamid.failonly-1', waId, name: 'FailOnly', body: 'x', runId: null });
+    const failedStatus = envelopeOf('messages', { statuses: [{
+      id: 'wamid.failonly-1', status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)),
+      recipient_id: waId, errors: [{ code: 131049, title: 'Not delivered' }],
+    }] });
+
+    const first = (await listening(() => processEnvelope(failedStatus))).filter(h => h.event === 'inbox');
+    assert.equal(first.length, 1, 'the transition into failed must reach an open thread the same way a reply does');
+
+    const again = (await listening(() => processEnvelope(failedStatus))).filter(h => h.event === 'inbox');
+    assert.equal(again.length, 0,
+      'a redelivery of the same failure is not a second transition into failed, so applyStatus returns nothing to announce');
   });
 }
 
@@ -9045,8 +9231,43 @@ console.log('\na Reset that lands mid-send');
       assert.equal(s.phase, 'paused');
       assert.equal(flags.pauseFlag, true, 'still set, so Resume is theirs to press');
       assert.equal(sends, 1, 'the fault must not be probed again while the operator\'s pause holds');
-      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused by the operator/.test(l.msg)),
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused, so nothing else changes/.test(l.msg)),
         'the fault is still said out loud in one line, even though the pause stays the operator\'s');
+    });
+  });
+
+  // Same race again, but the pause already there is the loop's OWN — an
+  // earlier halt (a previous contact here, or handleDeliveryFailure on the
+  // webhook thread) rather than the operator's. Gating on
+  // S.pauseReason === USER_PAUSE alone left an earlier halt's reason just as
+  // overwritable as no pause at all: a second, unrelated fault replaced the
+  // FIRST one's reason with its own, and the operator lost the fact that
+  // actually parked the campaign. flags.pauseFlag is the signal both cases
+  // share, and mirrors handleDeliveryFailure's own webhook entrance exactly.
+  testAsync('a halt landing on an already halt-paused loop keeps the first reason', async () => {
+    let sends = 0;
+    await withLoop(async () => {
+      sends++;
+      // An earlier halt already parked the run under its own reason. Set
+      // directly rather than via a second send: the loop offers a paused
+      // run no further attempts, so a real second send could never race here.
+      const M = require('./server');
+      M.flags.pauseFlag = true;
+      M.S.phase = 'paused';
+      M.S.pauseReason = 'Campaign paused — first fault [131042]';
+      return graphErr({ code: 190, message: 'Error validating access token' });
+    }, async h => {
+      const { S: s, flags } = h.M;
+      h.stage([{ dialStr: '919000034121', name: 'Marco' }], 'halt-during-halt');
+      h.start();
+      await h.until(() => sends === 1 && s.logs.some(l => /190/.test(l.msg)));
+      assert.equal(s.pauseReason, 'Campaign paused — first fault [131042]',
+        'the first halt\'s reason is kept, not overwritten by the second fault');
+      assert.equal(s.phase, 'paused');
+      assert.equal(flags.pauseFlag, true);
+      assert.equal(sends, 1, 'the loop must not probe the fault again while the campaign is already paused');
+      assert.ok(s.logs.some(l => /190/.test(l.msg) && /already paused, so nothing else changes/.test(l.msg)),
+        'the second fault is still said out loud in one line, even though the first reason stays on screen');
     });
   });
 
@@ -9958,9 +10179,13 @@ test('the DigitalOcean droplet option publishes on loopback only, same as the Do
   assert.match(section, /reverse proxy|Cloudflare Tunnel/i,
     'a loopback-only port needs something in front of it for a public URL, or the droplet is unreachable and the option is useless');
 });
-test('the tracked backup scripts carry no hosting username', () => {
+test('the tracked backup scripts and the README that documents them carry no hosting username', () => {
   const read = f => fsx.readFileSync(pathx.join(__dirname, f), 'utf8');
-  assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service'), /\/home\/[a-z]/,
+  // README.md's own backup table once spelled out a real deploy's /home/<user>
+  // path as the "default" for WA_APP_DIR / WA_BACKUP_DIR — this repo is public,
+  // and the scripts themselves were already scrubbed to @APP_USER@ for exactly
+  // this reason; the docs describing them must match.
+  assert.doesNotMatch(read('scripts/backup.sh') + read('scripts/wa-backup.service') + read('README.md'), /\/home\/[a-z]/,
     'a real hosting username in a public repo is exactly what docs/ is gitignored for');
 });
 

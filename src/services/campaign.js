@@ -881,16 +881,20 @@ async function campaignLoop() {
       // flag check owns what happens next, so this branch defers to it rather
       // than writing an answer of its own.
       if (flags.stopFlag) continue;
-      // The operator's own Pause landed first (USER_PAUSE, set synchronously
-      // by /api/pause) while this send was still in flight. Overwriting it
-      // with the halt reason turned USER_PAUSE into a reason
-      // resumeIfInterrupted treats as one the LOOP gave itself — silently
-      // auto-resuming, on the next boot, a campaign the operator asked to stay
-      // paused. The fault is still worth knowing about, so it is logged as one
-      // line without touching pauseReason.
-      if (S.pauseReason === USER_PAUSE) {
+      // Already parked — by the operator's own Pause, or by an earlier halt
+      // (this same branch on a previous contact, or handleDeliveryFailure on
+      // the webhook thread). Mirrors that function's own webhook entrance:
+      // flags.pauseFlag is the signal both share, and gating on
+      // S.pauseReason === USER_PAUSE alone left an earlier halt's reason just
+      // as overwritable as no pause at all — a second fault replaced the
+      // FIRST one's reason with its own, and painted over USER_PAUSE turned it
+      // into a reason resumeIfInterrupted treats as the LOOP's own, silently
+      // auto-resuming on the next boot a campaign the operator asked to stay
+      // paused. The fault is still one more contact it reached, so it is
+      // logged, not swallowed — without touching pauseReason.
+      if (flags.pauseFlag) {
         log('warn', `${n} [${result.errorCode}] ${result.error}${result.hint ? ` — ${result.hint}` : ''}`
-          + ' — already paused by the operator, not overwritten.');
+          + ' — the campaign is already paused, so nothing else changes.');
         continue;
       }
       flags.pauseFlag = true;

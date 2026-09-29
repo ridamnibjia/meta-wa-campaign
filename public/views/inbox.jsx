@@ -460,34 +460,44 @@ function Thread({ waId, onBack }) {
   // page no longer overlaps the one on screen, more than a page arrived while
   // nobody was watching — reload is the only correct answer to that.
   const refreshNewest = useCallback(() => {
-    api.get(`/api/inbox/${waId}`).then(fresh => setData(cur => {
-      if (!cur) return fresh;
-      const ids = new Set(cur.messages.map(m => m.id));
-      if (!fresh.messages.some(m => ids.has(m.id))) { load(); return cur; }
-      const freshById = new Map(fresh.messages.map(m => [m.id, m]));
-      // The oldest timestamp this fetch actually covers (messages come back
-      // oldest-first). A cur entry at or after it would have been IN `fresh`
-      // if it were still visible, so its absence means the server just hid
-      // it — VISIBLE excludes an outbound reply the instant a delayed status
-      // turns it 'failed', and applyStatus restamps threads.last_at for
-      // exactly that transition, which is what fires this refresh. A cur
-      // entry OLDER than the range is simply outside what this fetch asked
-      // for — merges only ever grow `cur.messages` past one page's worth —
-      // and must survive being merely absent from it.
-      // `<=`, not `<`: Meta timestamps whole seconds, so several messages can
-      // share rangeStart and the page's LIMIT can cut between them — one that
-      // merely aged out of the newest page then has m.at === rangeStart. The
-      // client has no rowid to break that tie, so a tie is kept: a duplicate
-      // line heals on reload, an omission is a message the operator never saw.
-      const rangeStart = fresh.messages[0]?.at ?? -Infinity;
-      const kept = cur.messages.filter(m => m.at <= rangeStart || freshById.has(m.id));
-      // Entries already on screen pick up their fresher copy too — a status
-      // moving sent → delivered → read on a bubble already rendered — and
-      // anything in the fresh page that was not here yet is appended after it.
-      const updated = kept.map(m => freshById.get(m.id) || m);
-      const merged  = [...updated, ...fresh.messages.filter(m => !ids.has(m.id))];
-      return { ...fresh, messages: merged, nextBefore: cur.nextBefore, hasMore: cur.hasMore };
-    })).catch(() => {});
+    api.get(`/api/inbox/${waId}`).then(fresh => {
+      // Set from inside the updater below, then acted on after it returns —
+      // setData's updater must stay a pure function of (cur, fresh) since
+      // React is free to call it more than once, and load() is a side effect
+      // (another fetch, another setData) that does not belong in there.
+      let overlapMissing = false;
+      setData(cur => {
+        if (!cur) return fresh;
+        const ids = new Set(cur.messages.map(m => m.id));
+        if (!fresh.messages.some(m => ids.has(m.id))) { overlapMissing = true; return cur; }
+        const freshById = new Map(fresh.messages.map(m => [m.id, m]));
+        // The oldest timestamp this fetch actually covers (messages come back
+        // oldest-first). A cur entry at or after it would have been IN `fresh`
+        // if it were still visible, so its absence means the server just hid
+        // it — VISIBLE excludes an outbound reply the instant a delayed status
+        // turns it 'failed'. The DB restamp alone does not reach this screen:
+        // what actually fires this refresh is services/ingest.js emitting the
+        // 'inbox' socket event for that transition, which is what updates
+        // `threads` (app.jsx) and therefore the `lastAt` prop this component
+        // watches. A cur entry OLDER than the range is simply outside what
+        // this fetch asked for — merges only ever grow `cur.messages` past
+        // one page's worth — and must survive being merely absent from it.
+        // `<=`, not `<`: Meta timestamps whole seconds, so several messages can
+        // share rangeStart and the page's LIMIT can cut between them — one that
+        // merely aged out of the newest page then has m.at === rangeStart. The
+        // client has no rowid to break that tie, so a tie is kept: a duplicate
+        // line heals on reload, an omission is a message the operator never saw.
+        const rangeStart = fresh.messages[0]?.at ?? -Infinity;
+        const kept = cur.messages.filter(m => m.at <= rangeStart || freshById.has(m.id));
+        // Entries already on screen pick up their fresher copy too — a status
+        // moving sent → delivered → read on a bubble already rendered — and
+        // anything in the fresh page that was not here yet is appended after it.
+        const updated = kept.map(m => freshById.get(m.id) || m);
+        const merged  = [...updated, ...fresh.messages.filter(m => !ids.has(m.id))];
+        return { ...fresh, messages: merged, nextBefore: cur.nextBefore, hasMore: cur.hasMore };
+      });
+      if (overlapMissing) load();
+    }).catch(() => {});
   }, [waId, load]);
   const seen = useRef(lastAt);
   // Reset the watermark on a thread switch rather than let it carry the
@@ -549,18 +559,20 @@ function Thread({ waId, onBack }) {
         <MediaInfo previewHours={data.previewHours} />
       </div>
 
-      {/* A transcript is what the two people said to each other, so a campaign
-          message Meta refused is not in it — the customer never saw it, cannot
-          answer it and does not know it exists. Stating the count is the honest
+      {/* A transcript is what the two people said to each other, so a message
+          Meta refused is not in it — the customer never saw it, cannot answer
+          it and does not know it exists. Stating the count is the honest
           middle: it is out of the conversation, and the fact that we tried is
-          not hidden. The codes and the reasons live in Campaign history, which
-          is the surface built to answer them. */}
+          not hidden. The count covers EVERY refused outbound row (countUndelivered
+          has no run filter), so a refused inbox reply is in it too — "campaign
+          message" was false for those, and only campaign sends have a reason in
+          Campaign history. */}
       {data.undelivered > 0 && (
         <p className="border-b border-border bg-muted/50 px-4 py-2 text-[11px] text-muted-foreground">
-          {num(data.undelivered)} campaign message{data.undelivered === 1 ? '' : 's'} to this contact
-          {data.undelivered === 1 ? ' was' : ' were'} not delivered by Meta and{' '}
-          {data.undelivered === 1 ? 'is' : 'are'} not shown here — they never reached this person.
-          See <strong>Campaign history</strong> for the reason.
+          {num(data.undelivered)} message{data.undelivered === 1 ? '' : 's'} to this contact
+          {data.undelivered === 1 ? ' was' : ' were'} refused by Meta and{' '}
+          {data.undelivered === 1 ? 'is' : 'are'} not shown here — {data.undelivered === 1 ? 'it' : 'they'} never
+          reached this person. For a campaign send, <strong>Campaign history</strong> has the reason.
         </p>
       )}
 

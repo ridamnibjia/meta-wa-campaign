@@ -318,6 +318,20 @@ function openDb(file) {
   d.exec(`CREATE INDEX IF NOT EXISTS idx_run_recipients_retry
             ON run_recipients(run_id, retry_after)
             WHERE skipped_reason = 'retry' AND wamid IS NULL`);
+  // Backfill: a contact already mid-ladder the moment ladder_code/ladder_attempts
+  // shipped has error_code (markRetry and requeueAfterDelivery have always
+  // written it) but reads as rung zero of whatever code fails them next —
+  // ladderPosition treats a NULL ladder_code as "not on this code's ladder yet"
+  // and hands back every rung it already climbed. error_code is the code THIS
+  // retry is waiting on, so it seeds ladder_code correctly; attempts is the
+  // TOTAL across every code the contact has failed on in this run, which can
+  // overstate the rung count for someone who bounced between codes before this
+  // upgrade — but that only SHORTENS what is left on the newly-identified
+  // ladder, never extends it, which is the safe direction for a count that
+  // exists to stop hammering 131049. Guarded on ladder_code IS NULL, so once a
+  // row is backfilled it no longer matches and a later boot is a no-op.
+  d.exec(`UPDATE run_recipients SET ladder_code = error_code, ladder_attempts = attempts
+          WHERE ladder_code IS NULL AND skipped_reason = 'retry' AND error_code IS NOT NULL`);
   // A file an operator deleted while history still pointed at it. The row stays
   // so the template and the sent message can still name what they sent; the
   // bytes are gone. NULL means the file is really here.

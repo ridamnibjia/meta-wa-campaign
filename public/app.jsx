@@ -386,10 +386,13 @@ function App() {
     // "new" is how many numbers this server had never seen. guessedCountry and
     // guessedPhone (contract C3) are guesses the parser made rather than facts
     // read off a header, so the same breakdown says which ones were guessed.
+    // shortPlus (item 6b) rides beside guessedCountry the same way — a number
+    // this likely to be wrong is worth a second look even though it was never
+    // rewritten.
     setContacts({ count: r.count, sample: r.sample, file: file.name,
                   breakdown: { duplicates: r.duplicates || 0, skipped: r.skipped || 0,
                                newCount: r.newCount ?? null, guessedCountry: r.guessedCountry || 0,
-                               guessedPhone: r.guessedPhone || null } });
+                               guessedPhone: r.guessedPhone || null, shortPlus: r.shortPlus || 0 } });
     setFailLog([]);
   }, []);
 
