@@ -239,7 +239,14 @@ const FUNNEL_ROWS = [
   // lands here too, and that one WAS attempted — "never attempted" would be
   // wrong for them specifically, not just imprecise.
   { key: 'optedOut',    label: 'Opted out or switched off',
-    hint: 'Tapped “Stop promotions” earlier, turned your marketing off inside WhatsApp, or switched off by you. Some of these were never attempted; others were sent this message and opted out in response.' },
+    // Not "sent this message and opted out in response" — that would also be
+    // true of someone WhatsApp delivered this run's message to who then opted
+    // out, and that contact stays in `delivered` (bucketOf never rewrites a
+    // resolved wamid). Every population actually in this bucket — disabled
+    // before the queue reached them, disabled before a queued retry could go
+    // out, or refused this run with WhatsApp's own opt-out code — has one
+    // thing in common instead: none of them were delivered.
+    hint: 'Tapped “Stop promotions” earlier, turned your marketing off inside WhatsApp, or switched off by you — before the queue reached them, or before a queued retry could go out. None of them received this run\'s message.' },
 ];
 
 // How many times this contact was actually put on the wire. `attempts` counts
